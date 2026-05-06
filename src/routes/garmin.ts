@@ -3,11 +3,8 @@ import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { garminAccount } from '../db/schema.js';
 import { deleteGarminAccount } from '../garmin/store.js';
-import {
-  authenticateWithBrowserTicket,
-  buildBrowserLoginUrl,
-} from '../garmin/client.js';
-import { requireUser, loadSession, type AuthedRequest } from '../lib/session.js';
+import { authenticateWithBrowserTicket } from '../garmin/client.js';
+import { requireUser, type AuthedRequest } from '../lib/session.js';
 
 export const garminRouter = Router();
 
@@ -15,13 +12,6 @@ const FRONTEND_ORIGIN = (process.env.BETTER_AUTH_TRUSTED_ORIGINS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)[0] || 'http://localhost:3001';
-
-function apiBaseUrl(): string {
-  return (process.env.BETTER_AUTH_URL || 'http://localhost:4001').replace(
-    /\/+$/,
-    '',
-  );
-}
 
 garminRouter.get('/accounts', requireUser, async (req, res) => {
   const userId = (req as AuthedRequest).user.id;
@@ -48,13 +38,11 @@ garminRouter.get('/accounts', requireUser, async (req, res) => {
 });
 
 /**
- * Kick off Garmin browser-ticket login. The user's browser is redirected to
- * the official Garmin SSO page; after they sign in, Garmin redirects back to
- * /api/garmin/callback/:region with `?ticket=...`.
- *
- * The user's BetterAuth session cookie is sent on the cross-site return
- * navigation (SameSite=Lax), so we can identify which user the ticket
- * belongs to without an explicit state token.
+ * Legacy compatibility — bounce to the frontend's widget-embedded connect page.
+ * Garmin's SSO does NOT redirect tickets to arbitrary external URLs, so we
+ * can't run a pure CAS-style flow against api.garmin-trainer.uk. Instead the
+ * frontend hosts Garmin's official `gauth-widget.js`, which emits the service
+ * ticket via a JS event after the user signs in, and POSTs it back here.
  */
 garminRouter.get('/login/:region', requireUser, async (req, res) => {
   const region = req.params.region as 'cn' | 'global';
@@ -62,61 +50,32 @@ garminRouter.get('/login/:region', requireUser, async (req, res) => {
     res.status(400).send('invalid region');
     return;
   }
-  const callbackUrl = `${apiBaseUrl()}/api/garmin/callback/${region}`;
-  const ssoUrl = buildBrowserLoginUrl(region, callbackUrl);
-  res.redirect(302, ssoUrl);
+  res.redirect(302, `${FRONTEND_ORIGIN}/garmin/connect/${region}`);
 });
 
 /**
- * Garmin redirects here after the user logs in. We exchange the ticket for
- * OAuth1+OAuth2 tokens, persist them, then bounce the browser back to the
- * frontend's Garmin page with a status flag.
+ * Receive the service ticket extracted by the gauth-widget on the frontend.
+ * Exchanges the ticket for OAuth1+OAuth2 tokens via @gooin/garmin-connect
+ * (which expects login-url=sso/embed — same URL the widget targets, so the
+ * exchange succeeds).
  */
-garminRouter.get('/callback/:region', async (req, res) => {
+garminRouter.post('/callback/:region', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
   const region = req.params.region as 'cn' | 'global';
   if (region !== 'cn' && region !== 'global') {
-    res.status(400).send('invalid region');
+    res.status(400).json({ ok: false, error: 'invalid region' });
     return;
   }
-
-  const ticket = String(req.query.ticket ?? '');
-  const frontendBase = FRONTEND_ORIGIN;
-  const back = (params: Record<string, string>) => {
-    const u = new URL(`${frontendBase}/garmin`);
-    for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
-    return res.redirect(302, u.toString());
-  };
-
+  const ticket = String((req.body && req.body.ticket) || '').trim();
   if (!ticket) {
-    return back({ region, error: '没有收到 Garmin 返回的 ticket，请重试' });
+    res.status(400).json({ ok: false, error: '缺少 ticket' });
+    return;
   }
-
-  // Identify the user from their session cookie (Lax cross-site navigation
-  // does send cookies on top-level GETs).
-  const session = await loadSession(req).catch(() => null);
-  if (!session?.user) {
-    return back({
-      region,
-      error: '回调时未能识别登录会话，请重新登录后再连接 Garmin',
-    });
-  }
-
   try {
-    const result = await authenticateWithBrowserTicket(
-      session.user.id,
-      region,
-      ticket,
-    );
-    return back({
-      region,
-      connected: '1',
-      name: result.profile.fullName || result.profile.userName || '',
-    });
+    const result = await authenticateWithBrowserTicket(userId, region, ticket);
+    res.json({ ok: true, profile: result.profile });
   } catch (error) {
-    return back({
-      region,
-      error: (error as Error).message,
-    });
+    res.status(400).json({ ok: false, error: (error as Error).message });
   }
 });
 
