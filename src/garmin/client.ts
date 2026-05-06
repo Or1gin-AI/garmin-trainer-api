@@ -1,6 +1,5 @@
 import garminPkg from '@gooin/garmin-connect';
-import { MFAManager } from '@gooin/garmin-connect/dist/common/MFAManager.js';
-const { GarminConnect } = garminPkg as { GarminConnect: any };
+import { UrlClass } from '@gooin/garmin-connect/dist/garmin/UrlClass.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
@@ -10,6 +9,8 @@ import {
   type Region,
 } from './store.js';
 import { getRegionLabel, humanizeAuthError } from './utils.js';
+
+const { GarminConnect } = garminPkg as { GarminConnect: any };
 
 const DEFAULT_TIMEOUT_MS = 30000;
 
@@ -24,14 +25,14 @@ function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function buildClient(
-  region: Region,
-  username?: string,
-  password?: string,
-): any {
+ensureDir(DATA_ROOT);
+
+function buildClient(region: Region): any {
+  // Browser-ticket flow doesn't actually use the username/password —
+  // the underlying lib still requires the fields to exist.
   const config = {
-    username: username || '',
-    password: password || '',
+    username: `browser-auth-${region}@local`,
+    password: 'browser-auth-session',
     timeout: resolveTimeoutMs(),
   };
   return region === 'cn'
@@ -39,13 +40,54 @@ function buildClient(
     : new GarminConnect(config);
 }
 
+function getRegionUrl(region: Region): UrlClass {
+  return new UrlClass(region === 'cn' ? 'garmin.cn' : 'garmin.com');
+}
+
 /**
- * MFA dir is per-user so concurrent users don't trample each other.
+ * Build the Garmin SSO sign-in URL that, after a successful login by the user,
+ * redirects the browser back to `callbackUrl` with `?ticket=ST-...`.
  */
-export function getMfaManagerForUser(userId: string) {
-  const dir = path.join(DATA_ROOT, 'mfa', userId);
-  ensureDir(dir);
-  return MFAManager.getInstance({ type: 'file', dir });
+export function buildBrowserLoginUrl(region: Region, callbackUrl: string): string {
+  const url = getRegionUrl(region);
+  const params = new URLSearchParams({
+    service: callbackUrl,
+    source: callbackUrl,
+    redirectAfterAccountLoginUrl: callbackUrl,
+    redirectAfterAccountCreationUrl: callbackUrl,
+    gauthHost: url.GARMIN_SSO,
+    locale: 'en',
+    id: 'gauth-widget',
+    clientId: 'GarminConnect',
+    rememberMeShown: 'false',
+    rememberMeChecked: 'false',
+    createAccountShown: 'true',
+    openCreateAccount: 'false',
+    displayNameShown: 'false',
+    consumeServiceTicket: 'true',
+    initialFocus: 'true',
+    embedWidget: 'false',
+    socialEnabled: 'false',
+    generateExtraServiceTicket: 'false',
+    generateTwoExtraServiceTickets: 'false',
+    generateNoServiceTicket: 'false',
+    globalOptInShown: 'false',
+    globalOptInChecked: 'false',
+    mobile: 'false',
+    connectLegalTerms: 'false',
+    showTermsOfUse: 'false',
+    showPrivacyPolicy: 'false',
+    showConnectLegalAge: 'false',
+    locationPromptShown: 'false',
+    showPassword: 'true',
+    useCustomHeader: 'false',
+    mfaRequired: 'false',
+    performMFACheck: 'false',
+    permanentMFA: 'false',
+    rememberMyBrowserShown: 'false',
+    rememberMyBrowserChecked: 'false',
+  });
+  return `${url.SIGNIN_URL}?${params.toString()}`;
 }
 
 export interface AuthenticatedClient {
@@ -54,89 +96,36 @@ export interface AuthenticatedClient {
 }
 
 /**
- * Authenticate a user's Garmin account for a given region.
- * Tries cached session first; falls back to username/password login.
+ * Exchange a Garmin service ticket (returned from the official SSO login
+ * window) for OAuth1 + OAuth2 tokens, and persist them encrypted under userId.
+ *
+ * The user never gives us their Garmin password — we only ever see the
+ * post-login service ticket from the redirect.
  */
-export async function authenticate(
+export async function authenticateWithBrowserTicket(
   userId: string,
   region: Region,
-  options: {
-    interactiveSessionId?: string | null;
-    onMfaPending?: (sessionId: string) => void;
-  } = {},
+  ticket: string,
 ): Promise<AuthenticatedClient> {
-  const account = await loadGarminAccount(userId, region);
-  if (!account) {
-    throw new Error(
-      `${getRegionLabel(region)}尚未配置账号，请先在控制台保存 Garmin 账号`,
-    );
+  const trimmed = String(ticket || '').trim();
+  if (!trimmed) {
+    throw new Error(`${getRegionLabel(region)}浏览器登录回调缺少 ticket`);
   }
 
-  const client = buildClient(region, account.username, account.password);
-  let authenticated = false;
+  const client = buildClient(region);
 
-  const session = account.session as { oauth1?: any; oauth2?: any } | null;
-  const hasStoredSession = Boolean(session?.oauth1 && session?.oauth2);
-
-  if (hasStoredSession) {
-    try {
-      await client.loadToken(session!.oauth1, session!.oauth2);
-      authenticated = true;
-    } catch {
-      await clearGarminSession(userId, region);
-    }
-  }
-
-  if (!authenticated) {
-    if (!account.username || !account.password) {
-      throw new Error(
-        `${getRegionLabel(region)}本地会话已失效，请重新提交账号密码`,
-      );
-    }
-
-    let watcher: NodeJS.Timeout | null = null;
-    const interactiveSessionId = options.interactiveSessionId || null;
-
-    if (interactiveSessionId) {
-      const mfaManager = getMfaManagerForUser(userId);
-      let notified = false;
-      watcher = setInterval(async () => {
-        if (notified) return;
-        try {
-          if (await mfaManager.hasSession(interactiveSessionId)) {
-            notified = true;
-            options.onMfaPending?.(interactiveSessionId);
-          }
-        } catch {
-          // ignore
-        }
-      }, 500);
-    }
-
-    try {
-      await client.login(
-        account.username,
-        account.password,
-        interactiveSessionId || undefined,
-      );
-    } catch (error) {
-      if (watcher) clearInterval(watcher);
-      const msg = String((error as Error)?.message || '');
-      if (msg.includes('需要MFA验证')) {
-        throw new Error(
-          `${getRegionLabel(region)}账号需要验证码，请先发起“验证 Garmin 连接”流程`,
-        );
-      }
-      throw new Error(humanizeAuthError(region, error));
-    } finally {
-      if (watcher) clearInterval(watcher);
-    }
+  try {
+    await client.client.fetchOauthConsumer();
+    const oauth1 = await client.client.getOauth1Token(trimmed);
+    await client.client.exchange(oauth1);
+  } catch (error) {
+    throw new Error(humanizeAuthError(region, error));
   }
 
   const profile = await client.getUserProfile();
   if (!profile?.fullName && !profile?.userName) {
     throw new Error(
-      `${getRegionLabel(region)}登录失败，请检查账号密码或网络环境`,
+      `${getRegionLabel(region)}登录成功，但读不到 Garmin 资料，请稍后重试`,
     );
   }
 
@@ -162,13 +151,62 @@ export async function authenticate(
 }
 
 /**
- * Submit an MFA code that was previously requested for an interactive login.
+ * Authenticate by loading the cached session token. There is no
+ * password fallback — the user must complete the official Garmin login
+ * window again if the session expired.
  */
-export async function submitMfa(
+export async function authenticate(
   userId: string,
-  interactiveSessionId: string,
-  code: string,
-): Promise<void> {
-  const mfaManager = getMfaManagerForUser(userId);
-  await mfaManager.submitMFACode(interactiveSessionId, code);
+  region: Region,
+): Promise<AuthenticatedClient> {
+  const account = await loadGarminAccount(userId, region);
+  if (!account) {
+    throw new Error(
+      `${getRegionLabel(region)}尚未连接 Garmin，请在控制台点击"连接 Garmin"完成登录`,
+    );
+  }
+
+  const session = account.session as { oauth1?: any; oauth2?: any } | null;
+  if (!session?.oauth1 || !session?.oauth2) {
+    throw new Error(
+      `${getRegionLabel(region)}本地会话缺失，请重新连接 Garmin`,
+    );
+  }
+
+  const client = buildClient(region);
+  try {
+    await client.loadToken(session.oauth1, session.oauth2);
+  } catch {
+    await clearGarminSession(userId, region);
+    throw new Error(
+      `${getRegionLabel(region)}本地会话已失效，请重新连接 Garmin`,
+    );
+  }
+
+  const profile = await client.getUserProfile();
+  if (!profile?.fullName && !profile?.userName) {
+    throw new Error(
+      `${getRegionLabel(region)}会话有效但读不到 Garmin 资料，请稍后重试`,
+    );
+  }
+
+  await persistGarminSession(
+    userId,
+    region,
+    typeof client.exportToken === 'function' ? client.exportToken() : null,
+    {
+      fullName: profile.fullName || '',
+      userName: profile.userName || '',
+      location: profile.location || '',
+    },
+  );
+
+  return {
+    client,
+    profile: {
+      fullName: profile.fullName || '',
+      userName: profile.userName || '',
+      location: profile.location || '',
+    },
+  };
 }

@@ -73,15 +73,32 @@ export async function persistGarminSession(
 ): Promise<void> {
   const id = `${userId}:${region}`;
   const sessionEnc = token ? encryptForUser(userId, JSON.stringify(token)) : null;
+  const now = new Date();
+  // Upsert: rows are now created on first successful browser-ticket exchange,
+  // so we may not have a prior row to UPDATE.
   await db
-    .update(garminAccount)
-    .set({
+    .insert(garminAccount)
+    .values({
+      id,
+      userId,
+      region,
+      usernameEnc: '',
+      passwordEnc: '',
       sessionEnc,
       profile,
-      lastValidatedAt: new Date(),
-      updatedAt: new Date(),
+      lastValidatedAt: now,
+      createdAt: now,
+      updatedAt: now,
     })
-    .where(eq(garminAccount.id, id));
+    .onConflictDoUpdate({
+      target: garminAccount.id,
+      set: {
+        sessionEnc,
+        profile,
+        lastValidatedAt: now,
+        updatedAt: now,
+      },
+    });
 }
 
 export async function clearGarminSession(

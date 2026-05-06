@@ -1,17 +1,27 @@
 import { Router } from 'express';
-import { z } from 'zod';
-import { and, eq } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { garminAccount } from '../db/schema.js';
+import { deleteGarminAccount } from '../garmin/store.js';
 import {
-  upsertGarminAccount,
-  loadGarminAccount,
-  deleteGarminAccount,
-} from '../garmin/store.js';
-import { authenticate, submitMfa } from '../garmin/client.js';
-import { requireUser, type AuthedRequest } from '../lib/session.js';
+  authenticateWithBrowserTicket,
+  buildBrowserLoginUrl,
+} from '../garmin/client.js';
+import { requireUser, loadSession, type AuthedRequest } from '../lib/session.js';
 
 export const garminRouter = Router();
+
+const FRONTEND_ORIGIN = (process.env.BETTER_AUTH_TRUSTED_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)[0] || 'http://localhost:3001';
+
+function apiBaseUrl(): string {
+  return (process.env.BETTER_AUTH_URL || 'http://localhost:4001').replace(
+    /\/+$/,
+    '',
+  );
+}
 
 garminRouter.get('/accounts', requireUser, async (req, res) => {
   const userId = (req as AuthedRequest).user.id;
@@ -24,7 +34,7 @@ garminRouter.get('/accounts', requireUser, async (req, res) => {
     })
     .from(garminAccount)
     .where(eq(garminAccount.userId, userId));
-  const summary = ['cn', 'global'].map((region) => {
+  const summary = (['cn', 'global'] as const).map((region) => {
     const row = rows.find((r) => r.region === region);
     return {
       region,
@@ -37,98 +47,77 @@ garminRouter.get('/accounts', requireUser, async (req, res) => {
   res.json({ accounts: summary });
 });
 
-const saveSchema = z.object({
-  region: z.enum(['cn', 'global']),
-  username: z.string().min(1),
-  password: z.string().min(1),
-});
-
-garminRouter.post('/accounts', requireUser, async (req, res) => {
-  const userId = (req as AuthedRequest).user.id;
-  const parsed = saveSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'invalid', issues: parsed.error.issues });
+/**
+ * Kick off Garmin browser-ticket login. The user's browser is redirected to
+ * the official Garmin SSO page; after they sign in, Garmin redirects back to
+ * /api/garmin/callback/:region with `?ticket=...`.
+ *
+ * The user's BetterAuth session cookie is sent on the cross-site return
+ * navigation (SameSite=Lax), so we can identify which user the ticket
+ * belongs to without an explicit state token.
+ */
+garminRouter.get('/login/:region', requireUser, async (req, res) => {
+  const region = req.params.region as 'cn' | 'global';
+  if (region !== 'cn' && region !== 'global') {
+    res.status(400).send('invalid region');
     return;
   }
-  await upsertGarminAccount(userId, parsed.data.region, {
-    username: parsed.data.username,
-    password: parsed.data.password,
-  });
-  res.json({ ok: true });
+  const callbackUrl = `${apiBaseUrl()}/api/garmin/callback/${region}`;
+  const ssoUrl = buildBrowserLoginUrl(region, callbackUrl);
+  res.redirect(302, ssoUrl);
 });
 
-const verifySchema = z.object({
-  region: z.enum(['cn', 'global']),
-});
-
-const interactiveSessions = new Map<string, string>(); // userId:region -> interactiveSessionId
-
-garminRouter.post('/verify', requireUser, async (req, res) => {
-  const userId = (req as AuthedRequest).user.id;
-  const parsed = verifySchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'invalid' });
-    return;
-  }
-  const region = parsed.data.region;
-
-  const account = await loadGarminAccount(userId, region);
-  if (!account) {
-    res.status(400).json({ error: '尚未配置该区域的 Garmin 账号' });
+/**
+ * Garmin redirects here after the user logs in. We exchange the ticket for
+ * OAuth1+OAuth2 tokens, persist them, then bounce the browser back to the
+ * frontend's Garmin page with a status flag.
+ */
+garminRouter.get('/callback/:region', async (req, res) => {
+  const region = req.params.region as 'cn' | 'global';
+  if (region !== 'cn' && region !== 'global') {
+    res.status(400).send('invalid region');
     return;
   }
 
-  const interactiveSessionId = `${userId}:${region}:${Date.now()}`;
-  let mfaPending = false;
+  const ticket = String(req.query.ticket ?? '');
+  const frontendBase = FRONTEND_ORIGIN;
+  const back = (params: Record<string, string>) => {
+    const u = new URL(`${frontendBase}/garmin`);
+    for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+    return res.redirect(302, u.toString());
+  };
+
+  if (!ticket) {
+    return back({ region, error: '没有收到 Garmin 返回的 ticket，请重试' });
+  }
+
+  // Identify the user from their session cookie (Lax cross-site navigation
+  // does send cookies on top-level GETs).
+  const session = await loadSession(req).catch(() => null);
+  if (!session?.user) {
+    return back({
+      region,
+      error: '回调时未能识别登录会话，请重新登录后再连接 Garmin',
+    });
+  }
 
   try {
-    const result = await authenticate(userId, region, {
-      interactiveSessionId,
-      onMfaPending: () => {
-        mfaPending = true;
-        interactiveSessions.set(`${userId}:${region}`, interactiveSessionId);
-      },
-    });
-    res.json({
-      ok: true,
-      profile: result.profile,
+    const result = await authenticateWithBrowserTicket(
+      session.user.id,
+      region,
+      ticket,
+    );
+    return back({
+      region,
+      connected: '1',
+      name: result.profile.fullName || result.profile.userName || '',
     });
   } catch (error) {
-    if (mfaPending) {
-      // MFA was requested mid-flight; the login promise rejected because the user hasn't answered yet.
-      // Front-end should now collect the MFA code and POST to /verify/mfa.
-      res.json({
-        ok: false,
-        mfaRequired: true,
-        interactiveSessionId,
-      });
-      return;
-    }
-    res.status(400).json({ error: (error as Error).message });
+    return back({
+      region,
+      error: (error as Error).message,
+    });
   }
-});
-
-const mfaSchema = z.object({
-  region: z.enum(['cn', 'global']),
-  code: z.string().min(1),
-});
-
-garminRouter.post('/verify/mfa', requireUser, async (req, res) => {
-  const userId = (req as AuthedRequest).user.id;
-  const parsed = mfaSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'invalid' });
-    return;
-  }
-  const key = `${userId}:${parsed.data.region}`;
-  const sessionId = interactiveSessions.get(key);
-  if (!sessionId) {
-    res.status(400).json({ error: 'no MFA session pending' });
-    return;
-  }
-  await submitMfa(userId, sessionId, parsed.data.code);
-  interactiveSessions.delete(key);
-  res.json({ ok: true });
 });
 
 garminRouter.delete('/accounts/:region', requireUser, async (req, res) => {
