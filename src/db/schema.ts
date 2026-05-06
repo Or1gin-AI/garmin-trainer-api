@@ -18,6 +18,8 @@ export const user = pgTable('user', {
   emailVerified: boolean('email_verified').notNull().default(false),
   image: text('image'),
   role: text('role').notNull().default('user'), // 'user' | 'admin'
+  username: text('username').unique(), // BetterAuth username plugin: lowercased, unique
+  displayUsername: text('display_username'), // BetterAuth username plugin: original case
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
 });

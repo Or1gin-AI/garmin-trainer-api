@@ -2,7 +2,14 @@ import type { Request, Response, NextFunction } from 'express';
 import { auth } from './auth.js';
 
 export interface AuthedRequest extends Request {
-  user: { id: string; email: string; name: string; role: string };
+  user: {
+    id: string;
+    email: string;
+    name: string;
+    role: string;
+    username?: string | null;
+    displayUsername?: string | null;
+  };
   sessionId: string;
 }
 
@@ -34,11 +41,14 @@ export async function requireUser(
       res.status(401).json({ error: 'unauthorized' });
       return;
     }
+    const u = data.user as any;
     (req as AuthedRequest).user = {
-      id: data.user.id,
-      email: data.user.email,
-      name: data.user.name,
-      role: (data.user as any).role || 'user',
+      id: u.id,
+      email: u.email,
+      name: u.name,
+      role: u.role || 'user',
+      username: u.username ?? null,
+      displayUsername: u.displayUsername ?? null,
     };
     (req as AuthedRequest).sessionId = data.session.id;
     next();

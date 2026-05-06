@@ -45,49 +45,21 @@ function getRegionUrl(region: Region): UrlClass {
 }
 
 /**
- * Build the Garmin SSO sign-in URL that, after a successful login by the user,
- * redirects the browser back to `callbackUrl` with `?ticket=ST-...`.
+ * Build the Garmin "portal SSO" sign-in URL — the modern branded login page
+ * (gym photo + Forgot Password link). After a successful login by the user,
+ * Garmin redirects the browser back to `callbackUrl` with `?ticket=ST-...`.
+ *
+ * The legacy `/sso/signin?id=gauth-widget` URL renders the bare-bones embed
+ * widget instead; we explicitly avoid it.
  */
 export function buildBrowserLoginUrl(region: Region, callbackUrl: string): string {
   const url = getRegionUrl(region);
+  const locale = region === 'cn' ? 'zh-CN' : 'en-US';
   const params = new URLSearchParams({
-    service: callbackUrl,
-    source: callbackUrl,
-    redirectAfterAccountLoginUrl: callbackUrl,
-    redirectAfterAccountCreationUrl: callbackUrl,
-    gauthHost: url.GARMIN_SSO,
-    locale: 'en',
-    id: 'gauth-widget',
     clientId: 'GarminConnect',
-    rememberMeShown: 'false',
-    rememberMeChecked: 'false',
-    createAccountShown: 'true',
-    openCreateAccount: 'false',
-    displayNameShown: 'false',
-    consumeServiceTicket: 'true',
-    initialFocus: 'true',
-    embedWidget: 'false',
-    socialEnabled: 'false',
-    generateExtraServiceTicket: 'false',
-    generateTwoExtraServiceTickets: 'false',
-    generateNoServiceTicket: 'false',
-    globalOptInShown: 'false',
-    globalOptInChecked: 'false',
-    mobile: 'false',
-    connectLegalTerms: 'false',
-    showTermsOfUse: 'false',
-    showPrivacyPolicy: 'false',
-    showConnectLegalAge: 'false',
-    locationPromptShown: 'false',
-    showPassword: 'true',
-    useCustomHeader: 'false',
-    mfaRequired: 'false',
-    performMFACheck: 'false',
-    permanentMFA: 'false',
-    rememberMyBrowserShown: 'false',
-    rememberMyBrowserChecked: 'false',
+    service: callbackUrl,
   });
-  return `${url.SIGNIN_URL}?${params.toString()}`;
+  return `${url.GARMIN_SSO_ORIGIN}/portal/sso/${locale}/sign-in?${params.toString()}`;
 }
 
 export interface AuthenticatedClient {
