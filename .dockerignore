@@ -1,0 +1,14 @@
+node_modules
+dist
+.env
+.env.local
+.env.production
+data/
+drizzle/meta/_journal.json.bak
+.git
+.gitignore
+.github
+*.log
+.DS_Store
+README.md
+CLAUDE.md

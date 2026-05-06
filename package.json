@@ -1,0 +1,49 @@
+{
+  "name": "garmin-trainer-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "dev:worker": "tsx watch src/worker/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "start:worker": "node dist/worker/index.js",
+    "start:migrate": "node dist/scripts/migrate.js",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio",
+    "codes:gen": "tsx src/scripts/generate-codes.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "dependencies": {
+    "@gooin/garmin-connect": "^1.7.6",
+    "better-auth": "^1.6.9",
+    "cors": "^2.8.6",
+    "decompress": "^4.2.1",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "express": "^5.2.1",
+    "node-cron": "^4.2.1",
+    "pg": "^8.20.0",
+    "ws": "^8.20.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/decompress": "^4.2.7",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.6.0",
+    "@types/node-cron": "^3.0.11",
+    "@types/pg": "^8.20.0",
+    "@types/ws": "^8.18.1",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}

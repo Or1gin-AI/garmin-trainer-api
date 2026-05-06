@@ -1,0 +1,93 @@
+import { eq } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { subscription } from '../db/schema.js';
+
+export interface UserPlanInfo {
+  plan: 'free' | 'pro';
+  expiresAt: Date | null;
+  isProActive: boolean;
+  autoSyncEnabled: boolean;
+  lastAutoSyncAt: Date | null;
+}
+
+export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
+  const rows = await db
+    .select()
+    .from(subscription)
+    .where(eq(subscription.userId, userId))
+    .limit(1);
+  const row = rows[0];
+  if (!row) {
+    // lazy create
+    const now = new Date();
+    await db.insert(subscription).values({
+      userId,
+      plan: 'free',
+      autoSyncEnabled: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return {
+      plan: 'free',
+      expiresAt: null,
+      isProActive: false,
+      autoSyncEnabled: true,
+      lastAutoSyncAt: null,
+    };
+  }
+  const now = new Date();
+  const isProActive =
+    row.plan === 'pro' && (!row.expiresAt || row.expiresAt > now);
+  return {
+    plan: isProActive ? 'pro' : 'free',
+    expiresAt: row.expiresAt,
+    isProActive,
+    autoSyncEnabled: row.autoSyncEnabled,
+    lastAutoSyncAt: row.lastAutoSyncAt,
+  };
+}
+
+export async function extendProSubscription(userId: string, days: number) {
+  const now = new Date();
+  const existing = (
+    await db
+      .select()
+      .from(subscription)
+      .where(eq(subscription.userId, userId))
+      .limit(1)
+  )[0];
+  const baseTime = existing?.expiresAt && existing.expiresAt > now
+    ? existing.expiresAt.getTime()
+    : now.getTime();
+  const newExpiresAt = new Date(baseTime + days * 24 * 60 * 60 * 1000);
+  if (existing) {
+    await db
+      .update(subscription)
+      .set({ plan: 'pro', expiresAt: newExpiresAt, updatedAt: now })
+      .where(eq(subscription.userId, userId));
+  } else {
+    await db.insert(subscription).values({
+      userId,
+      plan: 'pro',
+      expiresAt: newExpiresAt,
+      autoSyncEnabled: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+  return newExpiresAt;
+}
+
+export async function setAutoSyncEnabled(userId: string, enabled: boolean) {
+  await db
+    .update(subscription)
+    .set({ autoSyncEnabled: enabled, updatedAt: new Date() })
+    .where(eq(subscription.userId, userId));
+}
+
+export async function markAutoSync(userId: string) {
+  await db
+    .update(subscription)
+    .set({ lastAutoSyncAt: new Date(), updatedAt: new Date() })
+    .where(eq(subscription.userId, userId));
+}
