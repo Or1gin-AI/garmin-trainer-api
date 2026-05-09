@@ -71,7 +71,7 @@ drizzle/                   # checked-in SQL migrations (drizzle-kit output)
 
 ### Garmin sync
 
-- Cloud-only path is browser-ticket: frontend hosts gauth-widget → user logs in inside Garmin's iframe → `serviceTicket` event → frontend POSTs to `/api/garmin/callback/:region` → backend `authenticateWithBrowserTicket(userId, region, ticket)` exchanges via `getOauth1Token` (matches `login-url=GARMIN_SSO_EMBED` hardcoded in lib) → encrypted `oauth1`+`oauth2` saved to `garmin_account.session_enc`.
+- Cloud-only path is browser-ticket: frontend hosts gauth-widget → user logs in inside Garmin's iframe → SUCCESS event with `serviceTicket` + `serviceUrl` → frontend POSTs both to `/api/garmin/callback/:region` → backend `authenticateWithBrowserTicket(userId, region, ticket, serviceUrl)` exchanges via `getOauth1Token`. The lib hardcodes `login-url=GARMIN_SSO_EMBED` but the gauth-widget's Mode C ticket is bound to whatever URL Garmin chose, so the function defines an own property on the `UrlClass` instance to shadow `GARMIN_SSO_EMBED` for the call (and restores it in `finally`). Encrypted `oauth1`+`oauth2` then saved to `garmin_account.session_enc`.
 - `authenticate(userId, region)` only loads the cached session; on failure it clears and throws "请重新连接". There is intentionally no password fallback — see umbrella for rationale.
 - Sync queue: `POST /api/sync/jobs` inserts a `queued` row. Worker claims one with:
   ```sql

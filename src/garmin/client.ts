@@ -45,16 +45,59 @@ export interface AuthenticatedClient {
 }
 
 /**
+ * `@gooin/garmin-connect` calls `/oauth-service/oauth/preauthorized` with
+ * `login-url=this.url.GARMIN_SSO_EMBED` hardcoded. When the gauth-widget binds
+ * the ticket to a different service URL (Mode C, where we don't pass
+ * redirectAfterAccountLoginUrl), we need that exchange to use whatever URL
+ * Garmin actually bound the ticket to. `GARMIN_SSO_EMBED` is a getter on the
+ * UrlClass prototype, so define an own property on the instance that shadows
+ * it for the lifetime of this call.
+ */
+function overrideLoginUrl(httpClient: any, serviceUrl: string | null): () => void {
+  if (!serviceUrl) return () => {};
+  const url = httpClient?.url;
+  if (!url) return () => {};
+  const had = Object.prototype.hasOwnProperty.call(url, 'GARMIN_SSO_EMBED');
+  const previous = had ? url.GARMIN_SSO_EMBED : undefined;
+  Object.defineProperty(url, 'GARMIN_SSO_EMBED', {
+    value: serviceUrl,
+    writable: true,
+    configurable: true,
+    enumerable: true,
+  });
+  return () => {
+    if (had) {
+      Object.defineProperty(url, 'GARMIN_SSO_EMBED', {
+        value: previous,
+        writable: true,
+        configurable: true,
+        enumerable: true,
+      });
+    } else {
+      delete url.GARMIN_SSO_EMBED;
+    }
+  };
+}
+
+/**
  * Exchange a Garmin service ticket (returned from the official SSO login
  * window) for OAuth1 + OAuth2 tokens, and persist them encrypted under userId.
  *
  * The user never gives us their Garmin password — we only ever see the
  * post-login service ticket from the redirect.
+ *
+ * `serviceUrl` is the CAS service the ticket is bound to (the gauth-widget
+ * sends it back alongside the ticket). Garmin's CAS validator at
+ * `/oauth-service/oauth/preauthorized` only accepts the ticket if `login-url`
+ * matches that service. The lib hardcodes `login-url=GARMIN_SSO_EMBED`, so we
+ * monkey-patch the URL getter for this single call when the frontend supplies
+ * a different binding.
  */
 export async function authenticateWithBrowserTicket(
   userId: string,
   region: Region,
   ticket: string,
+  serviceUrl: string | null = null,
 ): Promise<AuthenticatedClient> {
   const trimmed = String(ticket || '').trim();
   if (!trimmed) {
@@ -62,6 +105,7 @@ export async function authenticateWithBrowserTicket(
   }
 
   const client = buildClient(region);
+  const restoreLoginUrl = overrideLoginUrl(client.client, serviceUrl);
 
   try {
     await client.client.fetchOauthConsumer();
@@ -69,6 +113,8 @@ export async function authenticateWithBrowserTicket(
     await client.client.exchange(oauth1);
   } catch (error) {
     throw new Error(humanizeAuthError(region, error));
+  } finally {
+    restoreLoginUrl();
   }
 
   const profile = await client.getUserProfile();

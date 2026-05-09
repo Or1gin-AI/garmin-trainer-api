@@ -71,8 +71,11 @@ garminRouter.post('/callback/:region', requireUser, async (req, res) => {
     res.status(400).json({ ok: false, error: '缺少 ticket' });
     return;
   }
+  const rawServiceUrl = req.body && req.body.serviceUrl;
+  const serviceUrl =
+    typeof rawServiceUrl === 'string' && rawServiceUrl.trim() ? rawServiceUrl.trim() : null;
   try {
-    const result = await authenticateWithBrowserTicket(userId, region, ticket);
+    const result = await authenticateWithBrowserTicket(userId, region, ticket, serviceUrl);
     res.json({ ok: true, profile: result.profile });
   } catch (error) {
     res.status(400).json({ ok: false, error: (error as Error).message });
