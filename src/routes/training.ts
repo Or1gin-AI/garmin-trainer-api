@@ -43,6 +43,15 @@ import { parameterizeWorkout } from '../training/parameterizer.js';
 import type { ParameterizedWorkout } from '../training/parameterizer.js';
 import { validatePlan } from '../training/validation.js';
 import { getTemplate } from '../training/templates/index.js';
+import {
+  runChatTurn,
+  ChatLlmNotConfiguredError,
+  type ToolCall as ChatToolCall,
+} from '../training/chat.js';
+import {
+  llmParameterizeWorkout,
+  InvalidLlmWorkoutError,
+} from '../training/llm-parameterizer.js';
 
 export const trainingRouter = Router();
 
@@ -84,6 +93,10 @@ const regenerateDaySchema = z.object({
 
 const workoutPatchSchema = z.object({
   status: z.enum(['planned', 'completed', 'skipped']),
+});
+
+const chatBodySchema = z.object({
+  message: z.string().min(1).max(5000),
 });
 
 // ---------------------------------------------------------------------------
@@ -724,3 +737,432 @@ trainingRouter.patch('/workouts/:id', requireUser, async (req, res) => {
 
   res.json({ workout: updated });
 });
+
+// ---------------------------------------------------------------------------
+// GET /api/training/plans/:id/messages
+// ---------------------------------------------------------------------------
+
+trainingRouter.get('/plans/:id/messages', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const planId = String(req.params.id);
+  const planRow = await loadOwnedPlan(userId, planId);
+  if (!planRow) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  const messages: ChatMessage[] = await db
+    .select()
+    .from(chatMessage)
+    .where(eq(chatMessage.planId, planId))
+    .orderBy(asc(chatMessage.createdAt))
+    .limit(200);
+  res.json({ messages });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/training/plans/:id/chat  — SSE
+// ---------------------------------------------------------------------------
+
+trainingRouter.post(
+  '/plans/:id/chat',
+  requireUser,
+  requireProAndQuota('chat_message'),
+  async (req, res) => {
+    const userId = (req as AuthedRequest).user.id;
+    const planId = String(req.params.id);
+
+    const parsed = chatBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      const first = parsed.error.issues[0];
+      res.status(400).json({
+        error: 'invalid_input',
+        field: first?.path.join('.') ?? null,
+        reason: first?.message ?? 'invalid input',
+      });
+      return;
+    }
+    const userMessageContent = parsed.data.message;
+
+    const planRow = await loadOwnedPlan(userId, planId);
+    if (!planRow) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+
+    const requestRaw = planRow.request as unknown;
+    const requestParsed = planRequestSchema.safeParse(requestRaw);
+    if (!requestParsed.success) {
+      res.status(500).json({ error: 'plan_request_corrupt' });
+      return;
+    }
+    const request = toScheduleRequest(requestParsed.data);
+
+    openSse(res);
+    const heartbeat = startHeartbeat(res);
+    const abort = new AbortController();
+    res.once('close', () => abort.abort());
+
+    // Persist the user's message first so it survives even if the assistant
+    // turn crashes mid-stream.
+    const userMsgId = crypto.randomUUID();
+    const userMsgCreatedAt = new Date();
+    try {
+      await db.insert(chatMessage).values({
+        id: userMsgId,
+        planId,
+        userId,
+        role: 'user',
+        content: userMessageContent,
+        toolCalls: null,
+        toolResultRefs: null,
+        createdAt: userMsgCreatedAt,
+      });
+    } catch (err) {
+      console.error('[training/chat] insert user msg failed:', (err as Error).message);
+      clearInterval(heartbeat);
+      endSse(res, 'error', { error: 'persist_user_message_failed' });
+      return;
+    }
+
+    writeEvent(res, 'user_message_saved', {
+      message: {
+        id: userMsgId,
+        planId,
+        userId,
+        role: 'user',
+        content: userMessageContent,
+        toolCalls: null,
+        toolResultRefs: null,
+        createdAt: userMsgCreatedAt.toISOString(),
+      },
+    });
+
+    try {
+      const ctx = await loadDerivedContext(userId, request);
+
+      // Load the latest snapshot of workouts (in case prior tool calls
+      // mutated them). Use this list both for the LLM context and as a
+      // working set for tool dispatch.
+      let workoutsSnapshot: Workout[] = await db
+        .select()
+        .from(workout)
+        .where(eq(workout.planId, planId))
+        .orderBy(asc(workout.dayIndex));
+
+      // History, oldest first, capped at 50 (NOT counting the just-inserted
+      // user message — runChatTurn appends the user message itself).
+      const historyAll: ChatMessage[] = await db
+        .select()
+        .from(chatMessage)
+        .where(eq(chatMessage.planId, planId))
+        .orderBy(asc(chatMessage.createdAt))
+        .limit(200);
+      const historyForTurn = historyAll
+        .filter((m) => m.id !== userMsgId)
+        .slice(-50);
+
+      const toolResultRefs: Array<{
+        workoutId: string;
+        before: unknown;
+        after: unknown;
+      }> = [];
+
+      const result = await runChatTurn({
+        plan: planRow,
+        workouts: workoutsSnapshot,
+        history: historyForTurn,
+        userMessage: userMessageContent,
+        athleteProfile: ctx.athleteProfile,
+        recentState: ctx.recentState,
+        signal: abort.signal,
+        onTextDelta: (text) => {
+          writeEvent(res, 'text_delta', { text });
+        },
+        onToolCall: async (call) => {
+          writeEvent(res, 'tool_call', {
+            name: call.name,
+            arguments: call.arguments,
+          });
+          const dispatched = await dispatchChatToolCall({
+            call,
+            planId,
+            request,
+            ctx,
+            workoutsSnapshot,
+            signal: abort.signal,
+          });
+          if (dispatched.updatedWorkout) {
+            workoutsSnapshot = workoutsSnapshot.map((w) =>
+              w.id === dispatched.updatedWorkout!.id ? dispatched.updatedWorkout! : w,
+            );
+            writeEvent(res, 'workout_updated', {
+              workout: dispatched.updatedWorkout,
+            });
+          }
+          if (dispatched.refEntry) {
+            toolResultRefs.push(dispatched.refEntry);
+          }
+          return dispatched.toolResult;
+        },
+      });
+
+      const assistantId = crypto.randomUUID();
+      const assistantCreatedAt = new Date();
+      const persistedToolCalls = result.toolCalls.map((tc) => ({
+        name: tc.name,
+        arguments: tc.arguments as unknown,
+      }));
+      const persistedToolResultRefs = toolResultRefs.length > 0 ? toolResultRefs : null;
+
+      try {
+        await db.insert(chatMessage).values({
+          id: assistantId,
+          planId,
+          userId,
+          role: 'assistant',
+          content: result.assistantContent,
+          toolCalls: persistedToolCalls.length > 0 ? persistedToolCalls : null,
+          toolResultRefs: persistedToolResultRefs,
+          createdAt: assistantCreatedAt,
+        });
+      } catch (err) {
+        console.error(
+          '[training/chat] insert assistant msg failed:',
+          (err as Error).message,
+        );
+        clearInterval(heartbeat);
+        endSse(res, 'error', { error: 'persist_assistant_message_failed' });
+        return;
+      }
+
+      writeEvent(res, 'assistant_message_saved', {
+        message: {
+          id: assistantId,
+          planId,
+          userId,
+          role: 'assistant',
+          content: result.assistantContent,
+          toolCalls: persistedToolCalls.length > 0 ? persistedToolCalls : null,
+          toolResultRefs: persistedToolResultRefs,
+          createdAt: assistantCreatedAt.toISOString(),
+        },
+      });
+
+      // TODO(U11): consumeQuota(userId, 'chat_message',
+      //   { inputTokens: result.meta.inputTokens, outputTokens: result.meta.outputTokens })
+
+      clearInterval(heartbeat);
+      endSse(res, 'done', {});
+    } catch (err) {
+      const code =
+        err instanceof ChatLlmNotConfiguredError
+          ? 'llm_not_configured'
+          : 'chat_failed';
+      console.error('[training/chat] failed:', (err as Error).message);
+      clearInterval(heartbeat);
+      endSse(res, 'error', { error: code });
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Tool dispatch (chat)
+// ---------------------------------------------------------------------------
+
+interface DispatchChatToolArgs {
+  call: ChatToolCall;
+  planId: string;
+  request: ScheduleRequest;
+  ctx: DerivedContext;
+  workoutsSnapshot: Workout[];
+  signal?: AbortSignal;
+}
+
+interface DispatchChatToolResult {
+  toolResult: string;
+  updatedWorkout?: Workout;
+  refEntry?: { workoutId: string; before: unknown; after: unknown };
+}
+
+async function dispatchChatToolCall(
+  args: DispatchChatToolArgs,
+): Promise<DispatchChatToolResult> {
+  const { call, planId, request, ctx, workoutsSnapshot, signal } = args;
+
+  if (call.name === 'regenerate_day') {
+    const dayIndex = call.arguments.dayIndex;
+    const before = workoutsSnapshot.find((w) => w.dayIndex === dayIndex);
+    if (!before) {
+      return {
+        toolResult: JSON.stringify({
+          error: `day ${dayIndex} not found in current plan`,
+        }),
+      };
+    }
+
+    // Build a ScheduleEntry from the existing workout row so we can re-run
+    // the parameterizer in place (without re-running the weekly scheduler).
+    const entry: ScheduleEntry = {
+      dayIndex: before.dayIndex,
+      date: String(before.date),
+      dayLabel: '周' + '一二三四五六日'[before.dayIndex - 1],
+      sport: before.sport as ScheduleEntry['sport'],
+      templateId: before.templateId,
+    };
+
+    const tpl = getTemplate(before.templateId) ?? getTemplate('rest.full.v1');
+    if (!tpl) {
+      return {
+        toolResult: JSON.stringify({
+          error: `template ${before.templateId} not found`,
+        }),
+      };
+    }
+
+    const progression =
+      ctx.recentState.fatigue === 'tired' || ctx.recentState.fatigue === 'high_risk'
+        ? 'conservative'
+        : 'normal';
+
+    let parameterized: ParameterizedWorkout;
+    const isRest =
+      tpl.fixed.sport === 'rest' || tpl.fixed.sport === 'mobility';
+    if (isRest) {
+      parameterized = parameterizeWorkout({
+        template: tpl,
+        athleteProfile: ctx.athleteProfile,
+        recentState: ctx.recentState,
+        request: {
+          targetMetricPreference: request.targetMetricPreference,
+          availableTime: request.availableTime,
+        },
+        scheduleEntry: entry,
+        progression,
+      });
+    } else {
+      try {
+        const llmRes = await llmParameterizeWorkout({
+          template: tpl,
+          athleteProfile: ctx.athleteProfile,
+          recentState: ctx.recentState,
+          request: {
+            targetMetricPreference: request.targetMetricPreference,
+            availableTime: request.availableTime,
+          },
+          scheduleEntry: entry,
+          progression,
+          signal,
+        });
+        parameterized = {
+          ...llmRes.workout,
+          parameterSource: {
+            ...llmRes.workout.parameterSource,
+            replacedVariables: {
+              ...llmRes.workout.parameterSource.replacedVariables,
+              __source: 'llm-chat',
+            },
+          },
+        };
+      } catch (err) {
+        if (err instanceof InvalidLlmWorkoutError) {
+          console.error(
+            `[training/chat] llm parameterize day ${dayIndex} invalid: ${err.violations.join('; ')}`,
+          );
+        } else {
+          console.error(
+            `[training/chat] llm parameterize day ${dayIndex} failed: ${(err as Error).message}`,
+          );
+        }
+        parameterized = parameterizeWorkout({
+          template: tpl,
+          athleteProfile: ctx.athleteProfile,
+          recentState: ctx.recentState,
+          request: {
+            targetMetricPreference: request.targetMetricPreference,
+            availableTime: request.availableTime,
+          },
+          scheduleEntry: entry,
+          progression,
+        });
+      }
+    }
+
+    const row = buildWorkoutRow(planId, entry, parameterized);
+    const updated = (
+      await db
+        .update(workout)
+        .set({
+          sport: row.sport,
+          templateId: row.templateId,
+          workoutType: row.workoutType,
+          title: row.title,
+          intensity: row.intensity,
+          durationMinutes: row.durationMinutes,
+          distanceKm: row.distanceKm,
+          targetMetric: row.targetMetric,
+          targetHeartRate: row.targetHeartRate,
+          targetPace: row.targetPace,
+          targetPower: row.targetPower,
+          workoutStructure: row.workoutStructure,
+          targets: row.targets,
+          parameterSource: row.parameterSource,
+          adaptation: row.adaptation,
+        })
+        .where(and(eq(workout.planId, planId), eq(workout.dayIndex, dayIndex)))
+        .returning()
+    )[0];
+
+    if (!updated) {
+      return {
+        toolResult: JSON.stringify({
+          error: `failed to persist regenerated day ${dayIndex}`,
+        }),
+      };
+    }
+
+    return {
+      toolResult: JSON.stringify({
+        ok: true,
+        dayIndex,
+        workout: parameterized,
+      }),
+      updatedWorkout: updated,
+      refEntry: { workoutId: updated.id, before, after: updated },
+    };
+  }
+
+  if (call.name === 'update_workout_field') {
+    const { workoutId, value } = call.arguments;
+    const before = workoutsSnapshot.find((w) => w.id === workoutId);
+    if (!before) {
+      return {
+        toolResult: JSON.stringify({
+          error: `workout ${workoutId} not found in this plan`,
+        }),
+      };
+    }
+    const updated = (
+      await db
+        .update(workout)
+        .set({ status: value })
+        .where(and(eq(workout.id, workoutId), eq(workout.planId, planId)))
+        .returning()
+    )[0];
+    if (!updated) {
+      return {
+        toolResult: JSON.stringify({
+          error: `failed to update workout ${workoutId}`,
+        }),
+      };
+    }
+    return {
+      toolResult: JSON.stringify({ ok: true, workoutId, status: value }),
+      updatedWorkout: updated,
+      refEntry: { workoutId, before, after: updated },
+    };
+  }
+
+  return {
+    toolResult: JSON.stringify({ error: 'unknown tool call' }),
+  };
+}
