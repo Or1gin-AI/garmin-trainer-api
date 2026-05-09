@@ -3,7 +3,11 @@ import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { username } from 'better-auth/plugins';
 import { db } from '../db/index.js';
 import * as schema from '../db/schema.js';
-import { sendEmail, buildPasswordResetEmail } from './mailer.js';
+import {
+  sendEmail,
+  buildPasswordResetEmail,
+  buildEmailVerificationEmail,
+} from './mailer.js';
 
 const trustedOrigins = (process.env.BETTER_AUTH_TRUSTED_ORIGINS || '')
   .split(',')
@@ -31,7 +35,8 @@ export const auth = betterAuth({
   }),
   emailAndPassword: {
     enabled: true,
-    autoSignIn: true,
+    autoSignIn: false,
+    requireEmailVerification: true,
     minPasswordLength: 8,
     sendResetPassword: async ({ user, url }) => {
       // BetterAuth's `url` includes a `callbackURL` query param. The frontend
@@ -39,7 +44,16 @@ export const auth = betterAuth({
       const { subject, html } = buildPasswordResetEmail(user.name || '', url);
       await sendEmail(user.email, subject, html);
     },
-    resetPasswordTokenExpiresIn: 3600, // 1 hour
+    resetPasswordTokenExpiresIn: 3600,
+  },
+  emailVerification: {
+    sendOnSignUp: true,
+    autoSignInAfterVerification: true,
+    expiresIn: 60 * 60,
+    sendVerificationEmail: async ({ user, url }) => {
+      const { subject, html } = buildEmailVerificationEmail(user.name || '', url);
+      await sendEmail(user.email, subject, html);
+    },
   },
   plugins: [
     username({
