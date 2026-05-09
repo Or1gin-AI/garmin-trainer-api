@@ -153,6 +153,8 @@ export const syncJob = pgTable(
       uploaded?: number;
       skipped?: number;
       failed?: number;
+      cnToGlobal?: { uploaded: number; skipped: number; failed: number };
+      globalToCn?: { uploaded: number; skipped: number; failed: number };
     } | null>(),
     error: text('error'),
     queuedAt: timestamp('queued_at').notNull().defaultNow(),
@@ -324,19 +326,28 @@ export const aiUsage = pgTable(
 
 // Admin-managed OpenAI-compatible LLM provider config. apiKeyEncrypted holds
 // the string format produced by lib/crypto.ts ("iv.tag.cipher", base64-joined),
-// stored as text since it's ASCII-safe. Application enforces "at most one row
-// with isActive = true" — no partial unique index here.
-export const llmConfig = pgTable('llm_config', {
-  id: serial('id').primaryKey(),
-  name: text('name').notNull().unique(), // 'primary' | 'fallback' | etc
-  baseUrl: text('base_url').notNull(),
-  apiKeyEncrypted: text('api_key_encrypted').notNull(),
-  model: text('model').notNull(),
-  maxOutputTokens: integer('max_output_tokens').notNull().default(4096),
-  isActive: boolean('is_active').notNull().default(false),
-  createdAt: timestamp('created_at').notNull().defaultNow(),
-  updatedAt: timestamp('updated_at').notNull().defaultNow(),
-});
+// stored as text since it's ASCII-safe. The partial unique index on is_active
+// enforces "at most one row active" at the DB level, so concurrent activates
+// can't both win.
+export const llmConfig = pgTable(
+  'llm_config',
+  {
+    id: serial('id').primaryKey(),
+    name: text('name').notNull().unique(), // 'primary' | 'fallback' | etc
+    baseUrl: text('base_url').notNull(),
+    apiKeyEncrypted: text('api_key_encrypted').notNull(),
+    model: text('model').notNull(),
+    maxOutputTokens: integer('max_output_tokens').notNull().default(4096),
+    isActive: boolean('is_active').notNull().default(false),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('llm_config_one_active_idx')
+      .on(t.isActive)
+      .where(sql`${t.isActive}`),
+  ],
+);
 
 export type User = typeof user.$inferSelect;
 export type Subscription = typeof subscription.$inferSelect;

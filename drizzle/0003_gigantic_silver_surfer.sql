@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "llm_config_one_active_idx" ON "llm_config" USING btree ("is_active") WHERE "llm_config"."is_active";

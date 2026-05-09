@@ -8,6 +8,7 @@ import { garminRouter } from './routes/garmin.js';
 import { syncRouter } from './routes/sync.js';
 import { redemptionRouter } from './routes/redemption.js';
 import { adminRouter } from './routes/admin.js';
+import { adminAiRouter } from './routes/admin-ai.js';
 
 const app = express();
 
@@ -39,6 +40,7 @@ app.use('/api/garmin', garminRouter);
 app.use('/api/sync', syncRouter);
 app.use('/api/redemption', redemptionRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/admin', adminAiRouter);
 
 // 404
 app.use((_req, res) => {
