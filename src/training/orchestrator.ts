@@ -1,13 +1,21 @@
-// Plan generation orchestrator (U7).
+// Plan generation orchestrator.
 //
-// Pure async function (async signature for U9 forward-compat — V1 doesn't
-// await anything internal). Wires scheduler + parameterizer + validation
-// together and returns a GeneratedPlan that the route handler persists and
-// streams.
+// U9: LLM-first with deterministic fallback per stage.
 //
-// V1 is fully deterministic: provider='deterministic', model='v1', no LLM
-// calls. U9 will replace the body of this function with an LLM-driven
-// version while keeping the same input/output contract.
+//   1) Schedule via llmBuildWeeklySchedule. On LlmNotConfiguredError or
+//      InvalidLlmScheduleError (after one retry that injects the violations),
+//      fall back to U7's deterministic buildWeeklySchedule.
+//   2) For each day, parameterize via llmParameterizeWorkout. Each day falls
+//      back independently to U7's deterministic parameterizeWorkout on error.
+//   3) Run validatePlan. If violations, run U7's existing one-retry-with-
+//      downgrade pass.
+//   4) Stream summary / monitoring / adjustment via llmStreamSummary, with
+//      onSummaryDelta forwarded to the SSE route. Fall back to deterministic
+//      strings if LLM is not configured / fails.
+//
+// The exported signature (generatePlan, GeneratePlanInput, GeneratedPlan)
+// stays compatible with U7 — only the optional onSummaryDelta callback and
+// modelMeta field shape are widened.
 
 import { buildWeeklySchedule } from './scheduler.js';
 import type { ScheduleRequest, ScheduleResult, ScheduleEntry } from './scheduler.js';
@@ -18,14 +26,41 @@ import type { Violation } from './validation.js';
 import type { AthleteProfile } from './athlete-profile.js';
 import type { RecentState } from './recent-state.js';
 import { getTemplate, type WorkoutTemplate } from './templates/index.js';
+import {
+  llmBuildWeeklySchedule,
+  LlmNotConfiguredError,
+  InvalidLlmScheduleError,
+  type LlmScheduleMeta,
+} from './llm-scheduler.js';
+import {
+  llmParameterizeWorkout,
+  InvalidLlmWorkoutError,
+} from './llm-parameterizer.js';
+import { llmStreamSummary, type SummaryDeltaKind } from './llm-summary.js';
 
-// LLM imports deferred to U9 — keep this file LLM-free.
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
 
 export interface GeneratePlanInput {
   userId: string;
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
   recentState: RecentState;
+  signal?: AbortSignal;
+  onSummaryDelta?: (delta: { kind: SummaryDeltaKind; text: string }) => void;
+}
+
+export interface ModelMeta {
+  provider: string;
+  model: string;
+  totalTokens: number;
+  costCents: number;
+  // Per-stage diagnostics (best-effort).
+  scheduleSource: 'llm' | 'deterministic';
+  parameterizerLlmCount: number;
+  parameterizerFallbackCount: number;
+  summarySource: 'llm' | 'deterministic';
 }
 
 export interface GeneratedPlan {
@@ -35,34 +70,130 @@ export interface GeneratedPlan {
   summary: string;
   monitoring: string;
   adjustmentRules: string;
-  modelMeta: {
-    provider: 'deterministic';
-    model: 'v1';
-    totalTokens: 0;
-    costCents: 0;
-  };
+  modelMeta: ModelMeta;
 }
 
 const HARD_STIMULI: ReadonlySet<string> = new Set(['threshold', 'vo2max', 'anaerobic']);
+const DETERMINISTIC_PROVIDER = 'deterministic-fallback';
+const DETERMINISTIC_MODEL = 'v1';
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
 
 export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedPlan> {
-  const { request, athleteProfile, recentState } = input;
+  const { request, athleteProfile, recentState, signal } = input;
 
-  // 1) Build schedule.
-  const schedule = buildWeeklySchedule({ request, athleteProfile, recentState });
+  // Stage 1: schedule.
+  const stageOne = await runScheduleStage({
+    request,
+    athleteProfile,
+    recentState,
+    signal,
+  });
+  const schedule = stageOne.schedule;
 
-  // 2) Parameterize each day.
-  const workouts: ParameterizedWorkout[] = schedule.days.map((entry) =>
-    parameterizeForEntry(entry, athleteProfile, recentState, request),
-  );
+  let totalInputTokens = stageOne.meta?.inputTokens ?? 0;
+  let totalOutputTokens = stageOne.meta?.outputTokens ?? 0;
+  const provider = stageOne.meta?.provider ?? DETERMINISTIC_PROVIDER;
+  const model = stageOne.meta?.model ?? DETERMINISTIC_MODEL;
 
-  // 3) Validate.
-  const baseCap =
-    request.maxHardSessionsPerWeek ??
-    (athleteProfile.experienceLevel === 'advanced' && recentState.fatigue !== 'tired'
-      ? 3
-      : 2);
+  // Stage 2: parameterize each day.
+  let llmParamCount = 0;
+  let fallbackParamCount = 0;
+  const workouts: ParameterizedWorkout[] = [];
 
+  for (const entry of schedule.days) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const tpl = getTemplate(entry.templateId) ?? getTemplate('rest.full.v1');
+    if (!tpl) {
+      // Should never happen — both rest templates are baked in.
+      throw new Error(`Missing template ${entry.templateId} and no rest fallback`);
+    }
+    const progression = decideProgression(athleteProfile, recentState, entry);
+    const tplResolved: WorkoutTemplate = tpl;
+
+    // Skip LLM for rest/mobility — they're trivially deterministic and the
+    // model would just fill in zeros.
+    const isRest = tplResolved.fixed.sport === 'rest' || tplResolved.fixed.sport === 'mobility';
+    if (isRest) {
+      workouts.push(
+        parameterizeWorkout({
+          template: tplResolved,
+          athleteProfile,
+          recentState,
+          request: {
+            targetMetricPreference: request.targetMetricPreference,
+            availableTime: request.availableTime,
+          },
+          scheduleEntry: entry,
+          progression,
+        }),
+      );
+      fallbackParamCount += 1;
+      continue;
+    }
+
+    try {
+      const llmRes = await llmParameterizeWorkout({
+        template: tplResolved,
+        athleteProfile,
+        recentState,
+        request: {
+          targetMetricPreference: request.targetMetricPreference,
+          availableTime: request.availableTime,
+        },
+        scheduleEntry: entry,
+        progression,
+        signal,
+      });
+      workouts.push({
+        ...llmRes.workout,
+        parameterSource: {
+          ...llmRes.workout.parameterSource,
+          replacedVariables: {
+            ...llmRes.workout.parameterSource.replacedVariables,
+            __source: 'llm',
+          },
+        },
+      });
+      totalInputTokens += llmRes.meta.inputTokens;
+      totalOutputTokens += llmRes.meta.outputTokens;
+      llmParamCount += 1;
+    } catch (err) {
+      if (signal?.aborted) {
+        throw err;
+      }
+      if (err instanceof InvalidLlmWorkoutError) {
+        console.error(
+          `[orchestrator] day ${entry.dayIndex} llm parameterize invalid: ${err.violations.join('; ')}`,
+        );
+      } else {
+        console.error(
+          `[orchestrator] day ${entry.dayIndex} llm parameterize failed: ${(err as Error).message}`,
+        );
+      }
+      workouts.push(
+        parameterizeWorkout({
+          template: tplResolved,
+          athleteProfile,
+          recentState,
+          request: {
+            targetMetricPreference: request.targetMetricPreference,
+            availableTime: request.availableTime,
+          },
+          scheduleEntry: entry,
+          progression,
+        }),
+      );
+      fallbackParamCount += 1;
+    }
+  }
+
+  // Stage 3: validate + retry-with-downgrade.
+  const baseCap = computeBaseCap(request, athleteProfile, recentState);
   const hoursSinceLatest = computeHoursSinceLatest(recentState);
 
   let violations = validatePlan({
@@ -77,7 +208,6 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     },
   });
 
-  // 4) Single retry: try downgrading offending day's template.
   if (violations.length > 0) {
     const dayIndexes = collectViolatingDays(violations);
     let mutated = false;
@@ -97,13 +227,22 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
         sport: downgradeTpl.fixed.sport,
         reason: `${entry.reason ?? ''} 校验未过自动降级为 ${downgradeId}。`.trim(),
       };
-      workouts[idx] = parameterizeForEntry(
-        schedule.days[idx],
+      // Use deterministic parameterizer for the downgrade path so we don't
+      // burn another LLM round-trip on a fix-up.
+      workouts[idx] = parameterizeWorkout({
+        template: downgradeTpl,
         athleteProfile,
         recentState,
-        request,
-      );
+        request: {
+          targetMetricPreference: request.targetMetricPreference,
+          availableTime: request.availableTime,
+        },
+        scheduleEntry: schedule.days[idx],
+        progression: decideProgression(athleteProfile, recentState, schedule.days[idx]),
+      });
       mutated = true;
+      fallbackParamCount += 1;
+      llmParamCount = Math.max(0, llmParamCount - 1);
     }
     if (mutated) {
       violations = validatePlan({
@@ -120,51 +259,197 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     }
   }
 
-  // 5) Summary / monitoring / adjustment.
-  const summary = buildSummary(schedule.days, recentState, baseCap);
-  const monitoring = buildMonitoring(recentState);
-  const adjustmentRules = buildAdjustmentRules(baseCap);
+  // Stage 4: summary.
+  const summaryStage = await runSummaryStage({
+    schedule,
+    workouts,
+    request,
+    athleteProfile,
+    recentState,
+    signal,
+    onDelta: input.onSummaryDelta,
+  });
+
+  totalInputTokens += summaryStage.meta?.inputTokens ?? 0;
+  totalOutputTokens += summaryStage.meta?.outputTokens ?? 0;
+
+  const totalTokens = totalInputTokens + totalOutputTokens;
 
   return {
     schedule,
     workouts,
     violations,
-    summary,
-    monitoring,
-    adjustmentRules,
+    summary: summaryStage.summary,
+    monitoring: summaryStage.monitoring,
+    adjustmentRules: summaryStage.adjustmentRules,
     modelMeta: {
-      provider: 'deterministic',
-      model: 'v1',
-      totalTokens: 0,
+      provider,
+      model,
+      totalTokens,
       costCents: 0,
+      scheduleSource: stageOne.source,
+      parameterizerLlmCount: llmParamCount,
+      parameterizerFallbackCount: fallbackParamCount,
+      summarySource: summaryStage.source,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1: schedule
+// ---------------------------------------------------------------------------
+
+interface ScheduleStageResult {
+  schedule: ScheduleResult;
+  source: 'llm' | 'deterministic';
+  meta?: LlmScheduleMeta;
+}
+
+async function runScheduleStage(args: {
+  request: ScheduleRequest;
+  athleteProfile: AthleteProfile;
+  recentState: RecentState;
+  signal?: AbortSignal;
+}): Promise<ScheduleStageResult> {
+  const { request, athleteProfile, recentState, signal } = args;
+
+  let firstViolations: string[] | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    try {
+      const res = await llmBuildWeeklySchedule({
+        request,
+        athleteProfile,
+        recentState,
+        signal,
+        retryViolations: firstViolations ?? undefined,
+      });
+      return { schedule: res.schedule, source: 'llm', meta: res.meta };
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      if (err instanceof LlmNotConfiguredError) {
+        console.error('[orchestrator] llm scheduler not configured, using deterministic');
+        break;
+      }
+      if (err instanceof InvalidLlmScheduleError) {
+        console.error(
+          `[orchestrator] llm schedule attempt ${attempt + 1} invalid: ${err.violations.join('; ')}`,
+        );
+        if (attempt === 0) {
+          firstViolations = err.violations;
+          continue;
+        }
+        break;
+      }
+      console.error(
+        `[orchestrator] llm schedule failed: ${(err as Error).message}`,
+      );
+      break;
+    }
+  }
+
+  return {
+    schedule: buildWeeklySchedule({ request, athleteProfile, recentState }),
+    source: 'deterministic',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: summary
+// ---------------------------------------------------------------------------
+
+interface SummaryStageResult {
+  summary: string;
+  monitoring: string;
+  adjustmentRules: string;
+  source: 'llm' | 'deterministic';
+  meta?: { inputTokens: number; outputTokens: number };
+}
+
+async function runSummaryStage(args: {
+  schedule: ScheduleResult;
+  workouts: ParameterizedWorkout[];
+  request: ScheduleRequest;
+  athleteProfile: AthleteProfile;
+  recentState: RecentState;
+  signal?: AbortSignal;
+  onDelta?: (delta: { kind: SummaryDeltaKind; text: string }) => void;
+}): Promise<SummaryStageResult> {
+  const { schedule, workouts, request, athleteProfile, recentState, signal } = args;
+  const baseCap = computeBaseCap(request, athleteProfile, recentState);
+
+  try {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const onDelta =
+      args.onDelta ?? (() => {
+        /* drop */
+      });
+    const res = await llmStreamSummary({
+      schedule,
+      workouts,
+      request,
+      athleteProfile,
+      recentState,
+      signal,
+      onDelta,
+    });
+    if (
+      res.summary.length === 0 &&
+      res.monitoring.length === 0 &&
+      res.adjustmentRules.length === 0
+    ) {
+      // Empty model output — fall through.
+      throw new Error('llm summary returned empty sections');
+    }
+    return {
+      summary: res.summary,
+      monitoring: res.monitoring.length > 0 ? res.monitoring : buildMonitoring(recentState),
+      adjustmentRules:
+        res.adjustmentRules.length > 0 ? res.adjustmentRules : buildAdjustmentRules(baseCap),
+      source: 'llm',
+      meta: res.meta,
+    };
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    if (!(err instanceof LlmNotConfiguredError)) {
+      console.error(
+        `[orchestrator] llm summary fell back: ${(err as Error).message}`,
+      );
+    }
+    const summary = buildSummary(schedule.days, recentState, baseCap);
+    const monitoring = buildMonitoring(recentState);
+    const adjustmentRules = buildAdjustmentRules(baseCap);
+    args.onDelta?.({ kind: 'summary', text: summary });
+    args.onDelta?.({ kind: 'monitoring', text: monitoring });
+    args.onDelta?.({ kind: 'adjustment_rules', text: adjustmentRules });
+    return {
+      summary,
+      monitoring,
+      adjustmentRules,
+      source: 'deterministic',
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function parameterizeForEntry(
-  entry: ScheduleEntry,
+function computeBaseCap(
+  request: ScheduleRequest,
   athleteProfile: AthleteProfile,
   recentState: RecentState,
-  request: ScheduleRequest,
-): ParameterizedWorkout {
-  const tpl: WorkoutTemplate | undefined = getTemplate(entry.templateId);
-  const safeTpl = tpl ?? getTemplate('rest.full.v1')!;
-  const progression = decideProgression(athleteProfile, recentState, entry);
-  return parameterizeWorkout({
-    template: safeTpl,
-    athleteProfile,
-    recentState,
-    request: {
-      targetMetricPreference: request.targetMetricPreference,
-      availableTime: request.availableTime,
-    },
-    scheduleEntry: entry,
-    progression,
-  });
+): number {
+  return (
+    request.maxHardSessionsPerWeek ??
+    (athleteProfile.experienceLevel === 'advanced' && recentState.fatigue !== 'tired'
+      ? 3
+      : 2)
+  );
 }
 
 function decideProgression(
@@ -295,3 +580,6 @@ const STIMULUS_ZH: Record<string, string> = {
   anaerobic: '无氧',
   unknown: '未知',
 };
+
+// touch HARD_STIMULI to keep symbol referenced for future logic.
+void HARD_STIMULI;

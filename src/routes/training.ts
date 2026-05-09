@@ -329,11 +329,20 @@ trainingRouter.post(
         },
       });
 
+      // Buffer summary deltas streamed during generation; we forward them to
+      // the SSE client AFTER the workouts/schedule events so the frontend
+      // sees a stable order. They're still produced progressively as the LLM
+      // streams, just held until we've emitted the schedule + workouts.
+      const summaryDeltas: Array<{ kind: 'summary' | 'monitoring' | 'adjustment_rules'; text: string }> = [];
+
       const plan = await generatePlan({
         userId,
         request,
         athleteProfile: ctx.athleteProfile,
         recentState: ctx.recentState,
+        onSummaryDelta: (delta) => {
+          summaryDeltas.push(delta);
+        },
       });
 
       writeEvent(res, 'schedule', { days: plan.schedule.days, notes: plan.schedule.notes });
@@ -388,9 +397,24 @@ trainingRouter.post(
         return;
       }
 
-      // Stream summary in chunks for a "delta" feel.
-      for (const chunk of chunkSummary(plan.summary)) {
-        writeEvent(res, 'summary_delta', { delta: chunk });
+      // Replay the LLM-streamed deltas (or chunked deterministic fallback)
+      // after persistence so the client sees a stable event order:
+      // schedule -> workouts -> violations -> summary_delta* -> monitoring
+      // -> adjustment_rules.
+      if (summaryDeltas.length > 0) {
+        for (const d of summaryDeltas) {
+          if (d.kind === 'summary') {
+            writeEvent(res, 'summary_delta', { delta: d.text });
+          } else if (d.kind === 'monitoring') {
+            writeEvent(res, 'summary_delta', { delta: d.text, kind: 'monitoring' });
+          } else {
+            writeEvent(res, 'summary_delta', { delta: d.text, kind: 'adjustment_rules' });
+          }
+        }
+      } else {
+        for (const chunk of chunkSummary(plan.summary)) {
+          writeEvent(res, 'summary_delta', { delta: chunk });
+        }
       }
       writeEvent(res, 'monitoring', { monitoring: plan.monitoring });
       writeEvent(res, 'adjustment_rules', { adjustmentRules: plan.adjustmentRules });
