@@ -337,8 +337,12 @@ trainingRouter.post(
       });
 
       writeEvent(res, 'schedule', { days: plan.schedule.days, notes: plan.schedule.notes });
-      for (const w of plan.workouts) {
-        writeEvent(res, 'workout', { workout: w });
+      for (let i = 0; i < plan.workouts.length; i += 1) {
+        const entry = plan.schedule.days[i];
+        writeEvent(res, 'workout', {
+          workout: plan.workouts[i],
+          dayIndex: entry?.dayIndex ?? i + 1,
+        });
       }
       if (plan.violations.length > 0) {
         writeEvent(res, 'violations', { violations: plan.violations });
