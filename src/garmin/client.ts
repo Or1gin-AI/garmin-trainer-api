@@ -8,6 +8,12 @@ import {
   type Region,
 } from './store.js';
 import { getRegionLabel, humanizeAuthError } from './utils.js';
+import {
+  diApiHeaders,
+  exchangeServiceTicketForDi,
+  refreshDiToken,
+  type DiTokenSet,
+} from './di-auth.js';
 
 const { GarminConnect } = garminPkg as { GarminConnect: any };
 
@@ -45,53 +51,115 @@ export interface AuthenticatedClient {
 }
 
 /**
- * `@gooin/garmin-connect` calls `/oauth-service/oauth/preauthorized` with
- * `login-url=this.url.GARMIN_SSO_EMBED` hardcoded. When the gauth-widget binds
- * the ticket to a different service URL (Mode C, where we don't pass
- * redirectAfterAccountLoginUrl), we need that exchange to use whatever URL
- * Garmin actually bound the ticket to. `GARMIN_SSO_EMBED` is a getter on the
- * UrlClass prototype, so define an own property on the instance that shadows
- * it for the lifetime of this call.
+ * Lib-shaped oauth2 token plus a couple of internal fields we need to drive
+ * DI refresh ourselves. The lib's request interceptor only reads
+ * `access_token`; the prefix-`__` fields ride along untouched and let us
+ * refresh without falling back to the rate-limited OAuth1 path.
  */
-function overrideLoginUrl(httpClient: any, serviceUrl: string | null): () => void {
-  if (!serviceUrl) return () => {};
-  const url = httpClient?.url;
-  if (!url) return () => {};
-  const had = Object.prototype.hasOwnProperty.call(url, 'GARMIN_SSO_EMBED');
-  const previous = had ? url.GARMIN_SSO_EMBED : undefined;
-  Object.defineProperty(url, 'GARMIN_SSO_EMBED', {
-    value: serviceUrl,
-    writable: true,
-    configurable: true,
-    enumerable: true,
-  });
-  return () => {
-    if (had) {
-      Object.defineProperty(url, 'GARMIN_SSO_EMBED', {
-        value: previous,
-        writable: true,
-        configurable: true,
-        enumerable: true,
-      });
-    } else {
-      delete url.GARMIN_SSO_EMBED;
-    }
+interface DiOauth2Token {
+  access_token: string;
+  refresh_token: string | null;
+  token_type: 'Bearer';
+  expires_in: number;
+  expires_at: number;
+  scope: string | null;
+  __di: true;
+  __di_client_id: string;
+  __region: Region;
+}
+
+const DI_OAUTH1_PLACEHOLDER = {
+  // The lib refuses to load a session without an oauth1Token, but with our
+  // patched refreshOauth2Token it never actually exercises the OAuth1
+  // signing path. Keep these values truthy and obvious so a human reading
+  // the encrypted blob in postgres can tell what they are.
+  oauth_token: 'di-bridge-no-oauth1',
+  oauth_token_secret: 'di-bridge-no-oauth1',
+};
+
+function toLibOauth2(di: DiTokenSet, region: Region): DiOauth2Token {
+  return {
+    access_token: di.access_token,
+    refresh_token: di.refresh_token,
+    token_type: 'Bearer',
+    expires_in: di.expires_in,
+    expires_at: di.expires_at,
+    scope: di.scope,
+    __di: true,
+    __di_client_id: di.client_id,
+    __region: region,
   };
+}
+
+function looksLikeDiToken(token: any): token is DiOauth2Token {
+  return !!token && token.__di === true && typeof token.__di_client_id === 'string';
+}
+
+/**
+ * Replace the lib's `refreshOauth2Token` (which would call
+ * `/oauth-service/oauth/exchange/user/2.0` via OAuth1, hitting the
+ * 429-blocked path) with one that calls Garmin's DI refresh endpoint.
+ *
+ * Also fold native mobile headers into every connectapi request when the
+ * stored token is a DI token. Garmin's connectapi accepts a DI Bearer
+ * without the native headers in practice, but matching the official mobile
+ * app's surface area (X-Garmin-User-Agent, X-Garmin-Client-Platform, …)
+ * keeps us indistinguishable from a legitimate client and avoids whatever
+ * heuristic eventually starts looking at the headers.
+ */
+function patchDiRefresh(httpClient: any): void {
+  if (httpClient.__diRefreshPatched) return;
+  httpClient.__diRefreshPatched = true;
+
+  // Preserve the lib's original OAuth1-driven refresh so legacy sessions
+  // (oauth1+oauth2 tokens that were saved before this DI rewrite) still
+  // refresh on their original path. New DI sessions go through DI refresh.
+  const originalRefresh = httpClient.refreshOauth2Token.bind(httpClient);
+  httpClient.refreshOauth2Token = async function (this: any) {
+    const current = this.oauth2Token;
+    if (looksLikeDiToken(current)) {
+      if (!current.refresh_token) {
+        throw new Error('No DI refresh token available for refresh');
+      }
+      const refreshed = await refreshDiToken(
+        current.__region,
+        current.refresh_token,
+        current.__di_client_id,
+      );
+      this.oauth2Token = toLibOauth2(refreshed, current.__region);
+      return;
+    }
+    return originalRefresh();
+  };
+
+  // Inject native headers on every authenticated request driven by this
+  // client. The lib's own request interceptor (which sets `Authorization:
+  // Bearer …`) runs first, so we just augment headers here.
+  const axiosClient = httpClient.client;
+  if (axiosClient && axiosClient.interceptors && !axiosClient.__diHeadersPatched) {
+    axiosClient.__diHeadersPatched = true;
+    axiosClient.interceptors.request.use(async (config: any) => {
+      if (looksLikeDiToken(httpClient.oauth2Token)) {
+        const extra = diApiHeaders();
+        config.headers = { ...extra, ...config.headers };
+      }
+      return config;
+    });
+  }
 }
 
 /**
  * Exchange a Garmin service ticket (returned from the official SSO login
- * window) for OAuth1 + OAuth2 tokens, and persist them encrypted under userId.
+ * window) for a Garmin Digital Identity Bearer token, and persist it
+ * encrypted under userId.
  *
  * The user never gives us their Garmin password — we only ever see the
  * post-login service ticket from the redirect.
  *
  * `serviceUrl` is the CAS service the ticket is bound to (the gauth-widget
- * sends it back alongside the ticket). Garmin's CAS validator at
- * `/oauth-service/oauth/preauthorized` only accepts the ticket if `login-url`
- * matches that service. The lib hardcodes `login-url=GARMIN_SSO_EMBED`, so we
- * monkey-patch the URL getter for this single call when the frontend supplies
- * a different binding.
+ * sends it back alongside the ticket). The DI endpoint validates that
+ * `service_url` matches the binding, so we forward whatever the frontend
+ * captured. With our current frontend it'll be `sso.garmin.{cn,com}/sso/embed`.
  */
 export async function authenticateWithBrowserTicket(
   userId: string,
@@ -105,17 +173,17 @@ export async function authenticateWithBrowserTicket(
   }
 
   const client = buildClient(region);
-  const restoreLoginUrl = overrideLoginUrl(client.client, serviceUrl);
 
+  let oauth2Token: DiOauth2Token;
   try {
-    await client.client.fetchOauthConsumer();
-    const oauth1 = await client.client.getOauth1Token(trimmed);
-    await client.client.exchange(oauth1);
+    const di = await exchangeServiceTicketForDi(region, trimmed, serviceUrl);
+    oauth2Token = toLibOauth2(di, region);
   } catch (error) {
     throw new Error(humanizeAuthError(region, error));
-  } finally {
-    restoreLoginUrl();
   }
+
+  client.loadToken(DI_OAUTH1_PLACEHOLDER, oauth2Token);
+  patchDiRefresh(client.client);
 
   const profile = await client.getUserProfile();
   if (!profile?.fullName && !profile?.userName) {
@@ -177,6 +245,7 @@ export async function authenticate(
       `${getRegionLabel(region)}本地会话已失效，请重新连接 Garmin`,
     );
   }
+  patchDiRefresh(client.client);
 
   const profile = await client.getUserProfile();
   if (!profile?.fullName && !profile?.userName) {

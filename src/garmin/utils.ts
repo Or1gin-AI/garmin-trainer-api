@@ -117,6 +117,12 @@ export function humanizeAuthError(
 ): string {
   const message = String((error as Error)?.message || '');
   const regionLabel = getRegionLabel(region);
+  if (message.includes('HTTP Error (429)') || message.includes('Too Many Requests')) {
+    return `${regionLabel}Garmin 服务器对当前请求节流（429）。请稍后再试，如果反复出现请告诉作者，可能需要换出口 IP。`;
+  }
+  if (message.includes('DI token exchange failed')) {
+    return `${regionLabel}DI 令牌兑换失败。常见原因：service ticket 已被使用过、过期（CAS ticket 通常 5 分钟内有效），或 client_id 全部失效。请重新点"连接 Garmin"获取新 ticket。`;
+  }
   if (message.includes('No OAuth2 token available')) {
     return `${regionLabel}登录失败：无法获取 OAuth 令牌，请检查账号密码或稍后重试`;
   }
