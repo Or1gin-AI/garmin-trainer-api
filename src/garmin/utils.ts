@@ -117,9 +117,6 @@ export function humanizeAuthError(
 ): string {
   const message = String((error as Error)?.message || '');
   const regionLabel = getRegionLabel(region);
-  if (message.includes('HTTP Error (429)') || message.includes('Too Many Requests')) {
-    return `${regionLabel}Garmin 服务器对我们的服务器临时限流（429 Too Many Requests）。这是 Garmin 对云服务器 IP 段的常见保护，请等 5-10 分钟后重新点"连接 Garmin"再试。如果反复出现，可能需要换出口 IP。`;
-  }
   if (message.includes('No OAuth2 token available')) {
     return `${regionLabel}登录失败：无法获取 OAuth 令牌，请检查账号密码或稍后重试`;
   }

@@ -45,49 +45,6 @@ export interface AuthenticatedClient {
 }
 
 /**
- * The OAuth consumer (key + secret) is the same pair of strings shared by
- * every user — the lib fetches it from `thegarth.s3.amazonaws.com`. Caching it
- * across logins removes one round-trip per auth and shrinks the surface area
- * Garmin's anti-bot watches.
- */
-let cachedOauthConsumer: { key: string; secret: string } | null = null;
-
-async function ensureOauthConsumer(httpClient: any): Promise<void> {
-  if (cachedOauthConsumer) {
-    httpClient.OAUTH_CONSUMER = cachedOauthConsumer;
-    return;
-  }
-  await httpClient.fetchOauthConsumer();
-  if (httpClient.OAUTH_CONSUMER?.key && httpClient.OAUTH_CONSUMER?.secret) {
-    cachedOauthConsumer = {
-      key: httpClient.OAUTH_CONSUMER.key,
-      secret: httpClient.OAUTH_CONSUMER.secret,
-    };
-  }
-}
-
-function isRateLimitError(error: unknown): boolean {
-  const msg = String((error as Error)?.message || '');
-  return msg.includes('HTTP Error (429)') || msg.includes('Too Many Requests');
-}
-
-/**
- * Garmin's `connectapi.garmin.com` (and to a lesser extent `.cn`) periodically
- * 429s requests from cloud-provider IPs. CAS service tickets are short-lived
- * but typically valid for ~5 minutes, so a single retry after a few seconds is
- * cheap and often unblocks the exchange.
- */
-async function retryOn429<T>(fn: () => Promise<T>): Promise<T> {
-  try {
-    return await fn();
-  } catch (error) {
-    if (!isRateLimitError(error)) throw error;
-    await new Promise((r) => setTimeout(r, 5000));
-    return await fn();
-  }
-}
-
-/**
  * `@gooin/garmin-connect` calls `/oauth-service/oauth/preauthorized` with
  * `login-url=this.url.GARMIN_SSO_EMBED` hardcoded. When the gauth-widget binds
  * the ticket to a different service URL (Mode C, where we don't pass
@@ -151,9 +108,9 @@ export async function authenticateWithBrowserTicket(
   const restoreLoginUrl = overrideLoginUrl(client.client, serviceUrl);
 
   try {
-    await ensureOauthConsumer(client.client);
-    const oauth1 = await retryOn429(() => client.client.getOauth1Token(trimmed));
-    await retryOn429(() => client.client.exchange(oauth1));
+    await client.client.fetchOauthConsumer();
+    const oauth1 = await client.client.getOauth1Token(trimmed);
+    await client.client.exchange(oauth1);
   } catch (error) {
     throw new Error(humanizeAuthError(region, error));
   } finally {
