@@ -103,13 +103,26 @@ export interface SyncProgress {
   percent: number | null;
 }
 
+export interface DirectionStats {
+  uploaded: number;
+  skipped: number;
+  failed: number;
+}
+
 export interface SyncResult {
   scanned: number;
   totalCount: number;
   uploadedCount: number;
   skippedCount: number;
   failedCount: number;
-  errors: { activityId: string | number; name: string; message: string }[];
+  cnToGlobal: DirectionStats;
+  globalToCn: DirectionStats;
+  errors: {
+    direction: 'cnToGlobal' | 'globalToCn';
+    activityId: string | number;
+    name: string;
+    message: string;
+  }[];
   uploaded: MappedActivity[];
 }
 
@@ -136,247 +149,157 @@ function buildProgress(p: Partial<SyncProgress>): SyncProgress {
 }
 
 export interface SyncOptions {
-  mode: 'incremental' | 'history';
-  maxActivities?: number | null;
-  startIndex?: number;
   compareWindow?: number;
-  historyPageSize?: number;
   onProgress?: (p: SyncProgress) => void;
 }
 
-export async function runCnToGlobalSync(
+export async function runBidirectionalSync(
   userId: string,
-  options: SyncOptions,
+  options: SyncOptions = {},
 ): Promise<SyncResult> {
   const compareWindow = Number(options.compareWindow ?? 40);
-  const historyPageSize = Number(options.historyPageSize ?? 50);
 
   const [{ client: cnClient }, { client: globalClient }] = await Promise.all([
     authenticate(userId, 'cn'),
     authenticate(userId, 'global'),
   ]);
 
-  await ensureUploadConsent(globalClient);
+  // Both sides receive uploads now
+  await Promise.all([
+    ensureUploadConsent(cnClient),
+    ensureUploadConsent(globalClient),
+  ]);
 
   const uploaded: MappedActivity[] = [];
   const errors: SyncResult['errors'] = [];
-  let scanned = 0;
-  let skipped = 0;
-  let failed = 0;
-  let totalForResult: number | null = null;
+  const cnToGlobal: DirectionStats = { uploaded: 0, skipped: 0, failed: 0 };
+  const globalToCn: DirectionStats = { uploaded: 0, skipped: 0, failed: 0 };
 
-  if (options.mode === 'incremental') {
-    const [cnList, globalList] = await Promise.all([
-      cnClient.getActivities(0, compareWindow),
-      globalClient.getActivities(0, compareWindow),
-    ]);
-    const globalSigs = new Set(
-      (globalList as RawActivity[]).map((a) => activitySignature(a)),
-    );
-    const pending = (cnList as RawActivity[])
-      .filter((a) => !globalSigs.has(activitySignature(a)))
-      .sort((a, b) =>
-        String(a.startTimeLocal).localeCompare(String(b.startTimeLocal)),
-      );
-    totalForResult = pending.length;
-    scanned = (cnList as RawActivity[]).length;
+  options.onProgress?.(
+    buildProgress({ stage: 'preparing', message: '正在读取双区最新记录' }),
+  );
 
-    options.onProgress?.(
-      buildProgress({
-        stage: 'syncing',
-        message: pending.length ? '正在同步新增记录' : '没有发现需要同步的新记录',
-        total: pending.length,
-        completed: 0,
-        scanned,
-      }),
+  const [cnList, globalList] = await Promise.all([
+    cnClient.getActivities(0, compareWindow) as Promise<RawActivity[]>,
+    globalClient.getActivities(0, compareWindow) as Promise<RawActivity[]>,
+  ]);
+
+  const cnSigs = new Set(cnList.map((a) => activitySignature(a)));
+  const globalSigs = new Set(globalList.map((a) => activitySignature(a)));
+
+  // Activities present in CN but missing from Global → push CN→Global
+  const toGlobal = cnList
+    .filter((a) => !globalSigs.has(activitySignature(a)))
+    .sort((a, b) =>
+      String(a.startTimeLocal).localeCompare(String(b.startTimeLocal)),
     );
+
+  // Activities present in Global but missing from CN → push Global→CN
+  const toCn = globalList
+    .filter((a) => !cnSigs.has(activitySignature(a)))
+    .sort((a, b) =>
+      String(a.startTimeLocal).localeCompare(String(b.startTimeLocal)),
+    );
+
+  const scanned = cnList.length + globalList.length;
+  const total = toGlobal.length + toCn.length;
+  let completed = 0;
+
+  options.onProgress?.(
+    buildProgress({
+      stage: 'syncing',
+      message: total
+        ? `共发现 ${toGlobal.length} 条 CN→国际、${toCn.length} 条 国际→CN 待同步`
+        : '两区已同步，无新增记录',
+      total,
+      completed,
+      scanned,
+    }),
+  );
+
+  async function runDirection(
+    direction: 'cnToGlobal' | 'globalToCn',
+    pending: RawActivity[],
+  ) {
+    const stats = direction === 'cnToGlobal' ? cnToGlobal : globalToCn;
+    const sourceClient = direction === 'cnToGlobal' ? cnClient : globalClient;
+    const targetClient = direction === 'cnToGlobal' ? globalClient : cnClient;
+    const sourceRegion: 'cn' | 'global' =
+      direction === 'cnToGlobal' ? 'cn' : 'global';
+    const targetRegion: 'cn' | 'global' =
+      direction === 'cnToGlobal' ? 'global' : 'cn';
+    const targetSigs = direction === 'cnToGlobal' ? globalSigs : cnSigs;
+    const dirLabel =
+      direction === 'cnToGlobal' ? 'CN→国际' : '国际→CN';
 
     for (let i = 0; i < pending.length; i += 1) {
       const activity = pending[i];
       try {
-        await transferActivity(cnClient, globalClient, activity);
-        uploaded.push(mapActivity(activity, 'cn'));
+        await transferActivity(sourceClient, targetClient, activity);
+        stats.uploaded += 1;
+        uploaded.push(mapActivity(activity, sourceRegion));
+        targetSigs.add(activitySignature(activity));
       } catch (error) {
         if (isDuplicateUploadConflict(error)) {
-          skipped += 1;
-          globalSigs.add(activitySignature(activity));
+          stats.skipped += 1;
+          targetSigs.add(activitySignature(activity));
         } else {
-          failed += 1;
+          stats.failed += 1;
           errors.push({
+            direction,
             activityId: activity.activityId,
             name: activity.activityName || '未命名活动',
-            message: String((error as Error).message || ''),
+            message: humanizeSyncFailure(error, targetRegion),
           });
-          options.onProgress?.(
-            buildProgress({
-              stage: 'failed',
-              message: `同步在第 ${i + 1}/${pending.length} 条停止`,
-              total: pending.length,
-              completed: i + 1,
-              scanned,
-              uploaded: uploaded.length,
-              skipped,
-              failed,
-            }),
-          );
-          throw new Error(humanizeSyncFailure(error));
         }
       }
+      completed += 1;
       options.onProgress?.(
         buildProgress({
           stage: 'syncing',
-          message: `正在同步新增记录 ${i + 1}/${pending.length}`,
-          total: pending.length,
-          completed: i + 1,
+          message: `${dirLabel} ${i + 1}/${pending.length}`,
+          total,
+          completed,
           scanned,
-          uploaded: uploaded.length,
-          skipped,
-          failed,
+          uploaded: cnToGlobal.uploaded + globalToCn.uploaded,
+          skipped: cnToGlobal.skipped + globalToCn.skipped,
+          failed: cnToGlobal.failed + globalToCn.failed,
         }),
       );
     }
-  } else {
-    options.onProgress?.(
-      buildProgress({ stage: 'preparing', message: '正在读取国际区已有记录' }),
-    );
-
-    const targetSigs = new Set<string>();
-    let pageOffset = 0;
-    while (true) {
-      const batch = (await globalClient.getActivities(
-        pageOffset,
-        historyPageSize,
-      )) as RawActivity[];
-      if (!batch.length) break;
-      for (const a of batch) targetSigs.add(activitySignature(a));
-      pageOffset += batch.length;
-      if (batch.length < historyPageSize) break;
-    }
-
-    let offset = Number.isFinite(Number(options.startIndex))
-      ? Number(options.startIndex)
-      : 0;
-    let remaining = options.maxActivities ?? null;
-
-    // Pre-count for progress total
-    let totalCount = 0;
-    {
-      let cursor = offset;
-      let rem = remaining;
-      while (true) {
-        const sz = rem ? Math.min(historyPageSize, rem) : historyPageSize;
-        const batch = (await cnClient.getActivities(cursor, sz)) as RawActivity[];
-        if (!batch.length) break;
-        totalCount += batch.length;
-        cursor += batch.length;
-        if (rem) {
-          rem -= batch.length;
-          if (rem <= 0) break;
-        }
-        if (batch.length < sz) break;
-      }
-    }
-    totalForResult = totalCount;
-
-    options.onProgress?.(
-      buildProgress({
-        stage: totalCount > 0 ? 'syncing' : 'succeeded',
-        message:
-          totalCount > 0
-            ? `共发现 ${totalCount} 条国区记录，开始同步`
-            : '国区没有可同步的运动记录',
-        total: totalCount,
-        completed: 0,
-      }),
-    );
-
-    while (true) {
-      const sz = remaining ? Math.min(historyPageSize, remaining) : historyPageSize;
-      const batch = (await cnClient.getActivities(offset, sz)) as RawActivity[];
-      if (!batch.length) break;
-
-      for (const activity of batch) {
-        scanned += 1;
-        const sig = activitySignature(activity);
-        if (!targetSigs.has(sig)) {
-          try {
-            await transferActivity(cnClient, globalClient, activity);
-            uploaded.push(mapActivity(activity, 'cn'));
-            targetSigs.add(sig);
-          } catch (error) {
-            if (isDuplicateUploadConflict(error)) {
-              skipped += 1;
-              targetSigs.add(sig);
-            } else {
-              failed += 1;
-              errors.push({
-                activityId: activity.activityId,
-                name: activity.activityName || '未命名活动',
-                message: String((error as Error).message || ''),
-              });
-              options.onProgress?.(
-                buildProgress({
-                  stage: 'failed',
-                  message: `同步在第 ${scanned}/${totalCount} 条停止`,
-                  total: totalCount,
-                  completed: scanned,
-                  scanned,
-                  uploaded: uploaded.length,
-                  skipped,
-                  failed,
-                }),
-              );
-              throw new Error(humanizeSyncFailure(error));
-            }
-          }
-        } else {
-          skipped += 1;
-        }
-        options.onProgress?.(
-          buildProgress({
-            stage: 'syncing',
-            message: `正在同步 ${scanned}/${totalCount} 条`,
-            total: totalCount,
-            completed: scanned,
-            scanned,
-            uploaded: uploaded.length,
-            skipped,
-            failed,
-          }),
-        );
-      }
-
-      offset += batch.length;
-      if (remaining) {
-        remaining -= batch.length;
-        if (remaining <= 0) break;
-      }
-      if (batch.length < sz) break;
-    }
   }
+
+  await runDirection('cnToGlobal', toGlobal);
+  await runDirection('globalToCn', toCn);
+
+  const uploadedCount = cnToGlobal.uploaded + globalToCn.uploaded;
+  const skippedCount = cnToGlobal.skipped + globalToCn.skipped;
+  const failedCount = cnToGlobal.failed + globalToCn.failed;
 
   options.onProgress?.(
     buildProgress({
-      stage: 'finishing',
-      message: '同步完成',
-      total: totalForResult ?? scanned,
-      completed:
-        options.mode === 'incremental'
-          ? uploaded.length + skipped + failed
-          : scanned,
+      stage: failedCount > 0 ? 'failed' : 'finishing',
+      message:
+        failedCount > 0
+          ? `同步完成（${failedCount} 条失败）`
+          : '同步完成',
+      total,
+      completed,
       scanned,
-      uploaded: uploaded.length,
-      skipped,
-      failed,
+      uploaded: uploadedCount,
+      skipped: skippedCount,
+      failed: failedCount,
     }),
   );
 
   return {
     scanned,
-    totalCount: totalForResult ?? scanned,
-    uploadedCount: uploaded.length,
-    skippedCount: skipped,
-    failedCount: failed,
+    totalCount: total,
+    uploadedCount,
+    skippedCount,
+    failedCount,
+    cnToGlobal,
+    globalToCn,
     errors,
     uploaded,
   };

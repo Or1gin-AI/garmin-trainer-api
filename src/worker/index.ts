@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { and, asc, eq, isNotNull, lt, or, sql, gt, isNull } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { subscription, syncJob, garminAccount } from '../db/schema.js';
-import { runCnToGlobalSync, type SyncProgress } from '../garmin/sync.js';
+import { runBidirectionalSync, type SyncProgress } from '../garmin/sync.js';
 import { markAutoSync } from '../lib/plan.js';
 
 const POLL_INTERVAL_MS = 3000;
@@ -89,36 +89,50 @@ async function appendLog(
   `);
 }
 
-async function processJob(job: { id: string; userId: string; mode: string }) {
-  const { id, userId, mode } = job;
-  console.log(`[worker] processing ${id} user=${userId} mode=${mode}`);
-  await appendLog(id, 'info', `开始 ${mode} 同步`);
+async function processJob(job: { id: string; userId: string }) {
+  const { id, userId } = job;
+  console.log(`[worker] processing ${id} user=${userId}`);
+  await appendLog(id, 'info', '开始双向同步');
   try {
-    const result = await runCnToGlobalSync(userId, {
-      mode: mode as 'incremental' | 'history',
+    const result = await runBidirectionalSync(userId, {
       onProgress: (p) => {
         // fire and forget; don't await each progress write
         updateProgress(id, p).catch(() => {});
       },
     });
+    const partial = result.failedCount > 0;
     await db
       .update(syncJob)
       .set({
-        status: 'success',
+        status: partial ? 'failed' : 'success',
         finishedAt: new Date(),
+        error: partial
+          ? `${result.failedCount} 条同步失败，详见日志`
+          : null,
         result: {
           uploaded: result.uploadedCount,
           skipped: result.skippedCount,
           failed: result.failedCount,
+          cnToGlobal: result.cnToGlobal,
+          globalToCn: result.globalToCn,
         },
       })
       .where(eq(syncJob.id, id));
+    for (const e of result.errors) {
+      const dirLabel =
+        e.direction === 'cnToGlobal' ? 'CN→国际' : '国际→CN';
+      await appendLog(
+        id,
+        'error',
+        `${dirLabel} 活动 "${e.name}" (${e.activityId}) 失败: ${e.message}`,
+      );
+    }
     await appendLog(
       id,
-      'info',
-      `同步完成 上传${result.uploadedCount} 跳过${result.skippedCount} 失败${result.failedCount}`,
+      partial ? 'warn' : 'info',
+      `同步完成 上传${result.uploadedCount}（CN→国际 ${result.cnToGlobal.uploaded}，国际→CN ${result.globalToCn.uploaded}）跳过${result.skippedCount} 失败${result.failedCount}`,
     );
-    console.log(`[worker] ${id} success`);
+    console.log(`[worker] ${id} ${partial ? 'partial-failure' : 'success'}`);
   } catch (error) {
     const msg = (error as Error).message || String(error);
     await db

@@ -269,13 +269,17 @@ export function isRetryableTransferError(error: unknown): boolean {
   return [408, 425, 429, 500, 502, 503, 504, 520, 522, 524].includes(status);
 }
 
-export function humanizeSyncFailure(error: unknown): string {
+export function humanizeSyncFailure(
+  error: unknown,
+  targetRegion?: 'cn' | 'global',
+): string {
   const message = String((error as Error)?.message || '');
   if (message.includes('HTTP Error (412): Precondition Failed')) {
-    return '国际区账号拒绝活动导入。这个账号还没有授予上传 consent，请先登录国际区 Garmin Connect 网页手动完成一次活动导入授权后再重试。';
+    const label = targetRegion ? getRegionLabel(targetRegion) : '目标区';
+    return `${label}账号拒绝活动导入。这个账号还没有授予上传 consent，请先登录 ${label} Garmin Connect 网页手动完成一次活动导入授权后再重试。`;
   }
   if (isRetryableTransferError(error)) {
-    return 'Garmin 服务器响应超时或临时异常。重新发起同步会从断点附近继续，已成功的记录会被自动跳过。';
+    return 'Garmin 服务器响应超时或临时异常。下次同步会自动重试已经失败的活动。';
   }
   return message || '同步失败';
 }
