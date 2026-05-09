@@ -1,0 +1,698 @@
+// Training plan routes (U7).
+//
+// Endpoints:
+//   POST   /api/training/plans                           SSE; generate plan
+//   GET    /api/training/plans                           list user's plans
+//   GET    /api/training/plans/:id                       plan + workouts + chat
+//   POST   /api/training/plans/:id/regenerate-day        SSE; regen one day
+//   PATCH  /api/training/workouts/:id                    update status
+//
+// Quota middleware (`requireProAndQuota`) gates the two SSE endpoints. Quota
+// CONSUMPTION is intentionally deferred to U11 — we leave a TODO marker.
+//
+// All endpoints require an authenticated user; ownership is checked on every
+// :id route by joining through training_plan.userId.
+
+import crypto from 'node:crypto';
+import { Router } from 'express';
+import { z } from 'zod';
+import { and, asc, desc, eq } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import {
+  trainingPlan,
+  workout,
+  chatMessage,
+  activityCache,
+  type TrainingPlan,
+  type Workout,
+  type ChatMessage,
+} from '../db/schema.js';
+import { requireUser, type AuthedRequest } from '../lib/session.js';
+import { requireProAndQuota } from '../lib/quota.js';
+import { openSse, writeEvent, endSse, startHeartbeat } from '../lib/sse.js';
+import { normalizeActivity } from '../training/activity-normalizer.js';
+import type { NormalizedActivity } from '../training/activity-normalizer.js';
+import { classifyActivityQuality } from '../training/activity-quality.js';
+import type { QualityResult } from '../training/activity-quality.js';
+import { deriveRecentTrainingState } from '../training/recent-state.js';
+import { buildAthleteProfile } from '../training/athlete-profile.js';
+import { generatePlan } from '../training/orchestrator.js';
+import { buildWeeklySchedule } from '../training/scheduler.js';
+import type { ScheduleRequest, ScheduleEntry } from '../training/scheduler.js';
+import { parameterizeWorkout } from '../training/parameterizer.js';
+import type { ParameterizedWorkout } from '../training/parameterizer.js';
+import { validatePlan } from '../training/validation.js';
+import { getTemplate } from '../training/templates/index.js';
+
+export const trainingRouter = Router();
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+const sportsSchema = z.object({
+  running: z.boolean().default(false),
+  cycling: z.boolean().default(false),
+  swimming: z.boolean().default(false),
+});
+
+const planRequestSchema = z.object({
+  weekStartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  goal: z.string().max(500).optional(),
+  raceDate: z.string().nullable().optional(),
+  goalDistance: z.string().max(50).nullable().optional(),
+  daysPerWeek: z.number().int().min(1).max(7),
+  preferredRestDay: z.string().max(20).optional(),
+  availableTime: z.string().max(200).optional(),
+  injuries: z.string().max(500).optional(),
+  notes: z.string().max(2000).optional(),
+  sports: sportsSchema,
+  sportPriorities: z
+    .array(
+      z.enum(['running', 'cycling', 'swimming', 'rest', 'strength', 'mobility']),
+    )
+    .optional(),
+  preferredKeyWorkoutDays: z.array(z.string()).optional(),
+  maxHardSessionsPerWeek: z.number().int().min(0).max(7).nullable(),
+  targetMetricPreference: z.enum(['auto', 'heart_rate', 'pace']),
+});
+
+const regenerateDaySchema = z.object({
+  dayIndex: z.number().int().min(1).max(7),
+  reason: z.string().max(500).optional(),
+});
+
+const workoutPatchSchema = z.object({
+  status: z.enum(['planned', 'completed', 'skipped']),
+});
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const ACTIVITY_LOOKBACK_DAYS = 56;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+interface DerivedContext {
+  request: ScheduleRequest;
+  athleteProfile: ReturnType<typeof buildAthleteProfile>;
+  recentState: ReturnType<typeof deriveRecentTrainingState>;
+  qualities: Map<string, QualityResult>;
+  activities: NormalizedActivity[];
+}
+
+async function loadDerivedContext(
+  userId: string,
+  request: ScheduleRequest,
+): Promise<DerivedContext> {
+  const cutoff = new Date(Date.now() - ACTIVITY_LOOKBACK_DAYS * DAY_MS);
+
+  const rows = await db
+    .select()
+    .from(activityCache)
+    .where(eq(activityCache.userId, userId));
+
+  const activities: NormalizedActivity[] = [];
+  for (const row of rows) {
+    const normalized = normalizeActivity(row.data);
+    if (!normalized) continue;
+    if (
+      normalized.startTimeLocal &&
+      normalized.startTimeLocal.getTime() < cutoff.getTime()
+    ) {
+      continue;
+    }
+    activities.push(normalized);
+  }
+
+  const qualities = new Map<string, QualityResult>();
+  // First pass: rough cycling-median speed for the personal-baseline filter.
+  const ridingSpeeds = activities
+    .filter((a) => a.sport === 'cycling' && a.averageSpeed !== null)
+    .map((a) => a.averageSpeed as number)
+    .sort((a, b) => a - b);
+  const cyclingMedianSpeedMps =
+    ridingSpeeds.length > 0
+      ? ridingSpeeds[Math.floor(ridingSpeeds.length / 2)]
+      : null;
+  for (const a of activities) {
+    qualities.set(a.id, classifyActivityQuality(a, { cyclingMedianSpeedMps }));
+  }
+
+  const recentState = deriveRecentTrainingState({
+    activities,
+    qualities,
+    asOf: new Date(),
+  });
+  const athleteProfile = buildAthleteProfile({
+    activities,
+    qualities,
+    request: {
+      injuries: request.injuries,
+      raceDate: request.raceDate ?? null,
+      goalDistance: request.goalDistance ?? null,
+    },
+  });
+
+  return { request, athleteProfile, recentState, qualities, activities };
+}
+
+function toScheduleRequest(parsed: z.infer<typeof planRequestSchema>): ScheduleRequest {
+  return {
+    weekStartDate: parsed.weekStartDate,
+    goal: parsed.goal,
+    raceDate: parsed.raceDate ?? null,
+    goalDistance: parsed.goalDistance ?? null,
+    daysPerWeek: parsed.daysPerWeek,
+    preferredRestDay: parsed.preferredRestDay,
+    availableTime: parsed.availableTime,
+    injuries: parsed.injuries,
+    notes: parsed.notes,
+    sports: parsed.sports,
+    sportPriorities: parsed.sportPriorities,
+    preferredKeyWorkoutDays: parsed.preferredKeyWorkoutDays,
+    maxHardSessionsPerWeek: parsed.maxHardSessionsPerWeek,
+    targetMetricPreference: parsed.targetMetricPreference,
+  };
+}
+
+interface TrainingPlanSummary {
+  id: string;
+  weekStartDate: string;
+  status: string;
+  summary: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function toPlanSummary(row: TrainingPlan): TrainingPlanSummary {
+  return {
+    id: row.id,
+    weekStartDate: String(row.weekStartDate),
+    status: row.status,
+    summary: row.summary,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+interface WorkoutInsertRow {
+  id: string;
+  planId: string;
+  dayIndex: number;
+  date: string;
+  sport: string;
+  templateId: string;
+  workoutType: string;
+  title: string;
+  intensity: string;
+  durationMinutes: number;
+  distanceKm: string | null;
+  targetMetric: string;
+  targetHeartRate: string;
+  targetPace: string;
+  targetPower: string;
+  workoutStructure: string;
+  targets: string[];
+  parameterSource: ParameterizedWorkout['parameterSource'];
+  adaptation: string;
+  status: 'planned' | 'completed' | 'skipped' | 'regenerating';
+}
+
+function buildWorkoutRow(
+  planId: string,
+  entry: ScheduleEntry,
+  w: ParameterizedWorkout,
+): WorkoutInsertRow {
+  return {
+    id: crypto.randomUUID(),
+    planId,
+    dayIndex: entry.dayIndex,
+    date: entry.date,
+    sport: entry.sport,
+    templateId: w.templateId,
+    workoutType: w.workoutType,
+    title: w.title,
+    intensity: w.intensity,
+    durationMinutes: w.durationMinutes,
+    distanceKm: w.distanceKm !== null ? w.distanceKm.toFixed(2) : null,
+    targetMetric: w.targetMetric,
+    targetHeartRate: w.targetHeartRate,
+    targetPace: w.targetPace,
+    targetPower: w.targetPower,
+    workoutStructure: w.workoutStructure,
+    targets: w.targets,
+    parameterSource: w.parameterSource,
+    adaptation: w.adaptation,
+    status: 'planned',
+  };
+}
+
+function chunkSummary(summary: string): string[] {
+  if (!summary) return [];
+  // Split by 句号 / period for a "streaming" feel even though we're deterministic.
+  const parts = summary.split(/(?<=。)/).filter((s) => s.trim().length > 0);
+  if (parts.length === 0) return [summary];
+  // Group into 3-5 chunks max.
+  const target = Math.min(5, Math.max(3, parts.length));
+  const groupSize = Math.ceil(parts.length / target);
+  const out: string[] = [];
+  for (let i = 0; i < parts.length; i += groupSize) {
+    out.push(parts.slice(i, i + groupSize).join(''));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/training/plans  — SSE
+// ---------------------------------------------------------------------------
+
+trainingRouter.post(
+  '/plans',
+  requireUser,
+  requireProAndQuota('plan_generation'),
+  async (req, res) => {
+    const userId = (req as AuthedRequest).user.id;
+
+    const parsed = planRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      const first = parsed.error.issues[0];
+      res.status(400).json({
+        error: 'invalid_input',
+        field: first?.path.join('.') ?? null,
+        reason: first?.message ?? 'invalid input',
+      });
+      return;
+    }
+    const request = toScheduleRequest(parsed.data);
+
+    // Insert generating row first so we have an id to stream.
+    const planId = crypto.randomUUID();
+    const now = new Date();
+    try {
+      await db.insert(trainingPlan).values({
+        id: planId,
+        userId,
+        weekStartDate: request.weekStartDate,
+        status: 'generating',
+        request: parsed.data,
+        createdAt: now,
+        updatedAt: now,
+      });
+    } catch (err) {
+      console.error('[training] insert plan failed:', (err as Error).message);
+      res.status(500).json({ error: 'internal_error' });
+      return;
+    }
+
+    openSse(res);
+    const heartbeat = startHeartbeat(res);
+    writeEvent(res, 'plan_created', { planId });
+
+    try {
+      const ctx = await loadDerivedContext(userId, request);
+      writeEvent(res, 'context', {
+        recentState: {
+          fatigue: ctx.recentState.fatigue,
+          latestStimulus: ctx.recentState.latestStimulus,
+          hardSessionsLast7d: ctx.recentState.hardSessionsLast7d,
+          load7d: ctx.recentState.load7d,
+          load28d: ctx.recentState.load28d,
+          loadTrend: ctx.recentState.loadTrend,
+          recommendation: ctx.recentState.recommendation,
+        },
+        athleteProfile: {
+          experienceLevel: ctx.athleteProfile.experienceLevel,
+          running: ctx.athleteProfile.running,
+          cycling: ctx.athleteProfile.cycling,
+          swimming: ctx.athleteProfile.swimming,
+        },
+      });
+
+      const plan = await generatePlan({
+        userId,
+        request,
+        athleteProfile: ctx.athleteProfile,
+        recentState: ctx.recentState,
+      });
+
+      writeEvent(res, 'schedule', { days: plan.schedule.days, notes: plan.schedule.notes });
+      for (const w of plan.workouts) {
+        writeEvent(res, 'workout', { workout: w });
+      }
+      if (plan.violations.length > 0) {
+        writeEvent(res, 'violations', { violations: plan.violations });
+      }
+
+      // Persist all-or-nothing in a single transaction.
+      const rows = plan.schedule.days.map((entry, i) =>
+        buildWorkoutRow(planId, entry, plan.workouts[i]),
+      );
+
+      try {
+        await db.transaction(async (tx) => {
+          await tx.insert(workout).values(rows);
+          await tx
+            .update(trainingPlan)
+            .set({
+              status: 'ready',
+              summary: plan.summary,
+              monitoring: plan.monitoring,
+              adjustmentRules: plan.adjustmentRules,
+              athleteProfileSnapshot: {
+                athleteProfile: ctx.athleteProfile,
+                recentState: {
+                  fatigue: ctx.recentState.fatigue,
+                  latestStimulus: ctx.recentState.latestStimulus,
+                  hardSessionsLast7d: ctx.recentState.hardSessionsLast7d,
+                  load7d: ctx.recentState.load7d,
+                  load28d: ctx.recentState.load28d,
+                  loadTrend: ctx.recentState.loadTrend,
+                  recommendation: ctx.recentState.recommendation,
+                },
+              },
+              modelMeta: plan.modelMeta,
+              updatedAt: new Date(),
+            })
+            .where(eq(trainingPlan.id, planId));
+        });
+      } catch (txErr) {
+        console.error('[training] persist failed:', (txErr as Error).message);
+        await markPlanFailed(planId, (txErr as Error).message);
+        clearInterval(heartbeat);
+        endSse(res, 'error', { error: 'persist_failed' });
+        return;
+      }
+
+      // Stream summary in chunks for a "delta" feel.
+      for (const chunk of chunkSummary(plan.summary)) {
+        writeEvent(res, 'summary_delta', { delta: chunk });
+      }
+      writeEvent(res, 'monitoring', { monitoring: plan.monitoring });
+      writeEvent(res, 'adjustment_rules', { adjustmentRules: plan.adjustmentRules });
+
+      // TODO(U11): consumeQuota(userId, 'plan_generation', { inputTokens, outputTokens })
+
+      clearInterval(heartbeat);
+      endSse(res, 'done', { planId });
+    } catch (err) {
+      console.error('[training] generate failed:', (err as Error).message);
+      await markPlanFailed(planId, (err as Error).message);
+      clearInterval(heartbeat);
+      endSse(res, 'error', { error: 'generation_failed' });
+    }
+  },
+);
+
+async function markPlanFailed(planId: string, message: string): Promise<void> {
+  try {
+    await db
+      .update(trainingPlan)
+      .set({
+        status: 'failed',
+        modelMeta: { error: message.slice(0, 500) },
+        updatedAt: new Date(),
+      })
+      .where(eq(trainingPlan.id, planId));
+  } catch (err) {
+    console.error('[training] markPlanFailed failed:', (err as Error).message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/training/plans
+// ---------------------------------------------------------------------------
+
+trainingRouter.get('/plans', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const rows = await db
+    .select()
+    .from(trainingPlan)
+    .where(eq(trainingPlan.userId, userId))
+    .orderBy(desc(trainingPlan.weekStartDate))
+    .limit(20);
+  res.json({ plans: rows.map(toPlanSummary) });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/training/plans/:id
+// ---------------------------------------------------------------------------
+
+trainingRouter.get('/plans/:id', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const planId = String(req.params.id);
+  const planRow = await loadOwnedPlan(userId, planId);
+  if (!planRow) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  const workouts: Workout[] = await db
+    .select()
+    .from(workout)
+    .where(eq(workout.planId, planId))
+    .orderBy(asc(workout.dayIndex));
+  const messages: ChatMessage[] = await db
+    .select()
+    .from(chatMessage)
+    .where(eq(chatMessage.planId, planId))
+    .orderBy(asc(chatMessage.createdAt))
+    .limit(50);
+  res.json({ plan: planRow, workouts, messages });
+});
+
+async function loadOwnedPlan(
+  userId: string,
+  planId: string,
+): Promise<TrainingPlan | null> {
+  const rows = await db
+    .select()
+    .from(trainingPlan)
+    .where(and(eq(trainingPlan.id, planId), eq(trainingPlan.userId, userId)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/training/plans/:id/regenerate-day  — SSE
+// ---------------------------------------------------------------------------
+
+trainingRouter.post(
+  '/plans/:id/regenerate-day',
+  requireUser,
+  requireProAndQuota('plan_generation'),
+  async (req, res) => {
+    const userId = (req as AuthedRequest).user.id;
+    const planId = String(req.params.id);
+
+    const parsed = regenerateDaySchema.safeParse(req.body);
+    if (!parsed.success) {
+      const first = parsed.error.issues[0];
+      res.status(400).json({
+        error: 'invalid_input',
+        field: first?.path.join('.') ?? null,
+        reason: first?.message ?? 'invalid input',
+      });
+      return;
+    }
+
+    const planRow = await loadOwnedPlan(userId, planId);
+    if (!planRow) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+
+    const requestRaw = planRow.request as unknown;
+    const requestParsed = planRequestSchema.safeParse(requestRaw);
+    if (!requestParsed.success) {
+      res.status(500).json({ error: 'plan_request_corrupt' });
+      return;
+    }
+    const request = toScheduleRequest(requestParsed.data);
+
+    openSse(res);
+    const heartbeat = startHeartbeat(res);
+
+    try {
+      const ctx = await loadDerivedContext(userId, request);
+      const schedule = buildWeeklySchedule({
+        request,
+        athleteProfile: ctx.athleteProfile,
+        recentState: ctx.recentState,
+      });
+
+      const dayIndex = parsed.data.dayIndex;
+      const entry = schedule.days[dayIndex - 1];
+      if (!entry) {
+        clearInterval(heartbeat);
+        endSse(res, 'error', { error: 'day_not_found' });
+        return;
+      }
+
+      const tpl = getTemplate(entry.templateId);
+      const safeTpl = tpl ?? getTemplate('rest.full.v1')!;
+      const progression =
+        ctx.recentState.fatigue === 'tired' || ctx.recentState.fatigue === 'high_risk'
+          ? 'conservative'
+          : 'normal';
+
+      const w = parameterizeWorkout({
+        template: safeTpl,
+        athleteProfile: ctx.athleteProfile,
+        recentState: ctx.recentState,
+        request: {
+          targetMetricPreference: request.targetMetricPreference,
+          availableTime: request.availableTime,
+        },
+        scheduleEntry: entry,
+        progression,
+      });
+
+      // Build the existing workouts array for whole-week validation.
+      const existing: Workout[] = await db
+        .select()
+        .from(workout)
+        .where(eq(workout.planId, planId))
+        .orderBy(asc(workout.dayIndex));
+
+      const workoutsForValidation: ParameterizedWorkout[] = existing.map((row) =>
+        row.dayIndex === dayIndex
+          ? w
+          : workoutRowToParameterized(row),
+      );
+
+      const violations = validatePlan({
+        schedule: existing.map((row, i) =>
+          row.dayIndex === dayIndex
+            ? entry
+            : {
+                dayIndex: row.dayIndex,
+                date: String(row.date),
+                dayLabel: '周' + '一二三四五六日'[row.dayIndex - 1],
+                sport: row.sport as ScheduleEntry['sport'],
+                templateId: row.templateId,
+              },
+        ),
+        workouts: workoutsForValidation,
+        context: {
+          maxHardSessionsPerWeek:
+            request.maxHardSessionsPerWeek ?? 2,
+          hardSessionsAlreadyDoneThisWeek: 0,
+          latestStimulus: ctx.recentState.latestStimulus,
+          hoursSinceLatest: ctx.recentState.latestReliableActivity?.startTimeLocal
+            ? (Date.now() - ctx.recentState.latestReliableActivity.startTimeLocal.getTime()) /
+              (60 * 60 * 1000)
+            : Number.POSITIVE_INFINITY,
+          fatigue: ctx.recentState.fatigue,
+        },
+      });
+
+      const row = buildWorkoutRow(planId, entry, w);
+
+      await db
+        .update(workout)
+        .set({
+          sport: row.sport,
+          templateId: row.templateId,
+          workoutType: row.workoutType,
+          title: row.title,
+          intensity: row.intensity,
+          durationMinutes: row.durationMinutes,
+          distanceKm: row.distanceKm,
+          targetMetric: row.targetMetric,
+          targetHeartRate: row.targetHeartRate,
+          targetPace: row.targetPace,
+          targetPower: row.targetPower,
+          workoutStructure: row.workoutStructure,
+          targets: row.targets,
+          parameterSource: row.parameterSource,
+          adaptation: row.adaptation,
+        })
+        .where(and(eq(workout.planId, planId), eq(workout.dayIndex, dayIndex)));
+
+      writeEvent(res, 'workout', { workout: w, dayIndex });
+      if (violations.length > 0) {
+        writeEvent(res, 'violations', { violations });
+      }
+
+      // TODO(U11): consumeQuota(userId, 'plan_generation', ...)
+
+      clearInterval(heartbeat);
+      endSse(res, 'done', { planId, dayIndex });
+    } catch (err) {
+      console.error('[training] regenerate-day failed:', (err as Error).message);
+      clearInterval(heartbeat);
+      endSse(res, 'error', { error: 'regeneration_failed' });
+    }
+  },
+);
+
+function workoutRowToParameterized(row: Workout): ParameterizedWorkout {
+  return {
+    templateId: row.templateId,
+    sport: row.sport,
+    workoutType: row.workoutType ?? '',
+    title: row.title,
+    intensity: row.intensity as 'low' | 'medium' | 'high',
+    durationMinutes: row.durationMinutes ?? 0,
+    distanceKm: row.distanceKm !== null ? Number(row.distanceKm) : null,
+    targetMetric: (row.targetMetric ?? 'none') as ParameterizedWorkout['targetMetric'],
+    targetHeartRate: row.targetHeartRate ?? '不适用',
+    targetPace: row.targetPace ?? '不适用',
+    targetPower: row.targetPower ?? '不适用',
+    workoutStructure: row.workoutStructure ?? '',
+    targets: row.targets ?? [],
+    parameterSource: (row.parameterSource as ParameterizedWorkout['parameterSource']) ?? {
+      templateId: row.templateId,
+      progression: 'normal',
+      replacedVariables: {},
+    },
+    adaptation: row.adaptation ?? '',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /api/training/workouts/:id
+// ---------------------------------------------------------------------------
+
+trainingRouter.patch('/workouts/:id', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const workoutId = String(req.params.id);
+
+  const parsed = workoutPatchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    res.status(400).json({
+      error: 'invalid_input',
+      field: first?.path.join('.') ?? null,
+      reason: first?.message ?? 'invalid input',
+    });
+    return;
+  }
+
+  // Ownership check via join.
+  const row = (
+    await db
+      .select({
+        workout,
+        plan: trainingPlan,
+      })
+      .from(workout)
+      .innerJoin(trainingPlan, eq(workout.planId, trainingPlan.id))
+      .where(and(eq(workout.id, workoutId), eq(trainingPlan.userId, userId)))
+      .limit(1)
+  )[0];
+  if (!row) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+
+  const updated = (
+    await db
+      .update(workout)
+      .set({ status: parsed.data.status })
+      .where(eq(workout.id, workoutId))
+      .returning()
+  )[0];
+
+  res.json({ workout: updated });
+});
