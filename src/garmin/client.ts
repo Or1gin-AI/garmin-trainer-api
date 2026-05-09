@@ -53,8 +53,7 @@ export interface AuthenticatedClient {
 /**
  * Lib-shaped oauth2 token plus a couple of internal fields we need to drive
  * DI refresh ourselves. The lib's request interceptor only reads
- * `access_token`; the prefix-`__` fields ride along untouched and let us
- * refresh without falling back to the rate-limited OAuth1 path.
+ * `access_token`; the prefix-`__` fields ride along untouched.
  */
 interface DiOauth2Token {
   access_token: string;
@@ -68,11 +67,11 @@ interface DiOauth2Token {
   __region: Region;
 }
 
+// `client.loadToken(oauth1, oauth2)` requires a truthy oauth1, but our
+// patched `refreshOauth2Token` never reads it — the only purpose of this
+// placeholder is to satisfy the lib's signature check. Make the value
+// obvious so a human poking at the encrypted blob in postgres can tell.
 const DI_OAUTH1_PLACEHOLDER = {
-  // The lib refuses to load a session without an oauth1Token, but with our
-  // patched refreshOauth2Token it never actually exercises the OAuth1
-  // signing path. Keep these values truthy and obvious so a human reading
-  // the encrypted blob in postgres can tell what they are.
   oauth_token: 'di-bridge-no-oauth1',
   oauth_token_secret: 'di-bridge-no-oauth1',
 };
@@ -111,25 +110,19 @@ function patchDiRefresh(httpClient: any): void {
   if (httpClient.__diRefreshPatched) return;
   httpClient.__diRefreshPatched = true;
 
-  // Preserve the lib's original OAuth1-driven refresh so legacy sessions
-  // (oauth1+oauth2 tokens that were saved before this DI rewrite) still
-  // refresh on their original path. New DI sessions go through DI refresh.
-  const originalRefresh = httpClient.refreshOauth2Token.bind(httpClient);
   httpClient.refreshOauth2Token = async function (this: any) {
     const current = this.oauth2Token;
-    if (looksLikeDiToken(current)) {
-      if (!current.refresh_token) {
-        throw new Error('No DI refresh token available for refresh');
-      }
-      const refreshed = await refreshDiToken(
-        current.__region,
-        current.refresh_token,
-        current.__di_client_id,
+    if (!looksLikeDiToken(current) || !current.refresh_token) {
+      throw new Error(
+        'Stored Garmin session is missing DI refresh metadata; please reconnect Garmin',
       );
-      this.oauth2Token = toLibOauth2(refreshed, current.__region);
-      return;
     }
-    return originalRefresh();
+    const refreshed = await refreshDiToken(
+      current.__region,
+      current.refresh_token,
+      current.__di_client_id,
+    );
+    this.oauth2Token = toLibOauth2(refreshed, current.__region);
   };
 
   // Inject native headers on every authenticated request driven by this
@@ -233,6 +226,15 @@ export async function authenticate(
   if (!session?.oauth1 || !session?.oauth2) {
     throw new Error(
       `${getRegionLabel(region)}本地会话缺失，请重新连接 Garmin`,
+    );
+  }
+  if (!looksLikeDiToken(session.oauth2)) {
+    // Pre-DI sessions can no longer be refreshed (the OAuth1 path is
+    // permanently 429-blocked on garmin.com and we don't want it on .cn
+    // either). Drop the row so the user re-connects through DI.
+    await clearGarminSession(userId, region);
+    throw new Error(
+      `${getRegionLabel(region)}本地会话来自旧的认证流程，请重新连接 Garmin`,
     );
   }
 
