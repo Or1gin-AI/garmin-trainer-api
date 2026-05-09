@@ -576,7 +576,7 @@ trainingRouter.post(
         context: {
           maxHardSessionsPerWeek:
             request.maxHardSessionsPerWeek ?? 2,
-          hardSessionsAlreadyDoneThisWeek: 0,
+          hardSessionsAlreadyDoneThisWeek: ctx.recentState.hardSessionsLast7d,
           latestStimulus: ctx.recentState.latestStimulus,
           hoursSinceLatest: ctx.recentState.latestReliableActivity?.startTimeLocal
             ? (Date.now() - ctx.recentState.latestReliableActivity.startTimeLocal.getTime()) /

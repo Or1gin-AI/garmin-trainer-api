@@ -70,7 +70,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     workouts,
     context: {
       maxHardSessionsPerWeek: baseCap,
-      hardSessionsAlreadyDoneThisWeek: 0,
+      hardSessionsAlreadyDoneThisWeek: recentState.hardSessionsLast7d,
       latestStimulus: recentState.latestStimulus,
       hoursSinceLatest,
       fatigue: recentState.fatigue,
@@ -111,7 +111,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
         workouts,
         context: {
           maxHardSessionsPerWeek: baseCap,
-          hardSessionsAlreadyDoneThisWeek: 0,
+          hardSessionsAlreadyDoneThisWeek: recentState.hardSessionsLast7d,
           latestStimulus: recentState.latestStimulus,
           hoursSinceLatest,
           fatigue: recentState.fatigue,

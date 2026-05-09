@@ -63,7 +63,11 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
       });
     }
 
-    const isRest = s.sport === 'rest';
+    // Rest-tier templates use either 'rest' (full rest) or 'mobility' (active
+    // recovery walk/stretch). Both are exempt from the metric-presence rule
+    // since 'targetHeartRate' may legitimately be '不适用' when the user has
+    // no HR data — these days exist precisely to NOT prescribe load.
+    const isRest = s.sport === 'rest' || s.sport === 'mobility';
 
     if (!isRest) {
       // non_rest_must_have_metric
