@@ -15,6 +15,13 @@
       "when": 1778076159371,
       "tag": "0001_friendly_skrulls",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1778325352747,
+      "tag": "0002_busy_mandrill",
+      "breakpoints": true
     }
   ]
 }
