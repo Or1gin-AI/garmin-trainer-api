@@ -1,8 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { eq, ne, and, asc } from 'drizzle-orm';
+import { eq, ne, and, asc, desc } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { llmConfig } from '../db/schema.js';
+import { llmConfig, aiUsage, user } from '../db/schema.js';
 import type { LlmConfig } from '../db/schema.js';
 import { requireAdmin } from '../lib/session.js';
 import { encryptGlobal, decryptGlobal } from '../lib/crypto.js';
@@ -313,6 +313,91 @@ adminAiRouter.delete('/llm-configs/:id', requireAdmin, async (req, res) => {
     res.status(204).end();
   } catch (err) {
     console.error('[admin-ai] delete failed:', (err as Error).message);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ===== AI usage =====
+//
+// GET /api/admin/ai-usage?periodStart=YYYY-MM-DD&limit=50
+//
+// Returns the per-user ai_usage rows for one month, joined with `user` so the
+// admin sees email/displayName instead of opaque ids. Default period is the
+// current month start (first day, UTC). Sorted by inputTokens DESC so the
+// loudest spenders show first.
+
+const usageQuerySchema = z.object({
+  periodStart: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD')
+    .optional(),
+  limit: z
+    .union([z.string(), z.number()])
+    .optional()
+    .transform((v) => (v === undefined ? undefined : Number(v)))
+    .pipe(z.number().int().min(1).max(500).optional()),
+});
+
+function defaultPeriodStart(now: Date = new Date()): string {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const mm = String(m + 1).padStart(2, '0');
+  return `${y}-${mm}-01`;
+}
+
+interface AiUsageEntry {
+  userId: string;
+  email: string;
+  displayName: string | null;
+  periodStart: string;
+  planGenerationCount: number;
+  chatMessageCount: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+adminAiRouter.get('/ai-usage', requireAdmin, async (req, res) => {
+  const parsed = usageQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    sendValidationError(res, parsed);
+    return;
+  }
+  const periodStart = parsed.data.periodStart ?? defaultPeriodStart();
+  const limit = parsed.data.limit ?? 50;
+
+  try {
+    const rows = await db
+      .select({
+        userId: aiUsage.userId,
+        email: user.email,
+        name: user.name,
+        displayUsername: user.displayUsername,
+        periodStart: aiUsage.periodStart,
+        planGenerationCount: aiUsage.planGenerationCount,
+        chatMessageCount: aiUsage.chatMessageCount,
+        inputTokens: aiUsage.inputTokens,
+        outputTokens: aiUsage.outputTokens,
+      })
+      .from(aiUsage)
+      .innerJoin(user, eq(aiUsage.userId, user.id))
+      .where(eq(aiUsage.periodStart, periodStart))
+      .orderBy(desc(aiUsage.inputTokens))
+      .limit(limit);
+
+    const entries: AiUsageEntry[] = rows.map((r) => ({
+      userId: r.userId,
+      email: r.email,
+      displayName: r.displayUsername ?? r.name ?? null,
+      periodStart: String(r.periodStart),
+      planGenerationCount: r.planGenerationCount,
+      chatMessageCount: r.chatMessageCount,
+      inputTokens: r.inputTokens,
+      outputTokens: r.outputTokens,
+    }));
+
+    res.json({ entries });
+  } catch (err) {
+    console.error('[admin-ai] ai-usage list failed:', (err as Error).message);
     res.status(500).json({ error: 'internal_error' });
   }
 });

@@ -28,7 +28,7 @@ import {
   type ChatMessage,
 } from '../db/schema.js';
 import { requireUser, type AuthedRequest } from '../lib/session.js';
-import { requireProAndQuota } from '../lib/quota.js';
+import { requireProAndQuota, consumeQuota } from '../lib/quota.js';
 import { openSse, writeEvent, endSse, startHeartbeat } from '../lib/sse.js';
 import { normalizeActivity } from '../training/activity-normalizer.js';
 import type { NormalizedActivity } from '../training/activity-normalizer.js';
@@ -432,7 +432,22 @@ trainingRouter.post(
       writeEvent(res, 'monitoring', { monitoring: plan.monitoring });
       writeEvent(res, 'adjustment_rules', { adjustmentRules: plan.adjustmentRules });
 
-      // TODO(U11): consumeQuota(userId, 'plan_generation', { inputTokens, outputTokens })
+      // U11: consume quota only after persistence + all events succeeded.
+      // We sum total tokens into inputTokens because the orchestrator only
+      // exposes totalTokens; outputTokens stays 0 to keep the column shape
+      // honest. Failures must NOT increment, so this stays inside the try
+      // block, after the persistence transaction succeeded.
+      try {
+        await consumeQuota(userId, 'plan_generation', {
+          inputTokens: plan.modelMeta.totalTokens || 0,
+          outputTokens: 0,
+        });
+      } catch (qErr) {
+        console.error(
+          '[training] consumeQuota plan_generation failed:',
+          (qErr as Error).message,
+        );
+      }
 
       clearInterval(heartbeat);
       endSse(res, 'done', { planId });
@@ -655,7 +670,20 @@ trainingRouter.post(
         writeEvent(res, 'violations', { violations });
       }
 
-      // TODO(U11): consumeQuota(userId, 'plan_generation', ...)
+      // U11: consume quota after the per-day regeneration successfully
+      // persisted. The deterministic regenerate-day path doesn't track LLM
+      // tokens, so we record 0/0 for input/output — the counter still bumps.
+      try {
+        await consumeQuota(userId, 'plan_generation', {
+          inputTokens: 0,
+          outputTokens: 0,
+        });
+      } catch (qErr) {
+        console.error(
+          '[training] consumeQuota regenerate-day failed:',
+          (qErr as Error).message,
+        );
+      }
 
       clearInterval(heartbeat);
       endSse(res, 'done', { planId, dayIndex });
@@ -948,8 +976,19 @@ trainingRouter.post(
         },
       });
 
-      // TODO(U11): consumeQuota(userId, 'chat_message',
-      //   { inputTokens: result.meta.inputTokens, outputTokens: result.meta.outputTokens })
+      // U11: consume quota only after assistant message persisted.
+      // Failed turns (LLM errors, persist errors) MUST NOT increment.
+      try {
+        await consumeQuota(userId, 'chat_message', {
+          inputTokens: result.meta.inputTokens,
+          outputTokens: result.meta.outputTokens,
+        });
+      } catch (qErr) {
+        console.error(
+          '[training] consumeQuota chat_message failed:',
+          (qErr as Error).message,
+        );
+      }
 
       clearInterval(heartbeat);
       endSse(res, 'done', {});

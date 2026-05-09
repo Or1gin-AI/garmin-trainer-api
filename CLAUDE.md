@@ -91,11 +91,33 @@ drizzle/                   # checked-in SQL migrations (drizzle-kit output)
 Image `ghcr.io/or1gin-ai/garmin-trainer-api:latest-dev` (main) / `:latest` (publish branch). Server compose at `/home/originai/garmin-trainer-api/`. Postgres host port 5557 (5556 was taken by ticket-system). All other originai services own ports 3000/3001/4000/4001 — do not collide.
 
 Caddy block (in `/etc/caddy/Caddyfile`, sudo required to edit):
-```
+
+```caddyfile
 api.garmin-trainer.uk {
-    reverse_proxy localhost:4001
+    # SSE-friendly reverse proxy. The training endpoints
+    # (/api/training/plans, /…/regenerate-day, /…/chat) emit progressive
+    # events that must reach the client immediately — `flush_interval -1`
+    # disables Caddy's response buffering, and the long header timeout keeps
+    # an idle assistant turn from being killed mid-stream.
+    reverse_proxy localhost:4001 {
+        flush_interval -1
+        transport http {
+            response_header_timeout 600s
+            dial_timeout 5s
+        }
+    }
 }
 ```
+
+The api responses already set `X-Accel-Buffering: no` (in `lib/sse.ts`); Caddy honors that header, so the `flush_interval` is belt-and-braces but worth keeping in case a different reverse proxy ends up in front.
+
+### Operational notes for AI features
+
+- **LLM provider keys** live in the `llm_config` table (encrypted with `APP_ENCRYPTION_KEY`). Rotate via the `/admin → AI 配置` UI: add a new row, mark it `isActive`, then delete the old one. There is no environment-variable path — keys are runtime-configurable on purpose.
+- **Per-user monthly quota** defaults are hardcoded in `api/src/lib/quota.ts` as `QUOTA_DEFAULTS = { plan_generation: 8, chat_message: 200 }`. Adjusting these today requires a code change + redeploy. A `quota_override` table (admin-set per-user limits) is intentionally out of scope for U11; revisit if the global default becomes contentious. The trade-off is simplicity (no extra schema, no UI) for less flexibility.
+- **Config cache TTL**: `lib/llm.ts` caches the active `llm_config` in-process for up to 60 seconds. After admin updates a config (edit / activate / delete), the FIRST request to a quota-gated endpoint may still use the previous config for up to ~1 minute. Activating a config calls `clearLlmConfigCache()` synchronously inside the same process, but if the api runs as multiple workers each worker has its own cache, so cross-worker propagation is bounded by the TTL.
+- **Quota enforcement**: `requireProAndQuota(kind)` checks the counter before the operation; `consumeQuota(userId, kind, …)` increments only after the SSE `done` event is emitted (i.e. after the persistence transaction commits). Failed generations / chats do not increment, so a transient LLM outage can't burn a user's monthly budget. Quota errors during increment are logged (`console.error`) but never propagated to the client — the user already received their successful response.
+- **Admin usage view**: `GET /api/admin/ai-usage?periodStart=YYYY-MM-DD` joins `ai_usage` with `user`. Powers the `/admin → 用量` tab.
 
 ## Don't
 
