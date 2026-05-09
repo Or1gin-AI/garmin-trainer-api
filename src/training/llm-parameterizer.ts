@@ -142,10 +142,11 @@ export async function llmParameterizeWorkout(
     signal: args.signal,
   });
 
-  let argsBuffer = '';
+  // Per-index accumulator: see the matching comment in llm-scheduler.ts.
+  const argsByIndex = new Map<number, string>();
+  const indexOrder: number[] = [];
   let inputTokens = 0;
   let outputTokens = 0;
-  let sawToolCall = false;
 
   for await (const chunk of stream) {
     if (args.signal?.aborted) {
@@ -155,10 +156,14 @@ export async function llmParameterizeWorkout(
     const toolCalls = choice?.delta?.tool_calls;
     if (toolCalls && toolCalls.length > 0) {
       for (const tc of toolCalls) {
+        const idx = typeof tc.index === 'number' ? tc.index : 0;
+        if (!argsByIndex.has(idx)) {
+          argsByIndex.set(idx, '');
+          indexOrder.push(idx);
+        }
         const piece = tc.function?.arguments;
         if (typeof piece === 'string' && piece.length > 0) {
-          argsBuffer += piece;
-          sawToolCall = true;
+          argsByIndex.set(idx, (argsByIndex.get(idx) ?? '') + piece);
         }
       }
     }
@@ -169,7 +174,10 @@ export async function llmParameterizeWorkout(
     }
   }
 
-  if (!sawToolCall || argsBuffer.length === 0) {
+  const firstIndex = indexOrder[0];
+  const argsBuffer =
+    firstIndex !== undefined ? (argsByIndex.get(firstIndex) ?? '') : '';
+  if (argsBuffer.length === 0) {
     throw new InvalidLlmWorkoutError(['model did not emit tool call']);
   }
 
