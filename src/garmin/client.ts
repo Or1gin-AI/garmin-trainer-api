@@ -1,5 +1,4 @@
 import garminPkg from '@gooin/garmin-connect';
-import { UrlClass } from '@gooin/garmin-connect/dist/garmin/UrlClass.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
@@ -38,28 +37,6 @@ function buildClient(region: Region): any {
   return region === 'cn'
     ? new GarminConnect(config, 'garmin.cn')
     : new GarminConnect(config);
-}
-
-function getRegionUrl(region: Region): UrlClass {
-  return new UrlClass(region === 'cn' ? 'garmin.cn' : 'garmin.com');
-}
-
-/**
- * Build the Garmin "portal SSO" sign-in URL — the modern branded login page
- * (gym photo + Forgot Password link). After a successful login by the user,
- * Garmin redirects the browser back to `callbackUrl` with `?ticket=ST-...`.
- *
- * The legacy `/sso/signin?id=gauth-widget` URL renders the bare-bones embed
- * widget instead; we explicitly avoid it.
- */
-export function buildBrowserLoginUrl(region: Region, callbackUrl: string): string {
-  const url = getRegionUrl(region);
-  const locale = region === 'cn' ? 'zh-CN' : 'en-US';
-  const params = new URLSearchParams({
-    clientId: 'GarminConnect',
-    service: callbackUrl,
-  });
-  return `${url.GARMIN_SSO_ORIGIN}/portal/sso/${locale}/sign-in?${params.toString()}`;
 }
 
 export interface AuthenticatedClient {

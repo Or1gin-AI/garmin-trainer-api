@@ -43,7 +43,7 @@ src/
 │   │                      #   redemption_code + garmin_account + sync_job)
 │   └── index.ts           # pg.Pool + drizzle, with HMR-safe global cache
 ├── garmin/
-│   ├── client.ts          # buildBrowserLoginUrl, authenticateWithBrowserTicket
+│   ├── client.ts          # authenticateWithBrowserTicket
 │   │                      # (the ticket exchange used by /api/garmin/callback),
 │   │                      # authenticate (load cached session — NO password fallback)
 │   ├── sync.ts            # runCnToGlobalSync — direct port of upstream
@@ -99,5 +99,5 @@ api.garmin-trainer.uk {
 ## Don't
 
 - Don't add a "save Garmin username/password" route without first restoring per-user `MFAManager` polling — the lib's password login throws "需要MFA验证" mid-flight, and the cloud needs an explicit flow for the user to submit the code asynchronously.
-- Don't change the `target` / `redirectAfterAccountLoginUrl` in the frontend's gauth-widget config without also patching the lib's `getOauth1Token` to send a matching `login-url`. Garmin's CAS validator rejects mismatches.
+- Keep the frontend's `redirectAfterAccountLoginUrl` on `sso.garmin.{cn,com}/sso/embed`, because `getOauth1Token` exchanges with `login-url=sso/embed`. Do not set GAUTH's `target` option; Garmin's widget script will navigate away before the frontend callback POST can finish.
 - Don't `pnpm db:push` against production — always go through generated migrations + `pnpm start:migrate`.
