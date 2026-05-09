@@ -8,12 +8,11 @@ function getResend(): Resend | null {
   return cached;
 }
 
-const FROM = process.env.EMAIL_FROM || 'Garmin Trainer <noreply@garmin-trainer.uk>';
+const FROM = process.env.EMAIL_FROM || 'Garmin Trainer <no-reply@garmin-trainer.uk>';
 
 export async function sendEmail(to: string, subject: string, html: string): Promise<void> {
   const client = getResend();
   if (!client) {
-    // Fallback: log to console so dev / unconfigured deploys still see the URL
     console.warn(
       `[mailer] RESEND_API_KEY missing — would have sent to=${to} subject=${JSON.stringify(subject)}`,
     );
@@ -31,32 +30,61 @@ export function buildPasswordResetEmail(name: string, resetUrl: string): {
   subject: string;
   html: string;
 } {
-  const subject = '[Garmin Trainer] 重置密码';
-  const html = `
-<!doctype html>
+  const subject = '重置你的 Garmin Trainer 密码';
+  const greeting = name ? `${escapeHtml(name)}，你好` : '你好';
+  const html = `<!DOCTYPE html>
 <html lang="zh">
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:#fafaf9;padding:32px;color:#18181b;">
-  <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e4e4e7;border-radius:16px;padding:32px;">
-    <h1 style="margin:0 0 16px;font-size:20px;">重置 Garmin Trainer 密码</h1>
-    <p style="line-height:1.6;color:#3f3f46;">${escapeHtml(name) || '你好'}，</p>
-    <p style="line-height:1.6;color:#3f3f46;">
-      点击下方按钮设置新密码。如果不是你本人发起的请求，可以忽略这封邮件。
-    </p>
-    <p style="margin:24px 0;">
-      <a href="${resetUrl}"
-         style="display:inline-block;padding:12px 20px;background:#059669;color:#fff;text-decoration:none;border-radius:8px;font-weight:500;">
-        重置密码
-      </a>
-    </p>
-    <p style="line-height:1.5;color:#71717a;font-size:13px;">
-      链接 1 小时内有效。如果按钮无法点击，可复制下面的 URL 到浏览器打开：
-    </p>
-    <p style="word-break:break-all;color:#52525b;font-size:12px;font-family:ui-monospace,'SF Mono',monospace;">
-      ${resetUrl}
-    </p>
-  </div>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0; padding:0; background-color:#f5f0e8; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f5f0e8; padding: 40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background-color:#fffdf8; border-radius:12px; overflow:hidden; box-shadow: 0 2px 12px rgba(180,160,120,0.1);">
+          <tr>
+            <td style="padding: 36px 40px; text-align:center; border-bottom: 1px solid #e8e0d0;">
+              <img src="https://garmin-trainer.uk/logo.jpg" alt="Garmin Trainer" width="64" height="64" style="display:block; margin: 0 auto 12px; border-radius:12px;">
+              <h1 style="margin:0; color:#5c4a2a; font-size:22px; font-weight:600; letter-spacing:0.5px;">Garmin Trainer</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px;">
+              <h2 style="margin:0 0 16px; font-size:20px; color:#5c4a2a; font-weight:600;">重置密码</h2>
+              <p style="margin:0 0 16px; font-size:16px; line-height:1.7; color:#4a3f2f;">${greeting}，</p>
+              <p style="margin:0 0 24px; font-size:16px; line-height:1.7; color:#4a3f2f;">
+                点击下方按钮重置你的 Garmin Trainer 密码。链接将在 1 小时后失效。
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" style="margin: 24px 0;">
+                <tr>
+                  <td align="center">
+                    <a href="${resetUrl}" style="display:inline-block; background:#c4a265; color:#ffffff; text-decoration:none; padding:14px 36px; border-radius:8px; font-size:15px; font-weight:600;">重置密码</a>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:24px 0 12px; font-size:13px; line-height:1.6; color:#9a8b6f;">
+                如果按钮无法点击，可复制下面的链接到浏览器打开：
+              </p>
+              <p style="margin:0; word-break:break-all; font-size:12px; color:#9a8b6f; font-family: 'SF Mono', Menlo, Consolas, monospace;">
+                ${resetUrl}
+              </p>
+              <p style="margin:24px 0 0; font-size:14px; line-height:1.7; color:#9a8b6f;">
+                如果这不是你本人发起的请求，可以安全地忽略这封邮件。
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 24px 40px; background-color:#f5f0e8; border-top:1px solid #e8e0d0; text-align:center;">
+              <p style="margin:0; font-size:13px; color:#9a8b6f;">Garmin Trainer Team</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
-</html>`.trim();
+</html>`;
   return { subject, html };
 }
 
