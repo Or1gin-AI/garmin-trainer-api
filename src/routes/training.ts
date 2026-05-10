@@ -22,11 +22,14 @@ import {
   trainingPlan,
   workout,
   chatMessage,
-  activityCache,
   type TrainingPlan,
   type Workout,
   type ChatMessage,
 } from '../db/schema.js';
+import {
+  fetchRecentRawActivities,
+  GarminUnavailableError,
+} from '../garmin/fetch-recent.js';
 import { requireUser, type AuthedRequest } from '../lib/session.js';
 import { requireProAndQuota, consumeQuota } from '../lib/quota.js';
 import { openSse, writeEvent, endSse, startHeartbeat } from '../lib/sse.js';
@@ -120,14 +123,13 @@ async function loadDerivedContext(
 ): Promise<DerivedContext> {
   const cutoff = new Date(Date.now() - ACTIVITY_LOOKBACK_DAYS * DAY_MS);
 
-  const rows = await db
-    .select()
-    .from(activityCache)
-    .where(eq(activityCache.userId, userId));
+  const fetched = await fetchRecentRawActivities(userId, {
+    days: ACTIVITY_LOOKBACK_DAYS,
+  });
 
   const activities: NormalizedActivity[] = [];
-  for (const row of rows) {
-    const normalized = normalizeActivity(row.data);
+  for (const raw of fetched.activities) {
+    const normalized = normalizeActivity(raw);
     if (!normalized) continue;
     if (
       normalized.startTimeLocal &&
@@ -455,7 +457,11 @@ trainingRouter.post(
       console.error('[training] generate failed:', (err as Error).message);
       await markPlanFailed(planId, (err as Error).message);
       clearInterval(heartbeat);
-      endSse(res, 'error', { error: 'generation_failed' });
+      const errorPayload =
+        err instanceof GarminUnavailableError
+          ? { error: (err as Error).message }
+          : { error: 'generation_failed' };
+      endSse(res, 'error', errorPayload);
     }
   },
 );
@@ -690,7 +696,11 @@ trainingRouter.post(
     } catch (err) {
       console.error('[training] regenerate-day failed:', (err as Error).message);
       clearInterval(heartbeat);
-      endSse(res, 'error', { error: 'regeneration_failed' });
+      const errorPayload =
+        err instanceof GarminUnavailableError
+          ? { error: (err as Error).message }
+          : { error: 'regeneration_failed' };
+      endSse(res, 'error', errorPayload);
     }
   },
 );
@@ -993,13 +1003,17 @@ trainingRouter.post(
       clearInterval(heartbeat);
       endSse(res, 'done', {});
     } catch (err) {
-      const code =
-        err instanceof ChatLlmNotConfiguredError
-          ? 'llm_not_configured'
-          : 'chat_failed';
       console.error('[training/chat] failed:', (err as Error).message);
       clearInterval(heartbeat);
-      endSse(res, 'error', { error: code });
+      let errorPayload: { error: string };
+      if (err instanceof ChatLlmNotConfiguredError) {
+        errorPayload = { error: 'llm_not_configured' };
+      } else if (err instanceof GarminUnavailableError) {
+        errorPayload = { error: (err as Error).message };
+      } else {
+        errorPayload = { error: 'chat_failed' };
+      }
+      endSse(res, 'error', errorPayload);
     }
   },
 );
