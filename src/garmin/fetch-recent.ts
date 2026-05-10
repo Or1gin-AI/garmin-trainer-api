@@ -10,7 +10,12 @@
 // activities between Garmin regions, not into our DB).
 
 import { authenticate } from './client.js';
-import { activitySignature, type RawActivity } from './utils.js';
+import {
+  activitySignature,
+  mapActivity,
+  type MappedActivity,
+  type RawActivity,
+} from './utils.js';
 
 export interface FetchRecentOptions {
   // Lookback window in days. Activities older than `now - days` are dropped.
@@ -25,7 +30,11 @@ export interface RegionFetchInfo {
 }
 
 export interface FetchRecentResult {
-  activities: RawActivity[];
+  // Activities run through `mapActivity` so the field names match what the
+  // training/activity-normalizer.ts pipeline expects (distanceKm, durationMin,
+  // averageHr, type, …). Garmin's raw payload uses different keys (distance
+  // in meters, duration in seconds, averageHR, activityType.typeKey).
+  activities: MappedActivity[];
   cn: RegionFetchInfo;
   global: RegionFetchInfo;
 }
@@ -76,16 +85,18 @@ export async function fetchRecentRawActivities(
   // Dedupe by activity signature. Prefer the CN copy when both regions have
   // it (CN is the more common source for our China users). For users with
   // only one region, the empty list from the other side is a no-op.
-  const seen = new Map<string, RawActivity>();
-  for (const a of cnRes.list) seen.set(activitySignature(a), a);
+  // Map each raw activity to MappedActivity at the same time, tagging the
+  // sourceRegion so downstream knows where it came from.
+  const seen = new Map<string, MappedActivity>();
+  for (const a of cnRes.list) seen.set(activitySignature(a), mapActivity(a, 'cn'));
   for (const a of globalRes.list) {
     const sig = activitySignature(a);
-    if (!seen.has(sig)) seen.set(sig, a);
+    if (!seen.has(sig)) seen.set(sig, mapActivity(a, 'global'));
   }
 
-  const filtered: RawActivity[] = [];
+  const filtered: MappedActivity[] = [];
   for (const a of seen.values()) {
-    const ts = a.startTimeLocal ? Date.parse(String(a.startTimeLocal)) : NaN;
+    const ts = a.startTimeLocal ? Date.parse(a.startTimeLocal) : NaN;
     if (Number.isFinite(ts) && ts < cutoffMs) continue;
     filtered.push(a);
   }
