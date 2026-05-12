@@ -37,6 +37,15 @@ import {
   InvalidLlmWorkoutError,
 } from './llm-parameterizer.js';
 import { llmStreamSummary, type SummaryDeltaKind } from './llm-summary.js';
+import {
+  TOOL_DISPLAY,
+  dayDisplay,
+  summarizeParameterized,
+  summarizeValidation,
+  summarizeSchedule,
+} from './tool-event-labels.js';
+import type { ToolEventPayload } from '../lib/sse.js';
+import crypto from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -49,6 +58,12 @@ export interface GeneratePlanInput {
   recentState: RecentState;
   signal?: AbortSignal;
   onSummaryDelta?: (delta: { kind: SummaryDeltaKind; text: string }) => void;
+  /**
+   * Optional callback that receives a stream of pseudo tool-event payloads
+   * describing the orchestrator's internal stages. The route handler forwards
+   * these as SSE `tool_event` messages so the user sees AI progress live.
+   */
+  onToolEvent?: (e: ToolEventPayload) => void;
 }
 
 export interface ModelMeta {
@@ -82,7 +97,8 @@ const DETERMINISTIC_MODEL = 'v1';
 // ---------------------------------------------------------------------------
 
 export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedPlan> {
-  const { request, athleteProfile, recentState, signal } = input;
+  const { request, athleteProfile, recentState, signal, onToolEvent } = input;
+  const emit = onToolEvent ?? (() => {});
 
   // Stage 1: schedule.
   const stageOne = await runScheduleStage({
@@ -90,6 +106,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     athleteProfile,
     recentState,
     signal,
+    emit,
   });
   const schedule = stageOne.schedule;
 
@@ -116,7 +133,8 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     const tplResolved: WorkoutTemplate = tpl;
 
     // Skip LLM for rest/mobility — they're trivially deterministic and the
-    // model would just fill in zeros.
+    // model would just fill in zeros. We don't emit a tool_event for these
+    // either: they'd just be noise.
     const isRest = tplResolved.fixed.sport === 'rest' || tplResolved.fixed.sport === 'mobility';
     if (isRest) {
       workouts.push(
@@ -136,6 +154,16 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
       continue;
     }
 
+    const paramId = crypto.randomUUID();
+    const paramDisplay = dayDisplay(entry.dayIndex, tplResolved.fixed.sport);
+    const paramStart = Date.now();
+    emit({
+      id: paramId,
+      name: 'llm_parameterize_workout',
+      displayName: paramDisplay,
+      phase: 'start',
+    });
+
     try {
       const llmRes = await llmParameterizeWorkout({
         template: tplResolved,
@@ -149,7 +177,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
         progression,
         signal,
       });
-      workouts.push({
+      const w = {
         ...llmRes.workout,
         parameterSource: {
           ...llmRes.workout.parameterSource,
@@ -158,10 +186,19 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
             __source: 'llm',
           },
         },
-      });
+      };
+      workouts.push(w);
       totalInputTokens += llmRes.meta.inputTokens;
       totalOutputTokens += llmRes.meta.outputTokens;
       llmParamCount += 1;
+      emit({
+        id: paramId,
+        name: 'llm_parameterize_workout',
+        displayName: paramDisplay,
+        phase: 'done',
+        summary: summarizeParameterized('llm', w),
+        durationMs: Date.now() - paramStart,
+      });
     } catch (err) {
       if (signal?.aborted) {
         throw err;
@@ -175,26 +212,42 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
           `[orchestrator] day ${entry.dayIndex} llm parameterize failed: ${(err as Error).message}`,
         );
       }
-      workouts.push(
-        parameterizeWorkout({
-          template: tplResolved,
-          athleteProfile,
-          recentState,
-          request: {
-            targetMetricPreference: request.targetMetricPreference,
-            availableTime: request.availableTime,
-          },
-          scheduleEntry: entry,
-          progression,
-        }),
-      );
+      const fallbackW = parameterizeWorkout({
+        template: tplResolved,
+        athleteProfile,
+        recentState,
+        request: {
+          targetMetricPreference: request.targetMetricPreference,
+          availableTime: request.availableTime,
+        },
+        scheduleEntry: entry,
+        progression,
+      });
+      workouts.push(fallbackW);
       fallbackParamCount += 1;
+      emit({
+        id: paramId,
+        name: 'llm_parameterize_workout',
+        displayName: paramDisplay,
+        phase: 'done',
+        summary: summarizeParameterized('fallback', fallbackW),
+        durationMs: Date.now() - paramStart,
+      });
     }
   }
 
   // Stage 3: validate + retry-with-downgrade.
   const baseCap = computeBaseCap(request, athleteProfile, recentState);
   const hoursSinceLatest = computeHoursSinceLatest(recentState);
+
+  const validateId = crypto.randomUUID();
+  const validateStart = Date.now();
+  emit({
+    id: validateId,
+    name: 'validate_plan',
+    displayName: TOOL_DISPLAY.validate_plan,
+    phase: 'start',
+  });
 
   let violations = validatePlan({
     schedule: schedule.days,
@@ -259,6 +312,15 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     }
   }
 
+  emit({
+    id: validateId,
+    name: 'validate_plan',
+    displayName: TOOL_DISPLAY.validate_plan,
+    phase: 'done',
+    summary: summarizeValidation(violations),
+    durationMs: Date.now() - validateStart,
+  });
+
   // Stage 4: summary.
   const summaryStage = await runSummaryStage({
     schedule,
@@ -268,6 +330,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     recentState,
     signal,
     onDelta: input.onSummaryDelta,
+    emit,
   });
 
   totalInputTokens += summaryStage.meta?.inputTokens ?? 0;
@@ -310,10 +373,38 @@ async function runScheduleStage(args: {
   athleteProfile: AthleteProfile;
   recentState: RecentState;
   signal?: AbortSignal;
+  emit: (e: ToolEventPayload) => void;
 }): Promise<ScheduleStageResult> {
-  const { request, athleteProfile, recentState, signal } = args;
+  const { request, athleteProfile, recentState, signal, emit } = args;
+
+  const scheduleId = crypto.randomUUID();
+  const scheduleStart = Date.now();
+  emit({
+    id: scheduleId,
+    name: 'llm_build_schedule',
+    displayName: TOOL_DISPLAY.llm_build_schedule,
+    phase: 'start',
+  });
 
   let firstViolations: string[] | null = null;
+  const finalize = (
+    res: ScheduleStageResult,
+  ): ScheduleStageResult => {
+    const sportCounts: Record<string, number> = {};
+    for (const d of res.schedule.days) {
+      sportCounts[d.sport] = (sportCounts[d.sport] ?? 0) + 1;
+    }
+    emit({
+      id: scheduleId,
+      name: 'llm_build_schedule',
+      displayName: TOOL_DISPLAY.llm_build_schedule,
+      phase: 'done',
+      summary: summarizeSchedule(res.source, res.schedule.days.length, sportCounts),
+      durationMs: Date.now() - scheduleStart,
+    });
+    return res;
+  };
+
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (signal?.aborted) {
       throw new DOMException('Aborted', 'AbortError');
@@ -326,7 +417,7 @@ async function runScheduleStage(args: {
         signal,
         retryViolations: firstViolations ?? undefined,
       });
-      return { schedule: res.schedule, source: 'llm', meta: res.meta };
+      return finalize({ schedule: res.schedule, source: 'llm', meta: res.meta });
     } catch (err) {
       if (signal?.aborted) throw err;
       if (err instanceof LlmNotConfiguredError) {
@@ -350,10 +441,10 @@ async function runScheduleStage(args: {
     }
   }
 
-  return {
+  return finalize({
     schedule: buildWeeklySchedule({ request, athleteProfile, recentState }),
     source: 'deterministic',
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -376,9 +467,19 @@ async function runSummaryStage(args: {
   recentState: RecentState;
   signal?: AbortSignal;
   onDelta?: (delta: { kind: SummaryDeltaKind; text: string }) => void;
+  emit: (e: ToolEventPayload) => void;
 }): Promise<SummaryStageResult> {
-  const { schedule, workouts, request, athleteProfile, recentState, signal } = args;
+  const { schedule, workouts, request, athleteProfile, recentState, signal, emit } = args;
   const baseCap = computeBaseCap(request, athleteProfile, recentState);
+
+  const summaryEventId = crypto.randomUUID();
+  const summaryStart = Date.now();
+  emit({
+    id: summaryEventId,
+    name: 'llm_stream_summary',
+    displayName: TOOL_DISPLAY.llm_stream_summary,
+    phase: 'start',
+  });
 
   try {
     if (signal?.aborted) {
@@ -405,6 +506,14 @@ async function runSummaryStage(args: {
       // Empty model output — fall through.
       throw new Error('llm summary returned empty sections');
     }
+    emit({
+      id: summaryEventId,
+      name: 'llm_stream_summary',
+      displayName: TOOL_DISPLAY.llm_stream_summary,
+      phase: 'done',
+      summary: '总结、监测重点与调整规则已生成',
+      durationMs: Date.now() - summaryStart,
+    });
     return {
       summary: res.summary,
       monitoring: res.monitoring.length > 0 ? res.monitoring : buildMonitoring(recentState),
@@ -426,6 +535,14 @@ async function runSummaryStage(args: {
     args.onDelta?.({ kind: 'summary', text: summary });
     args.onDelta?.({ kind: 'monitoring', text: monitoring });
     args.onDelta?.({ kind: 'adjustment_rules', text: adjustmentRules });
+    emit({
+      id: summaryEventId,
+      name: 'llm_stream_summary',
+      displayName: TOOL_DISPLAY.llm_stream_summary,
+      phase: 'done',
+      summary: '已使用规则引擎生成总结',
+      durationMs: Date.now() - summaryStart,
+    });
     return {
       summary,
       monitoring,

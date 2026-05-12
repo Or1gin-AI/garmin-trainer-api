@@ -71,6 +71,25 @@ export function startHeartbeat(
 }
 
 /**
+ * tool_event payload — emitted by orchestrator/derived-context/chat to give
+ * the frontend a real-time view of what the AI is doing. start/done/error
+ * are paired by `id`. Done/error replace the matching start row in the UI.
+ */
+export interface ToolEventPayload {
+  id: string;
+  name: string;
+  displayName: string;
+  phase: 'start' | 'done' | 'error';
+  summary?: string;
+  errorMessage?: string;
+  durationMs?: number;
+}
+
+export function emitToolEvent(res: Response, payload: ToolEventPayload): void {
+  writeEvent(res, 'tool_event', payload);
+}
+
+/**
  * Convenience: writeEvent followed by res.end(). Use for terminal events
  * like 'done' and 'error'.
  */

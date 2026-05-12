@@ -32,7 +32,12 @@ import {
 } from '../garmin/fetch-recent.js';
 import { requireUser, type AuthedRequest } from '../lib/session.js';
 import { requireProAndQuota, consumeQuota } from '../lib/quota.js';
-import { openSse, writeEvent, endSse, startHeartbeat } from '../lib/sse.js';
+import { openSse, writeEvent, endSse, startHeartbeat, emitToolEvent, type ToolEventPayload } from '../lib/sse.js';
+import {
+  TOOL_DISPLAY,
+  summarizeRegenerateDay,
+  summarizeUpdateStatus,
+} from '../training/tool-event-labels.js';
 import { normalizeActivity } from '../training/activity-normalizer.js';
 import type { NormalizedActivity } from '../training/activity-normalizer.js';
 import { classifyActivityQuality } from '../training/activity-quality.js';
@@ -120,8 +125,19 @@ interface DerivedContext {
 async function loadDerivedContext(
   userId: string,
   request: ScheduleRequest,
+  emit?: (e: ToolEventPayload) => void,
 ): Promise<DerivedContext> {
+  const emitFn = emit ?? (() => {});
   const cutoff = new Date(Date.now() - ACTIVITY_LOOKBACK_DAYS * DAY_MS);
+
+  const activitiesId = crypto.randomUUID();
+  const activitiesStart = Date.now();
+  emitFn({
+    id: activitiesId,
+    name: 'load_recent_activities',
+    displayName: TOOL_DISPLAY.load_recent_activities,
+    phase: 'start',
+  });
 
   const fetched = await fetchRecentRawActivities(userId, {
     days: ACTIVITY_LOOKBACK_DAYS,
@@ -139,6 +155,24 @@ async function loadDerivedContext(
     }
     activities.push(normalized);
   }
+
+  emitFn({
+    id: activitiesId,
+    name: 'load_recent_activities',
+    displayName: TOOL_DISPLAY.load_recent_activities,
+    phase: 'done',
+    summary: `已加载 ${activities.length} 条活动`,
+    durationMs: Date.now() - activitiesStart,
+  });
+
+  const profileId = crypto.randomUUID();
+  const profileStart = Date.now();
+  emitFn({
+    id: profileId,
+    name: 'load_athlete_profile',
+    displayName: TOOL_DISPLAY.load_athlete_profile,
+    phase: 'start',
+  });
 
   const qualities = new Map<string, QualityResult>();
   // First pass: rough cycling-median speed for the personal-baseline filter.
@@ -169,7 +203,36 @@ async function loadDerivedContext(
     },
   });
 
+  emitFn({
+    id: profileId,
+    name: 'load_athlete_profile',
+    displayName: TOOL_DISPLAY.load_athlete_profile,
+    phase: 'done',
+    summary: summarizeProfileShort(athleteProfile, recentState),
+    durationMs: Date.now() - profileStart,
+  });
+
   return { request, athleteProfile, recentState, qualities, activities };
+}
+
+function summarizeProfileShort(
+  profile: ReturnType<typeof buildAthleteProfile>,
+  state: ReturnType<typeof deriveRecentTrainingState>,
+): string {
+  const fatigueZh: Record<string, string> = {
+    fresh: '新鲜',
+    normal: '正常',
+    tired: '偏疲劳',
+    high_risk: '高风险',
+  };
+  const exp = profile.experienceLevel ?? 'unknown';
+  const expZh: Record<string, string> = {
+    beginner: '入门',
+    intermediate: '进阶',
+    advanced: '资深',
+    unknown: '未知',
+  };
+  return `${expZh[exp] ?? exp} · 疲劳：${fatigueZh[state.fatigue] ?? state.fatigue}`;
 }
 
 function toScheduleRequest(parsed: z.infer<typeof planRequestSchema>): ScheduleRequest {
@@ -324,8 +387,10 @@ trainingRouter.post(
     const heartbeat = startHeartbeat(res);
     writeEvent(res, 'plan_created', { planId });
 
+    const emitToolEv = (e: ToolEventPayload) => emitToolEvent(res, e);
+
     try {
-      const ctx = await loadDerivedContext(userId, request);
+      const ctx = await loadDerivedContext(userId, request, emitToolEv);
       writeEvent(res, 'context', {
         recentState: {
           fatigue: ctx.recentState.fatigue,
@@ -358,6 +423,7 @@ trainingRouter.post(
         onSummaryDelta: (delta) => {
           summaryDeltas.push(delta);
         },
+        onToolEvent: emitToolEv,
       });
 
       writeEvent(res, 'schedule', { days: plan.schedule.days, notes: plan.schedule.notes });
@@ -574,8 +640,10 @@ trainingRouter.post(
     openSse(res);
     const heartbeat = startHeartbeat(res);
 
+    const emitToolEv = (e: ToolEventPayload) => emitToolEvent(res, e);
+
     try {
-      const ctx = await loadDerivedContext(userId, request);
+      const ctx = await loadDerivedContext(userId, request, emitToolEv);
       const schedule = buildWeeklySchedule({
         request,
         athleteProfile: ctx.athleteProfile,
@@ -597,6 +665,14 @@ trainingRouter.post(
           ? 'conservative'
           : 'normal';
 
+      const paramId = crypto.randomUUID();
+      const paramStart = Date.now();
+      emitToolEv({
+        id: paramId,
+        name: 'llm_parameterize_workout',
+        displayName: `第 ${dayIndex} 天 · 重新生成参数`,
+        phase: 'start',
+      });
       const w = parameterizeWorkout({
         template: safeTpl,
         athleteProfile: ctx.athleteProfile,
@@ -607,6 +683,14 @@ trainingRouter.post(
         },
         scheduleEntry: entry,
         progression,
+      });
+      emitToolEv({
+        id: paramId,
+        name: 'llm_parameterize_workout',
+        displayName: `第 ${dayIndex} 天 · 重新生成参数`,
+        phase: 'done',
+        summary: w.title || '已生成',
+        durationMs: Date.now() - paramStart,
       });
 
       // Build the existing workouts array for whole-week validation.
@@ -622,6 +706,14 @@ trainingRouter.post(
           : workoutRowToParameterized(row),
       );
 
+      const validateId = crypto.randomUUID();
+      const validateStart = Date.now();
+      emitToolEv({
+        id: validateId,
+        name: 'validate_plan',
+        displayName: TOOL_DISPLAY.validate_plan,
+        phase: 'start',
+      });
       const violations = validatePlan({
         schedule: existing.map((row, i) =>
           row.dayIndex === dayIndex
@@ -646,6 +738,14 @@ trainingRouter.post(
             : Number.POSITIVE_INFINITY,
           fatigue: ctx.recentState.fatigue,
         },
+      });
+      emitToolEv({
+        id: validateId,
+        name: 'validate_plan',
+        displayName: TOOL_DISPLAY.validate_plan,
+        phase: 'done',
+        summary: violations.length === 0 ? '无冲突' : `检出 ${violations.length} 处冲突`,
+        durationMs: Date.now() - validateStart,
       });
 
       const row = buildWorkoutRow(planId, entry, w);
@@ -875,8 +975,10 @@ trainingRouter.post(
       },
     });
 
+    const emitToolEv = (e: ToolEventPayload) => emitToolEvent(res, e);
+
     try {
-      const ctx = await loadDerivedContext(userId, request);
+      const ctx = await loadDerivedContext(userId, request, emitToolEv);
 
       // Load the latest snapshot of workouts (in case prior tool calls
       // mutated them). Use this list both for the LLM context and as a
@@ -921,14 +1023,36 @@ trainingRouter.post(
             name: call.name,
             arguments: call.arguments,
           });
-          const dispatched = await dispatchChatToolCall({
-            call,
-            planId,
-            request,
-            ctx,
-            workoutsSnapshot,
-            signal: abort.signal,
+          const toolEventId = crypto.randomUUID();
+          const toolEventStart = Date.now();
+          const displayName = TOOL_DISPLAY[call.name] ?? call.name;
+          emitToolEv({
+            id: toolEventId,
+            name: call.name,
+            displayName,
+            phase: 'start',
           });
+          let dispatched: Awaited<ReturnType<typeof dispatchChatToolCall>>;
+          try {
+            dispatched = await dispatchChatToolCall({
+              call,
+              planId,
+              request,
+              ctx,
+              workoutsSnapshot,
+              signal: abort.signal,
+            });
+          } catch (err) {
+            emitToolEv({
+              id: toolEventId,
+              name: call.name,
+              displayName,
+              phase: 'error',
+              errorMessage: (err as Error).message || '工具执行失败',
+              durationMs: Date.now() - toolEventStart,
+            });
+            throw err;
+          }
           if (dispatched.updatedWorkout) {
             workoutsSnapshot = workoutsSnapshot.map((w) =>
               w.id === dispatched.updatedWorkout!.id ? dispatched.updatedWorkout! : w,
@@ -940,6 +1064,25 @@ trainingRouter.post(
           if (dispatched.refEntry) {
             toolResultRefs.push(dispatched.refEntry);
           }
+          let summary: string | undefined;
+          if (call.name === 'regenerate_day') {
+            const w = dispatched.updatedWorkout;
+            if (w) {
+              summary = summarizeRegenerateDay(call.arguments.dayIndex, w.sport as string);
+            } else {
+              summary = `第 ${call.arguments.dayIndex} 天处理完成`;
+            }
+          } else if (call.name === 'update_workout_field') {
+            summary = summarizeUpdateStatus(call.arguments.value);
+          }
+          emitToolEv({
+            id: toolEventId,
+            name: call.name,
+            displayName,
+            phase: 'done',
+            summary,
+            durationMs: Date.now() - toolEventStart,
+          });
           return dispatched.toolResult;
         },
       });
