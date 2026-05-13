@@ -4,8 +4,8 @@
 //
 //   - Builds system + history + user messages, with a structured plan / 7-day
 //     workouts / athlete-profile / recent-state context block.
-//   - Exposes two function-call tools: regenerate_day(dayIndex, reason) and
-//     update_workout_field(workoutId, 'status', value).
+//   - Exposes function-call tools to regenerate an existing workout, add a
+//     second workout to a day, and update workout status.
 //   - Streams text deltas via onTextDelta as the model speaks; when the model
 //     emits tool calls, dispatches each via onToolCall and feeds the tool
 //     result back as a `tool` role message, then re-enters the LLM loop.
@@ -48,6 +48,15 @@ export type ToolCall =
       arguments: { dayIndex: number; reason: string; slotIndex?: number; workoutId?: string };
     }
   | {
+      name: 'add_second_workout';
+      arguments: {
+        dayIndex: number;
+        reason: string;
+        sport?: 'running' | 'cycling' | 'swimming' | 'mobility';
+        templateId?: string;
+      };
+    }
+  | {
       name: 'update_workout_field';
       arguments: {
         workoutId: string;
@@ -86,6 +95,7 @@ export interface ChatTurnResult {
 }
 
 const TOOL_REGEN = 'regenerate_day';
+const TOOL_ADD_SECOND = 'add_second_workout';
 const TOOL_UPDATE_FIELD = 'update_workout_field';
 const MAX_ITERATIONS = 3;
 
@@ -305,6 +315,40 @@ function buildToolDefs(): ChatCompletionTool[] {
     {
       type: 'function',
       function: {
+        name: TOOL_ADD_SECOND,
+        description:
+          '给本周第 dayIndex 天新增第二堂训练课，创建 slotIndex=2/3。用户要求“一天两练”“加第二练”“某天加练”时使用这个工具，而不是 regenerate_day。若用户让你自己决定，默认加低强度恢复/交叉训练。',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['dayIndex', 'reason'],
+          properties: {
+            dayIndex: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 7,
+              description: '需要加第二练的本周天数 (1..7)',
+            },
+            sport: {
+              type: 'string',
+              enum: ['running', 'cycling', 'swimming', 'mobility'],
+              description: '用户指定或你选择的第二练项目；不填则系统自动选低冲击恢复课',
+            },
+            templateId: {
+              type: 'string',
+              description: '可选模板 id；不填时系统按安全规则选择低强度模板',
+            },
+            reason: {
+              type: 'string',
+              description: '中文一句说明为什么要新增第二练',
+            },
+          },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: TOOL_UPDATE_FIELD,
         description:
           '更新某个训练日的字段。当前仅支持把 status 改为 completed/skipped/planned。',
@@ -397,6 +441,51 @@ function parseToolCall(name: string, argsBuffer: string): ParseResult {
     };
   }
 
+  if (name === TOOL_ADD_SECOND) {
+    const dayIndex = obj.dayIndex;
+    const reason = obj.reason;
+    const sport = obj.sport;
+    const templateId = obj.templateId;
+    if (
+      typeof dayIndex !== 'number' ||
+      !Number.isInteger(dayIndex) ||
+      dayIndex < 1 ||
+      dayIndex > 7
+    ) {
+      return {
+        kind: 'error',
+        message: `${name}: dayIndex must be integer 1..7`,
+      };
+    }
+    if (typeof reason !== 'string' || reason.length === 0) {
+      return { kind: 'error', message: `${name}: reason must be a non-empty string` };
+    }
+    if (
+      sport !== undefined &&
+      sport !== 'running' &&
+      sport !== 'cycling' &&
+      sport !== 'swimming' &&
+      sport !== 'mobility'
+    ) {
+      return { kind: 'error', message: `${name}: sport must be running|cycling|swimming|mobility` };
+    }
+    if (templateId !== undefined && typeof templateId !== 'string') {
+      return { kind: 'error', message: `${name}: templateId must be a string` };
+    }
+    return {
+      kind: 'ok',
+      call: {
+        name: 'add_second_workout',
+        arguments: {
+          dayIndex,
+          reason,
+          ...(sport ? { sport } : {}),
+          ...(templateId ? { templateId } : {}),
+        },
+      },
+    };
+  }
+
   if (name === TOOL_UPDATE_FIELD) {
     const workoutId = obj.workoutId;
     const field = obj.field;
@@ -443,7 +532,9 @@ function buildSystemPrompt(input: ChatTurnInput): string {
   parts.push('');
   parts.push('修改训练计划的唯一方式是调用下列工具，禁止直接声称已修改课表：');
   parts.push('- regenerate_day(dayIndex, reason, slotIndex?, workoutId?) — 重新生成指定训练课；同一天有多课时必须传 slotIndex 或 workoutId；');
+  parts.push('- add_second_workout(dayIndex, reason, sport?, templateId?) — 给某一天新增第二堂训练课；用户说“一天两练 / 加第二练 / 某天加练”时必须优先用这个工具；');
   parts.push('- update_workout_field(workoutId, field="status", value) — 修改某个训练日的状态。');
+  parts.push('- 如果用户让你自己决定第二练内容，优先选择低强度恢复或低冲击交叉训练，例如跑后加恢复游；不要用 regenerate_day 代替新增课时。');
   parts.push('调用工具前请先用一句话告诉用户你打算做什么，然后再触发工具调用。');
   parts.push('');
   parts.push('# 当前计划上下文');

@@ -17,7 +17,12 @@
 // stays compatible with U7 — only the optional onSummaryDelta callback and
 // modelMeta field shape are widened.
 
-import { buildWeeklySchedule } from './scheduler.js';
+import {
+  applyDurationCap,
+  buildWeeklySchedule,
+  MAX_WEEKLY_TRAINING_MINUTES,
+  requestedDoubleDayIndex,
+} from './scheduler.js';
 import type { ScheduleRequest, ScheduleResult, ScheduleEntry } from './scheduler.js';
 import { parameterizeWorkout } from './parameterizer.js';
 import type { ParameterizedWorkout } from './parameterizer.js';
@@ -25,6 +30,7 @@ import { validatePlan } from './validation.js';
 import type { Violation } from './validation.js';
 import type { AthleteProfile } from './athlete-profile.js';
 import type { RecentState } from './recent-state.js';
+import type { TrainingCapacity } from './training-capacity.js';
 import { getTemplate, type WorkoutTemplate } from './templates/index.js';
 import {
   llmBuildWeeklySchedule,
@@ -56,6 +62,7 @@ export interface GeneratePlanInput {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
   recentState: RecentState;
+  trainingCapacity?: TrainingCapacity;
   signal?: AbortSignal;
   onSummaryDelta?: (delta: { kind: SummaryDeltaKind; text: string }) => void;
   /**
@@ -97,7 +104,7 @@ const DETERMINISTIC_MODEL = 'v1';
 // ---------------------------------------------------------------------------
 
 export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedPlan> {
-  const { request, athleteProfile, recentState, signal, onToolEvent } = input;
+  const { request, athleteProfile, recentState, trainingCapacity, signal, onToolEvent } = input;
   const emit = onToolEvent ?? (() => {});
 
   // Stage 1: schedule.
@@ -105,11 +112,19 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     request,
     athleteProfile,
     recentState,
+    trainingCapacity,
     signal,
     emit,
   });
   let schedule = stageOne.schedule;
-  schedule = expandMultiSessionSchedule(schedule, request, athleteProfile, recentState);
+  const progressionCapacity = request.forceRequestedSchedule ? undefined : trainingCapacity;
+  schedule = expandMultiSessionSchedule(
+    schedule,
+    request,
+    athleteProfile,
+    recentState,
+    trainingCapacity,
+  );
 
   let totalInputTokens = stageOne.meta?.inputTokens ?? 0;
   let totalOutputTokens = stageOne.meta?.outputTokens ?? 0;
@@ -130,7 +145,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
       // Should never happen — both rest templates are baked in.
       throw new Error(`Missing template ${entry.templateId} and no rest fallback`);
     }
-    const progression = decideProgression(athleteProfile, recentState, entry);
+    const progression = decideProgression(athleteProfile, recentState, entry, progressionCapacity);
     const tplResolved: WorkoutTemplate = tpl;
 
     // Skip LLM for rest/mobility — they're trivially deterministic and the
@@ -240,9 +255,12 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     }
   }
 
+  enforceWeeklyDurationLimit(schedule, workouts, request);
+
   // Stage 3: validate + retry-with-downgrade.
-  const baseCap = computeBaseCap(request, athleteProfile, recentState);
+  const baseCap = computeBaseCap(request, athleteProfile, recentState, trainingCapacity);
   const hoursSinceLatest = computeHoursSinceLatest(recentState);
+  const validationCapacity = request.forceRequestedSchedule ? undefined : trainingCapacity;
 
   const validateId = crypto.randomUUID();
   const validateStart = Date.now();
@@ -262,6 +280,9 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
       latestStimulus: recentState.latestStimulus,
       hoursSinceLatest,
       fatigue: recentState.fatigue,
+      forceRequestedSchedule: request.forceRequestedSchedule === true,
+      weeklyMaxMinutes: request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES,
+      trainingCapacity: validationCapacity,
     },
   });
 
@@ -296,7 +317,12 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
           dailyPreferredMinutes: request.dailyPreferredMinutes,
         },
         scheduleEntry: schedule.days[idx],
-        progression: decideProgression(athleteProfile, recentState, schedule.days[idx]),
+        progression: decideProgression(
+          athleteProfile,
+          recentState,
+          schedule.days[idx],
+          progressionCapacity,
+        ),
       });
       mutated = true;
       fallbackParamCount += 1;
@@ -312,6 +338,9 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
           latestStimulus: recentState.latestStimulus,
           hoursSinceLatest,
           fatigue: recentState.fatigue,
+          forceRequestedSchedule: request.forceRequestedSchedule === true,
+          weeklyMaxMinutes: request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES,
+          trainingCapacity: validationCapacity,
         },
       });
     }
@@ -333,6 +362,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     request,
     athleteProfile,
     recentState,
+    trainingCapacity,
     signal,
     onDelta: input.onSummaryDelta,
     emit,
@@ -368,38 +398,75 @@ export function expandMultiSessionSchedule(
   request: ScheduleRequest,
   athleteProfile: AthleteProfile,
   recentState: RecentState,
+  trainingCapacity?: TrainingCapacity,
 ): ScheduleResult {
+  const forceRequestedSchedule = request.forceRequestedSchedule === true;
+  let expanded = expandRequestedDoubleDay(
+    schedule,
+    request,
+    athleteProfile,
+    trainingCapacity,
+    forceRequestedSchedule,
+  );
   const wantsDoubleThreshold =
     request.allowAdvancedWorkouts === true &&
     request.allowDoubleDays === true &&
     /双阈值|double\s*threshold/i.test(`${request.goal ?? ''}\n${request.notes ?? ''}`);
-  if (!wantsDoubleThreshold) return schedule;
-  if (!request.sports.running) return schedule;
+  if (!wantsDoubleThreshold) return expanded;
+  if (!request.sports.running) return expanded;
+  let notes = expanded.notes;
+  if (trainingCapacity && !trainingCapacity.guardrails.allowDoubleDays) {
+    if (forceRequestedSchedule) {
+      notes = [
+        ...notes,
+        '用户已明确要求同日多练；训练容量/恢复评估不建议安排，系统仍按要求生成并保留风险提示。',
+      ];
+    } else {
+      return {
+        ...expanded,
+        notes: [...notes, '已请求同日多练，但训练容量/恢复评估未通过，本周保留单次训练。'],
+      };
+    }
+  }
   if (recentState.fatigue === 'tired' || recentState.fatigue === 'high_risk') {
-    return {
-      ...schedule,
-      notes: [...schedule.notes, '已请求双阈值，但近期疲劳偏高，未安排同日两练。'],
-    };
+    if (forceRequestedSchedule) {
+      notes = [
+        ...notes,
+        '用户已明确要求双阈值；近期疲劳偏高，系统仍按要求生成但不推荐执行。',
+      ];
+    } else {
+      return {
+        ...expanded,
+        notes: [...notes, '已请求双阈值，但近期疲劳偏高，未安排同日两练。'],
+      };
+    }
   }
   if (athleteProfile.experienceLevel !== 'advanced') {
-    return {
-      ...schedule,
-      notes: [...schedule.notes, '双阈值仅适合高水平且恢复正常的用户，本周保留单次阈值/节奏课。'],
-    };
+    if (forceRequestedSchedule) {
+      notes = [
+        ...notes,
+        '用户已明确要求双阈值；当前能力等级未达到推荐条件，系统仍按要求生成但建议谨慎执行。',
+      ];
+    } else {
+      return {
+        ...expanded,
+        notes: [...notes, '双阈值仅适合高水平且恢复正常的用户，本周保留单次阈值/节奏课。'],
+      };
+    }
   }
 
-  const thresholdIdx = schedule.days.findIndex((d) => {
+  const thresholdIdx = expanded.days.findIndex((d) => {
     const tpl = getTemplate(d.templateId);
     return d.sport === 'running' && (tpl?.fixed.workoutType === 'threshold' || tpl?.fixed.workoutType === 'tempo');
   });
   if (thresholdIdx < 0) {
     return {
-      ...schedule,
-      notes: [...schedule.notes, '已开启同日多练，但本周没有合适的跑步阈值日可扩展为双阈值。'],
+      ...expanded,
+      notes: [...notes, '已开启同日多练，但本周没有合适的跑步阈值日可扩展为双阈值。'],
     };
   }
 
-  const base = schedule.days[thresholdIdx];
+  const base = expanded.days[thresholdIdx];
   const am: ScheduleEntry = {
     ...base,
     templateId: 'run.double_threshold_am.v1',
@@ -408,6 +475,7 @@ export function expandMultiSessionSchedule(
     timeOfDay: 'morning',
     reason: `${base.reason ?? ''} 双阈值上午课：短时间阈值间歇，控制乳酸与配速稳定。`.trim(),
   };
+  applyDurationCap(am, forceRequestedSchedule ? undefined : trainingCapacity);
   const pm: ScheduleEntry = {
     ...base,
     templateId: 'run.double_threshold_pm.v1',
@@ -416,16 +484,151 @@ export function expandMultiSessionSchedule(
     timeOfDay: 'afternoon',
     reason: '双阈值下午课：同日第二次阈值刺激，全天阈值总时间控制在 40-70 分钟。',
   };
+  applyDurationCap(pm, forceRequestedSchedule ? undefined : trainingCapacity);
   const days = [
-    ...schedule.days.slice(0, thresholdIdx),
+    ...expanded.days.slice(0, thresholdIdx),
     am,
     pm,
-    ...schedule.days.slice(thresholdIdx + 1),
+    ...expanded.days.slice(thresholdIdx + 1),
   ].sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
   return {
     days,
-    notes: [...schedule.notes, `第 ${base.dayIndex} 天已安排双阈值上午/下午两练。`],
+    notes: [...notes, `第 ${base.dayIndex} 天已安排双阈值上午/下午两练。`],
   };
+}
+
+function expandRequestedDoubleDay(
+  schedule: ScheduleResult,
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+  trainingCapacity: TrainingCapacity | undefined,
+  forceRequestedSchedule: boolean,
+): ScheduleResult {
+  const dayIndex = requestedDoubleDayIndex(request);
+  if (dayIndex === null) return schedule;
+
+  const existingForDay = schedule.days
+    .filter((d) => d.dayIndex === dayIndex)
+    .sort((a, b) => (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
+  const base = existingForDay[0];
+  if (!base) return schedule;
+  if (existingForDay.some((d) => (d.slotIndex ?? 1) > 1)) {
+    return {
+      ...schedule,
+      notes: [...schedule.notes, `${base.dayLabel} 已按用户要求包含同日多练。`],
+    };
+  }
+
+  const primary = isRestLikeEntry(base)
+    ? buildRequestedDoublePrimary(base, request, athleteProfile, trainingCapacity, forceRequestedSchedule)
+    : {
+        ...base,
+        slotIndex: 1,
+        sessionLabel: base.sessionLabel ?? '上午',
+        timeOfDay: base.timeOfDay ?? 'morning',
+      };
+  const second = buildRequestedDoubleSecond(primary, request, athleteProfile, trainingCapacity, forceRequestedSchedule);
+  const days = schedule.days
+    .filter((d) => !(d.dayIndex === dayIndex && (d.slotIndex ?? 1) === 1))
+    .concat(primary, second)
+    .sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
+
+  return {
+    days,
+    notes: [
+      ...schedule.notes,
+      `${primary.dayLabel} 已按用户要求安排一天两练：${primary.templateId} + ${second.templateId}。`,
+    ],
+  };
+}
+
+function isRestLikeEntry(entry: ScheduleEntry): boolean {
+  return entry.sport === 'rest' || entry.sport === 'mobility';
+}
+
+function buildRequestedDoublePrimary(
+  base: ScheduleEntry,
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+  trainingCapacity: TrainingCapacity | undefined,
+  forceRequestedSchedule: boolean,
+): ScheduleEntry {
+  const templateId = choosePrimaryDoubleTemplate(request, athleteProfile);
+  const tpl = getTemplate(templateId)!;
+  const entry: ScheduleEntry = {
+    ...base,
+    sport: tpl.fixed.sport,
+    templateId,
+    slotIndex: 1,
+    sessionLabel: '上午',
+    timeOfDay: 'morning',
+    reason: '用户明确要求这一天安排两练；原休息日改为低风险主训练。',
+  };
+  applyDurationCap(entry, forceRequestedSchedule ? undefined : trainingCapacity);
+  return entry;
+}
+
+function buildRequestedDoubleSecond(
+  primary: ScheduleEntry,
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+  trainingCapacity: TrainingCapacity | undefined,
+  forceRequestedSchedule: boolean,
+): ScheduleEntry {
+  const templateId = chooseSecondDoubleTemplate(primary, request, athleteProfile);
+  const tpl = getTemplate(templateId)!;
+  const entry: ScheduleEntry = {
+    dayIndex: primary.dayIndex,
+    date: primary.date,
+    dayLabel: primary.dayLabel,
+    sport: tpl.fixed.sport,
+    templateId,
+    slotIndex: 2,
+    sessionLabel: '下午',
+    timeOfDay: 'afternoon',
+    reason: '用户明确要求一天两练；第二练安排为低压力恢复/交叉训练。',
+  };
+  applyDurationCap(entry, forceRequestedSchedule ? undefined : trainingCapacity);
+  return entry;
+}
+
+function choosePrimaryDoubleTemplate(
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+): string {
+  const priorities = request.sportPriorities ?? [];
+  for (const sport of priorities) {
+    if (sport === 'running' && request.sports.running && athleteProfile.running.available) return 'run.aerobic.v1';
+    if (sport === 'cycling' && request.sports.cycling && athleteProfile.cycling.available) return 'bike.endurance.v1';
+    if (sport === 'swimming' && request.sports.swimming && athleteProfile.swimming.available) return 'swim.aerobic.v1';
+  }
+  if (request.sports.running && athleteProfile.running.available) return 'run.aerobic.v1';
+  if (request.sports.cycling && athleteProfile.cycling.available) return 'bike.endurance.v1';
+  if (request.sports.swimming && athleteProfile.swimming.available) return 'swim.aerobic.v1';
+  if (request.sports.running) return 'run.recovery.v1';
+  if (request.sports.cycling) return 'bike.recovery_spin.v1';
+  if (request.sports.swimming) return 'swim.recovery.v1';
+  return 'rest.mobility.v1';
+}
+
+function chooseSecondDoubleTemplate(
+  primary: ScheduleEntry,
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+): string {
+  if (request.sports.swimming && athleteProfile.swimming.available && primary.sport !== 'swimming') {
+    return 'swim.recovery.v1';
+  }
+  if (request.sports.cycling && athleteProfile.cycling.available && primary.sport !== 'cycling') {
+    return 'bike.recovery_spin.v1';
+  }
+  if (request.sports.running && athleteProfile.running.available && primary.sport !== 'running') {
+    return 'run.recovery.v1';
+  }
+  if (request.sports.swimming) return 'swim.recovery.v1';
+  if (request.sports.cycling) return 'bike.recovery_spin.v1';
+  if (request.sports.running) return 'run.recovery.v1';
+  return 'rest.mobility.v1';
 }
 
 // ---------------------------------------------------------------------------
@@ -442,10 +645,11 @@ async function runScheduleStage(args: {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
   recentState: RecentState;
+  trainingCapacity?: TrainingCapacity;
   signal?: AbortSignal;
   emit: (e: ToolEventPayload) => void;
 }): Promise<ScheduleStageResult> {
-  const { request, athleteProfile, recentState, signal, emit } = args;
+  const { request, athleteProfile, recentState, trainingCapacity, signal, emit } = args;
 
   const scheduleId = crypto.randomUUID();
   const scheduleStart = Date.now();
@@ -484,6 +688,7 @@ async function runScheduleStage(args: {
         request,
         athleteProfile,
         recentState,
+        trainingCapacity,
         signal,
         retryViolations: firstViolations ?? undefined,
       });
@@ -512,7 +717,7 @@ async function runScheduleStage(args: {
   }
 
   return finalize({
-    schedule: buildWeeklySchedule({ request, athleteProfile, recentState }),
+    schedule: buildWeeklySchedule({ request, athleteProfile, recentState, trainingCapacity }),
     source: 'deterministic',
   });
 }
@@ -535,12 +740,13 @@ async function runSummaryStage(args: {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
   recentState: RecentState;
+  trainingCapacity?: TrainingCapacity;
   signal?: AbortSignal;
   onDelta?: (delta: { kind: SummaryDeltaKind; text: string }) => void;
   emit: (e: ToolEventPayload) => void;
 }): Promise<SummaryStageResult> {
-  const { schedule, workouts, request, athleteProfile, recentState, signal, emit } = args;
-  const baseCap = computeBaseCap(request, athleteProfile, recentState);
+  const { schedule, workouts, request, athleteProfile, recentState, trainingCapacity, signal, emit } = args;
+  const baseCap = computeBaseCap(request, athleteProfile, recentState, trainingCapacity);
 
   const summaryEventId = crypto.randomUUID();
   const summaryStart = Date.now();
@@ -630,20 +836,37 @@ function computeBaseCap(
   request: ScheduleRequest,
   athleteProfile: AthleteProfile,
   recentState: RecentState,
+  trainingCapacity?: TrainingCapacity,
 ): number {
-  return (
+  const explicitHardCap =
+    request.maxHardSessionsPerWeek !== null &&
+    request.maxHardSessionsPerWeek !== undefined;
+  const base =
     request.maxHardSessionsPerWeek ??
     (athleteProfile.experienceLevel === 'advanced' && recentState.fatigue !== 'tired'
       ? 3
-      : 2)
-  );
+      : 2);
+  if (request.forceRequestedSchedule === true || explicitHardCap) {
+    return Math.min(7, Math.max(0, base));
+  }
+  return trainingCapacity
+    ? Math.min(base, trainingCapacity.guardrails.maxHardSessionsPerWeek)
+    : base;
 }
 
 function decideProgression(
   athleteProfile: AthleteProfile,
   recentState: RecentState,
   entry: ScheduleEntry,
+  trainingCapacity?: TrainingCapacity,
 ): 'conservative' | 'normal' | 'aggressive' {
+  if (
+    trainingCapacity &&
+    (trainingCapacity.overall.readiness !== 'green' ||
+      trainingCapacity.overall.readinessConfidence === 'low')
+  ) {
+    return 'conservative';
+  }
   if (recentState.fatigue === 'tired' || recentState.fatigue === 'high_risk') {
     return 'conservative';
   }
@@ -653,14 +876,156 @@ function decideProgression(
   if (sport === 'cycling') confidence = athleteProfile.cycling.confidence;
   if (sport === 'swimming') confidence = athleteProfile.swimming.confidence;
   if (confidence === 'low') return 'conservative';
+  if (
+    trainingCapacity &&
+    (sport === 'running' || sport === 'cycling' || sport === 'swimming') &&
+    trainingCapacity.sports[sport].confidence === 'low'
+  ) {
+    return 'conservative';
+  }
 
   if (
     recentState.fatigue === 'fresh' &&
-    athleteProfile.experienceLevel === 'advanced'
+    athleteProfile.experienceLevel === 'advanced' &&
+    (!trainingCapacity || trainingCapacity.overall.readiness === 'green')
   ) {
     return 'aggressive';
   }
   return 'normal';
+}
+
+function enforceWeeklyDurationLimit(
+  schedule: ScheduleResult,
+  workouts: ParameterizedWorkout[],
+  request: ScheduleRequest,
+): void {
+  const limit = normalizeWeeklyMaxMinutes(request.weeklyMaxMinutes);
+  const activeIndexes = workouts
+    .map((w, index) => ({ w, s: schedule.days[index], index }))
+    .filter(({ w, s }) =>
+      s &&
+      s.sport !== 'rest' &&
+      s.sport !== 'mobility' &&
+      Number.isFinite(w.durationMinutes) &&
+      w.durationMinutes > 0,
+    );
+  const total = activeIndexes.reduce((sum, { w }) => sum + w.durationMinutes, 0);
+  if (total <= limit) return;
+
+  const minSessionMinutes = 15;
+  const reducible = activeIndexes.reduce(
+    (sum, { w }) => sum + Math.max(0, w.durationMinutes - minSessionMinutes),
+    0,
+  );
+  if (reducible <= 0) {
+    schedule.notes.push(
+      `用户周时长上限为 ${limit} 分钟，但当前训练日数量下每节课已接近最低可执行时长，无法继续压缩。`,
+    );
+    return;
+  }
+
+  const overflow = total - limit;
+  for (const item of activeIndexes) {
+    const current = item.w.durationMinutes;
+    const share = Math.max(0, current - minSessionMinutes) / reducible;
+    const target = current - overflow * share;
+    workouts[item.index] = adjustWorkoutDuration(
+      item.w,
+      Math.max(minSessionMinutes, roundToFive(target)),
+      limit,
+    );
+  }
+
+  let adjustedTotal = activeWeeklyMinutes(schedule, workouts);
+  while (adjustedTotal > limit) {
+    const candidate = activeIndexes
+      .map(({ index }) => ({ index, minutes: workouts[index].durationMinutes }))
+      .filter(({ minutes }) => minutes > minSessionMinutes)
+      .sort((a, b) => b.minutes - a.minutes)[0];
+    if (!candidate) break;
+    const nextMinutes = Math.max(
+      minSessionMinutes,
+      candidate.minutes - Math.min(5, adjustedTotal - limit),
+    );
+    workouts[candidate.index] = adjustWorkoutDuration(
+      workouts[candidate.index],
+      nextMinutes,
+      limit,
+    );
+    adjustedTotal = activeWeeklyMinutes(schedule, workouts);
+  }
+
+  const finalTotal = activeWeeklyMinutes(schedule, workouts);
+  if (finalTotal <= limit) {
+    schedule.notes.push(
+      `本周原始生成时长 ${total} 分钟，已按用户周上限压缩到 ${finalTotal}/${limit} 分钟。`,
+    );
+  } else {
+    schedule.notes.push(
+      `本周原始生成时长 ${total} 分钟，已尽量压缩到 ${finalTotal} 分钟，但仍超过用户周上限 ${limit} 分钟。`,
+    );
+  }
+}
+
+function adjustWorkoutDuration(
+  workout: ParameterizedWorkout,
+  nextMinutes: number,
+  weeklyLimit: number,
+): ParameterizedWorkout {
+  const current = workout.durationMinutes;
+  const durationMinutes = Math.max(0, Math.round(nextMinutes));
+  if (durationMinutes === current) return workout;
+  const scale =
+    current > 0 && workout.distanceKm !== null
+      ? durationMinutes / current
+      : null;
+  const distanceKm =
+    scale && Number.isFinite(scale)
+      ? Math.round(workout.distanceKm! * scale * 100) / 100
+      : workout.distanceKm;
+  const targets = [
+    `总时长 ${durationMinutes} 分钟（已按周上限 ${weeklyLimit} 分钟控制）`,
+    ...(workout.targets ?? []).filter((t) => !/^总时长\s*\d+\s*分钟/.test(t)),
+  ];
+  return {
+    ...workout,
+    durationMinutes,
+    distanceKm,
+    targets,
+    parameterSource: {
+      ...workout.parameterSource,
+      replacedVariables: {
+        ...workout.parameterSource.replacedVariables,
+        __weekly_duration_limit: weeklyLimit,
+        __original_duration_minutes: current,
+      },
+    },
+  };
+}
+
+function activeWeeklyMinutes(
+  schedule: ScheduleResult,
+  workouts: ParameterizedWorkout[],
+): number {
+  let total = 0;
+  for (let i = 0; i < Math.min(schedule.days.length, workouts.length); i += 1) {
+    const s = schedule.days[i];
+    if (s.sport === 'rest' || s.sport === 'mobility') continue;
+    const minutes = Number(workouts[i].durationMinutes);
+    if (Number.isFinite(minutes) && minutes > 0) total += minutes;
+  }
+  return total;
+}
+
+function normalizeWeeklyMaxMinutes(value: number | null | undefined): number {
+  if (!Number.isFinite(value ?? NaN) || !value || value <= 0) {
+    return MAX_WEEKLY_TRAINING_MINUTES;
+  }
+  return Math.min(MAX_WEEKLY_TRAINING_MINUTES, Math.max(15, Math.round(value)));
+}
+
+function roundToFive(value: number): number {
+  return Math.round(value / 5) * 5;
 }
 
 function collectViolatingDays(violations: Violation[]): number[] {

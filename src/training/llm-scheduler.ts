@@ -29,6 +29,15 @@ import type {
   ScheduleRequest,
   ScheduleResult,
 } from './scheduler.js';
+import {
+  applyDurationCap,
+  formatDayIndexes,
+  MAX_WEEKLY_TRAINING_MINUTES,
+  normalizeDaysPerWeek,
+  requestedDoubleDayIndex,
+  requestedTrainingDayIndexes,
+} from './scheduler.js';
+import type { TrainingCapacity } from './training-capacity.js';
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -58,6 +67,7 @@ export interface LlmBuildScheduleArgs {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
   recentState: RecentState;
+  trainingCapacity?: TrainingCapacity;
   signal?: AbortSignal;
   /** Extra system-prompt text to inject after a previous failed attempt. */
   retryViolations?: string[];
@@ -77,6 +87,9 @@ export interface LlmBuildScheduleResult {
 
 interface LlmDay {
   dayIndex: number;
+  slotIndex?: number;
+  sessionLabel?: string;
+  timeOfDay?: ScheduleEntry['timeOfDay'];
   sport: string;
   templateId: string;
   reason?: string;
@@ -116,21 +129,34 @@ export async function llmBuildWeeklySchedule(
     throw new LlmNotConfiguredError((err as Error).message);
   }
 
-  const { request, athleteProfile, recentState } = args;
+  const { request, athleteProfile, recentState, trainingCapacity } = args;
+  const effectiveHardCap = computeHardCap(
+    request,
+    athleteProfile,
+    recentState,
+    trainingCapacity,
+  );
 
   // Build per-sport allowed catalog (post-contraindication filter).
   const enabledSports = collectEnabledSports(request);
+  const requestedTrainingDays = effectiveTrainingDaysPerWeek(request);
   const allowedIds = new Set<string>();
   const catalogLines: string[] = [];
 
   for (const sport of enabledSports) {
     const allowed = filterAllowedTemplates({
       sport,
-      athleteProfile: filterAthleteProfile(athleteProfile),
-      recentState: filterRecentState(recentState),
+      athleteProfile: filterAthleteProfile(
+        athleteProfile,
+        request.forceRequestedSchedule === true,
+      ),
+      recentState: filterRecentState(
+        recentState,
+        request.forceRequestedSchedule === true,
+      ),
       request: {
         sports: request.sports as Partial<Record<Sport, boolean>>,
-        maxHardSessionsPerWeek: request.maxHardSessionsPerWeek ?? undefined,
+        maxHardSessionsPerWeek: effectiveHardCap,
         allowAdvancedWorkouts: request.allowAdvancedWorkouts,
       },
       hardSessionsAlreadyScheduledThisWeek: 0,
@@ -152,19 +178,24 @@ export async function llmBuildWeeklySchedule(
     }
   }
 
-  // Always allow rest templates.
-  for (const tpl of Object.values(WORKOUT_TEMPLATES)) {
-    if (tpl.fixed.sport === 'rest' || tpl.fixed.sport === 'mobility') {
-      allowedIds.add(tpl.id);
+  // Allow rest templates only when the requested training frequency leaves
+  // actual rest/recovery days. A 7-day request must not silently become a
+  // 6-day plan plus one rest day.
+  if (requestedTrainingDays < 7) {
+    for (const tpl of Object.values(WORKOUT_TEMPLATES)) {
+      if (tpl.fixed.sport === 'rest' || tpl.fixed.sport === 'mobility') {
+        allowedIds.add(tpl.id);
+      }
     }
+    const restCatalog = getCatalogForPrompt(['rest', 'mobility']);
+    if (restCatalog) catalogLines.push(restCatalog);
   }
-  const restCatalog = getCatalogForPrompt(['rest', 'mobility']);
-  if (restCatalog) catalogLines.push(restCatalog);
 
   const messages = buildMessages({
     request,
     athleteProfile,
     recentState,
+    trainingCapacity,
     catalog: catalogLines.join('\n'),
     retryViolations: args.retryViolations,
   });
@@ -175,7 +206,7 @@ export async function llmBuildWeeklySchedule(
       function: {
         name: TOOL_NAME,
         description:
-          '从允许的模板列表中为本周 7 天各选 1 个 templateId，并附中文 reason。',
+          '从允许的模板列表中为本周训练日程选择 templateId，并附中文 reason。默认每个 dayIndex 1 个；用户明确要求一天两练时，可为同一 dayIndex 返回 slotIndex=1/2 两条。',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -184,13 +215,27 @@ export async function llmBuildWeeklySchedule(
             days: {
               type: 'array',
               minItems: 7,
-              maxItems: 7,
+              maxItems: args.request.allowDoubleDays === true ? 10 : 7,
               items: {
                 type: 'object',
                 additionalProperties: false,
                 required: ['dayIndex', 'sport', 'templateId', 'reason'],
                 properties: {
                   dayIndex: { type: 'integer', minimum: 1, maximum: 7 },
+                  slotIndex: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 3,
+                    description: '同一天多课时的课次编号；单练可省略或填 1',
+                  },
+                  sessionLabel: {
+                    type: 'string',
+                    description: '例如 上午 / 下午；单练可省略',
+                  },
+                  timeOfDay: {
+                    type: 'string',
+                    enum: ['morning', 'midday', 'afternoon', 'evening'],
+                  },
                   sport: {
                     type: 'string',
                     enum: ['running', 'cycling', 'swimming', 'rest', 'mobility', 'strength'],
@@ -282,6 +327,7 @@ export async function llmBuildWeeklySchedule(
     allowedIds,
     athleteProfile,
     recentState,
+    trainingCapacity,
   });
 
   return {
@@ -305,20 +351,26 @@ interface ValidateArgs {
   allowedIds: Set<string>;
   athleteProfile: AthleteProfile;
   recentState: RecentState;
+  trainingCapacity?: TrainingCapacity;
 }
 
 function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
   const violations: string[] = [];
-  const { parsed, request, allowedIds, athleteProfile, recentState } = args;
+  const { parsed, request, allowedIds, athleteProfile, recentState, trainingCapacity } = args;
 
   if (!Array.isArray(parsed.days)) {
     throw new InvalidLlmScheduleError(['days is not an array']);
   }
-  if (parsed.days.length !== 7) {
+  const allowDoubleDays = request.allowDoubleDays === true;
+  if (allowDoubleDays) {
+    if (parsed.days.length < 7 || parsed.days.length > 10) {
+      violations.push(`days.length=${parsed.days.length}, expected 7..10 when double days are allowed`);
+    }
+  } else if (parsed.days.length !== 7) {
     violations.push(`days.length=${parsed.days.length}, expected 7`);
   }
 
-  const seenDayIndexes = new Set<number>();
+  const seenSlotsByDay = new Map<number, Set<number>>();
   const entries: ScheduleEntry[] = [];
 
   for (const day of parsed.days) {
@@ -331,11 +383,27 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
       violations.push(`invalid dayIndex: ${String(day.dayIndex)}`);
       continue;
     }
-    if (seenDayIndexes.has(day.dayIndex)) {
+    const usedSlots = seenSlotsByDay.get(day.dayIndex) ?? new Set<number>();
+    let slotIndex = typeof day.slotIndex === 'number' && Number.isInteger(day.slotIndex)
+      ? day.slotIndex
+      : 1;
+    if (usedSlots.has(slotIndex) && allowDoubleDays) {
+      slotIndex = firstAvailableSlot(usedSlots);
+    }
+    if (slotIndex < 1 || slotIndex > 3) {
+      violations.push(`day ${day.dayIndex}: invalid slotIndex ${String(day.slotIndex)}`);
+      continue;
+    }
+    if (usedSlots.has(slotIndex)) {
+      violations.push(`duplicate dayIndex ${day.dayIndex} slotIndex ${slotIndex}`);
+      continue;
+    }
+    if (!allowDoubleDays && usedSlots.size > 0) {
       violations.push(`duplicate dayIndex ${day.dayIndex}`);
       continue;
     }
-    seenDayIndexes.add(day.dayIndex);
+    usedSlots.add(slotIndex);
+    seenSlotsByDay.set(day.dayIndex, usedSlots);
 
     if (typeof day.sport !== 'string' || !ALLOWED_SPORTS.has(day.sport)) {
       violations.push(`day ${day.dayIndex}: invalid sport "${String(day.sport)}"`);
@@ -371,24 +439,60 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
       continue;
     }
 
-    entries.push({
+    const entry: ScheduleEntry = {
       dayIndex: day.dayIndex,
       date: addDays(request.weekStartDate, day.dayIndex - 1),
       dayLabel: DAY_LABELS[day.dayIndex - 1] ?? '',
       sport: tpl.fixed.sport,
       templateId: day.templateId,
-      slotIndex: 1,
-      timeOfDay: chooseTimeOfDay(request, day.dayIndex),
+      slotIndex,
+      sessionLabel: typeof day.sessionLabel === 'string' ? day.sessionLabel : undefined,
+      timeOfDay: day.timeOfDay ?? chooseTimeOfDay(request, day.dayIndex),
       reason: typeof day.reason === 'string' ? day.reason : undefined,
-    });
+    };
+    applyDurationCap(entry, request.forceRequestedSchedule ? undefined : trainingCapacity);
+    entries.push(entry);
   }
 
-  if (entries.length !== 7) {
+  if (!allowDoubleDays && entries.length !== 7) {
     violations.push(`only ${entries.length}/7 days valid`);
+  }
+  const coveredDayIndexes = new Set(entries.map((e) => e.dayIndex));
+  if (coveredDayIndexes.size !== 7) {
+    violations.push(`covered dayIndex count ${coveredDayIndexes.size} != 7`);
   }
 
   // Hard-rule: no two consecutive intensity=high.
-  const sortedEntries = entries.slice().sort((a, b) => a.dayIndex - b.dayIndex);
+  const sortedEntries = entries
+    .slice()
+    .sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
+  const requestedTrainingDays = effectiveTrainingDaysPerWeek(request);
+  const protectedTrainingDays = requestedTrainingDayIndexes(request);
+  const activeTrainingCount = new Set(
+    sortedEntries
+      .filter((e) => !isRestLikeSport(e.sport))
+      .map((e) => e.dayIndex),
+  ).size;
+  if (activeTrainingCount !== requestedTrainingDays) {
+    violations.push(
+      `active training days ${activeTrainingCount} != requested daysPerWeek ${requestedTrainingDays}`,
+    );
+  }
+  if (requestedTrainingDays === 7) {
+    const restLike = sortedEntries.filter((e) => isRestLikeSport(e.sport));
+    if (restLike.length > 0) {
+      violations.push(
+        `daysPerWeek=7 but rest/mobility days found: ${restLike.map((e) => e.dayIndex).join(',')}`,
+      );
+    }
+  }
+  for (const protectedDay of protectedTrainingDays) {
+    const dayEntries = sortedEntries.filter((e) => e.dayIndex === protectedDay);
+    if (dayEntries.length === 0 || dayEntries.every((e) => isRestLikeSport(e.sport))) {
+      violations.push(`day ${protectedDay}: user requested training but model scheduled rest/mobility`);
+    }
+  }
+
   const enabledSports = collectEnabledSports(request);
   if (request.daysPerWeek >= enabledSports.length) {
     for (const sport of enabledSports) {
@@ -398,23 +502,25 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
     }
   }
 
-  for (let i = 1; i < sortedEntries.length; i += 1) {
-    const prev = sortedEntries[i - 1];
-    const curr = sortedEntries[i];
-    if (
-      prev.dayIndex + 1 === curr.dayIndex &&
-      getTemplate(prev.templateId)?.fixed.intensity === 'high' &&
-      getTemplate(curr.templateId)?.fixed.intensity === 'high'
-    ) {
-      violations.push(
-        `days ${prev.dayIndex}/${curr.dayIndex}: consecutive high-intensity`,
-      );
+  if (request.forceRequestedSchedule !== true) {
+    for (let i = 1; i < sortedEntries.length; i += 1) {
+      const prev = sortedEntries[i - 1];
+      const curr = sortedEntries[i];
+      if (
+        prev.dayIndex + 1 === curr.dayIndex &&
+        getTemplate(prev.templateId)?.fixed.intensity === 'high' &&
+        getTemplate(curr.templateId)?.fixed.intensity === 'high'
+      ) {
+        violations.push(
+          `days ${prev.dayIndex}/${curr.dayIndex}: consecutive high-intensity`,
+        );
+      }
     }
   }
 
   // Hard-rule: hard-cap.
   const HARD_STIMULI = new Set(['threshold', 'vo2max', 'anaerobic']);
-  const hardCap = computeHardCap(request, athleteProfile, recentState);
+  const hardCap = computeHardCap(request, athleteProfile, recentState, trainingCapacity);
   const hardCount = sortedEntries.filter(
     (e) => getTemplate(e.templateId)?.fixed.intensity === 'high',
   ).length;
@@ -449,6 +555,7 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
   // Hard-rule: no high intensity within 36h of a recent threshold/vo2/anaerobic.
   const hoursAgo = hoursSinceLatest(recentState);
   if (
+    request.forceRequestedSchedule !== true &&
     HARD_STIMULI.has(recentState.latestStimulus) &&
     hoursAgo !== null &&
     hoursAgo < 36
@@ -486,6 +593,7 @@ interface BuildMessagesArgs {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
   recentState: RecentState;
+  trainingCapacity?: TrainingCapacity;
   catalog: string;
   retryViolations?: string[];
 }
@@ -498,25 +606,62 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   systemParts.push(
     '硬性规则：',
   );
-  systemParts.push('- 必须输出且仅输出 7 天 (dayIndex 1..7)；');
+  const requestedTrainingDays = effectiveTrainingDaysPerWeek(args.request);
+  const requestedRestDays = 7 - requestedTrainingDays;
+  const requestedDoubleDay = requestedDoubleDayIndex(args.request);
+  const protectedTrainingDays = requestedTrainingDayIndexes(args.request);
+  if (args.request.allowDoubleDays === true && requestedDoubleDay !== null) {
+    systemParts.push(
+      '- 必须覆盖 7 个 dayIndex (1..7)；用户明确要求同日两练时，days 数组可以超过 7 条，同一 dayIndex 用 slotIndex=1/2 表示上午/下午两课。',
+    );
+  } else {
+    systemParts.push('- 必须输出且仅输出 7 条，覆盖 dayIndex 1..7；');
+  }
+  systemParts.push(
+    `- 用户选择每周 ${requestedTrainingDays} 天训练：必须正好 ${requestedTrainingDays} 天使用 running/cycling/swimming 模板，剩余 ${requestedRestDays} 天才可使用 rest/mobility 模板；`,
+  );
+  if (protectedTrainingDays.size > 0) {
+    systemParts.push(
+      `- 用户明确指定 ${formatDayIndexes(protectedTrainingDays)} 为训练日：这些 dayIndex 禁止使用 rest/mobility 模板，也不能被默认休息日、近期疲劳或容量保护改成休息。`,
+    );
+  }
+  if (requestedTrainingDays === 7) {
+    systemParts.push(
+      '- 用户选择每周 7 天训练：禁止使用 rest 或 mobility 模板，7 天都必须是实际运动训练；恢复只能用各运动项目的低强度恢复模板。',
+    );
+  }
   systemParts.push('- 每个非休息日必须给出一个允许列表中的 templateId；');
-  systemParts.push('- 任意相邻两天不得同时为 intensity=high 的训练；');
+  if (args.request.forceRequestedSchedule !== true) {
+    systemParts.push('- 任意相邻两天不得同时为 intensity=high 的训练；');
+  } else {
+    systemParts.push(
+      '- 严格模式已开启：不要因为连续高强度、近期训练刺激或容量评估自动减少用户要求的训练天数/强度；这些问题只在 notes 中写成风险提示。',
+    );
+  }
   systemParts.push(
     `- 本周高强度课不得超过 ${computeHardCap(
       args.request,
       args.athleteProfile,
       args.recentState,
+      args.trainingCapacity,
     )} 次；`,
   );
+  if (args.request.forceRequestedSchedule !== true) {
+    systemParts.push(
+      '- 若最近 36 小时内有 threshold/vo2max/anaerobic 训练，第 1 天不得安排高强度课；',
+    );
+  }
   systemParts.push(
-    '- 若最近 36 小时内有 threshold/vo2max/anaerobic 训练，第 1 天不得安排高强度课；',
+    `- 本周总训练时长不得超过 ${args.request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES} 分钟；`,
   );
   systemParts.push(
     '- sport 字段必须与所选 templateId 对应模板的 sport 一致；',
   );
-  systemParts.push(
-    '- 休息日请使用 rest 类模板（rest.full.v1 / rest.mobility.v1）。',
-  );
+  if (requestedTrainingDays < 7) {
+    systemParts.push(
+      '- 休息日请使用 rest 类模板（rest.full.v1 / rest.mobility.v1）。',
+    );
+  }
   systemParts.push(
     '- 同一运动一周内若安排多次 high 强度课，应优先覆盖不同训练目的，例如 threshold / interval / VO2max / race_pace，不要无理由重复同一个 high 模板；',
   );
@@ -531,8 +676,25 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   );
   if (args.request.dailyPreferredMinutes && args.request.dailyPreferredMinutes > 0) {
     systemParts.push(
-      `- 用户偏好单次训练约 ${args.request.dailyPreferredMinutes} 分钟；选择模板时优先匹配该时长，不要安排明显超出可用时间的课程。`,
+      `- 用户填写的 ${args.request.dailyPreferredMinutes} 分钟是单日可用上限，不是每节课必须凑满的目标；不要为了凑时长拉长阈值/VO2/间歇课。`,
     );
+  }
+  if (args.trainingCapacity) {
+    systemParts.push(
+      `- 训练容量评估：level=${args.trainingCapacity.overall.level}, readiness=${args.trainingCapacity.overall.readiness}, confidence=${args.trainingCapacity.overall.readinessConfidence}，高强度上限 ${args.trainingCapacity.guardrails.maxHardSessionsPerWeek} 次，高强度分钟占比上限 ${Math.round(args.trainingCapacity.guardrails.maxHighMinutesShare * 100)}%。`,
+    );
+    systemParts.push(
+      '- 单周专业规则：低强度训练应占主体；不要用多个长阈值/VO2/间歇课去填满用户可用时长；长跑/长骑只能作为本项目周训练量的一部分，不能吞掉大多数训练分钟。',
+    );
+    if (args.request.forceRequestedSchedule === true) {
+      systemParts.push(
+        '- 用户已明确要求按原请求生成：不要因为训练容量保护自动删除用户要求的训练频率/高强度意图，但必须在 notes 中说明风险与不推荐原因。',
+      );
+    } else if (!args.trainingCapacity.guardrails.allowHighIntensity) {
+      systemParts.push(
+        '- 容量/恢复保护：本周禁止安排 intensity=high 的模板，只能安排低强度、技术或恢复类训练。',
+      );
+    }
   }
   if (args.request.preferredTrainingWindows && args.request.preferredTrainingWindows.length > 0) {
     systemParts.push(
@@ -569,7 +731,9 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     preferredRestDay: args.request.preferredRestDay ?? null,
     availableTime: args.request.availableTime ?? null,
     preferredTrainingWindows: args.request.preferredTrainingWindows ?? [],
+    preferredKeyWorkoutDays: args.request.preferredKeyWorkoutDays ?? [],
     dailyPreferredMinutes: args.request.dailyPreferredMinutes ?? null,
+    weeklyMaxMinutes: args.request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES,
     injuries: args.request.injuries ?? null,
     notes: args.request.notes ?? null,
     sports: args.request.sports,
@@ -620,6 +784,13 @@ function collectEnabledSports(request: ScheduleRequest): ActiveSport[] {
   return out;
 }
 
+function firstAvailableSlot(usedSlots: Set<number>): number {
+  for (const slot of [1, 2, 3]) {
+    if (!usedSlots.has(slot)) return slot;
+  }
+  return 4;
+}
+
 function chooseTimeOfDay(
   request: ScheduleRequest,
   dayIndex: number,
@@ -639,20 +810,26 @@ function parseTrainingWindow(raw: string): ScheduleEntry['timeOfDay'] | undefine
   return undefined;
 }
 
-function filterAthleteProfile(p: AthleteProfile) {
+function filterAthleteProfile(p: AthleteProfile, forceRequestedSchedule: boolean) {
   return {
     injuries: p.injuries,
     experienceLevel: p.experienceLevel,
-    running: { confidence: p.running.confidence },
+    running: { confidence: forceRequestedSchedule ? 'high' as const : p.running.confidence },
     cycling: {
-      confidence: p.cycling.confidence,
+      confidence: forceRequestedSchedule ? 'high' as const : p.cycling.confidence,
       ftpWatts: p.cycling.ftpWatts ?? null,
     },
-    swimming: { confidence: p.swimming.confidence },
+    swimming: { confidence: forceRequestedSchedule ? 'high' as const : p.swimming.confidence },
   };
 }
 
-function filterRecentState(state: RecentState) {
+function filterRecentState(state: RecentState, forceRequestedSchedule: boolean) {
+  if (forceRequestedSchedule) {
+    return {
+      latestStimulus: null,
+      fatigue: 'normal' as const,
+    };
+  }
   return {
     latestStimulus: state.latestStimulus === 'unknown' ? null : state.latestStimulus,
     fatigue: state.fatigue === 'fresh' ? 'normal' as const : state.fatigue,
@@ -663,15 +840,37 @@ function computeHardCap(
   request: ScheduleRequest,
   athleteProfile: AthleteProfile,
   recentState: RecentState,
+  trainingCapacity?: TrainingCapacity,
 ): number {
+  const explicitHardCap =
+    request.maxHardSessionsPerWeek !== null &&
+    request.maxHardSessionsPerWeek !== undefined;
   const base = request.maxHardSessionsPerWeek ?? 2;
+  if (request.forceRequestedSchedule === true || explicitHardCap) {
+    return Math.min(7, Math.max(0, base));
+  }
+  const capacityCap = trainingCapacity?.guardrails.maxHardSessionsPerWeek ?? Number.POSITIVE_INFINITY;
   if (
     athleteProfile.experienceLevel === 'advanced' &&
     (recentState.fatigue === 'fresh' || recentState.fatigue === 'normal')
   ) {
-    return Math.min(base, 3);
+    return Math.min(base, 3, capacityCap);
   }
-  return Math.min(base, 2);
+  return Math.min(base, 2, capacityCap);
+}
+
+function effectiveTrainingDaysPerWeek(request: ScheduleRequest): number {
+  return Math.min(
+    7,
+    Math.max(
+      normalizeDaysPerWeek(request.daysPerWeek),
+      requestedTrainingDayIndexes(request).size,
+    ),
+  );
+}
+
+function isRestLikeSport(sport: string): boolean {
+  return sport === 'rest' || sport === 'mobility';
 }
 
 function hoursSinceLatest(state: RecentState): number | null {

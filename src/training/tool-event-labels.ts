@@ -16,6 +16,7 @@ export const TOOL_DISPLAY: Record<string, string> = {
 
   // Real chat tools.
   regenerate_day: '重新生成训练课',
+  add_second_workout: '新增第二堂训练课',
   update_workout_field: '更新训练状态',
 };
 
@@ -91,6 +92,11 @@ export function summarizeSchedule(
 export function summarizeRegenerateDay(dayIndex: number, sport: string): string {
   const zh = SPORT_ZH[sport] ?? sport;
   return `已为第 ${dayIndex} 天生成${zh}训练`;
+}
+
+export function summarizeAddSecondWorkout(dayIndex: number, sport: string): string {
+  const zh = SPORT_ZH[sport] ?? sport;
+  return `已为第 ${dayIndex} 天新增${zh}第二练`;
 }
 
 export function summarizeUpdateStatus(value: string): string {

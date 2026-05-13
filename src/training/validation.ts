@@ -5,7 +5,8 @@
 // uses violations to trigger a single retry-with-downgrade pass.
 
 import type { ParameterizedWorkout } from './parameterizer.js';
-import type { ScheduleEntry } from './scheduler.js';
+import { MAX_WEEKLY_TRAINING_MINUTES, type ScheduleEntry } from './scheduler.js';
+import type { CapacityLevel, CapacitySport, TrainingCapacity } from './training-capacity.js';
 
 export interface PlanForValidation {
   schedule: ScheduleEntry[];
@@ -16,6 +17,9 @@ export interface PlanForValidation {
     latestStimulus: string;
     hoursSinceLatest: number;
     fatigue: string;
+    forceRequestedSchedule?: boolean;
+    weeklyMaxMinutes?: number | null;
+    trainingCapacity?: TrainingCapacity;
   };
 }
 
@@ -27,6 +31,33 @@ export interface Violation {
 
 const NA = '不适用';
 const HARD_STIMULI: ReadonlySet<string> = new Set(['threshold', 'vo2max', 'anaerobic']);
+const HIGH_WORKOUT_TYPES = new Set([
+  'threshold',
+  'css_threshold',
+  'vo2max',
+  'interval',
+  'anaerobic',
+  'sprint',
+  'hill',
+  'race_pace',
+  'double_threshold',
+  'over_under',
+]);
+const LOW_WORKOUT_TYPES = new Set([
+  'recovery',
+  'recovery_spin',
+  'aerobic',
+  'lsd',
+  'long_ride',
+  'endurance',
+  'technique',
+  'cadence_drill',
+  'kick',
+  'full_rest',
+  'mobility',
+  'walk',
+]);
+const LONG_WORKOUT_TYPES = new Set(['lsd', 'long_ride']);
 
 export function validatePlan(plan: PlanForValidation): Violation[] {
   const violations: Violation[] = [];
@@ -132,6 +163,32 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
           break;
         }
       }
+
+      if (
+        typeof s.durationCapMinutes === 'number' &&
+        Number.isFinite(s.durationCapMinutes) &&
+        s.durationCapMinutes > 0 &&
+        w.durationMinutes > s.durationCapMinutes + 1
+      ) {
+        violations.push({
+          rule: 'single_session_duration_within_capacity',
+          dayIndex,
+          details: `第 ${dayIndex} 天时长 ${w.durationMinutes} 分钟 > 容量上限 ${s.durationCapMinutes} 分钟（${s.durationCapReason ?? '容量保护'}）。`,
+        });
+      }
+
+      if (
+        plan.context.trainingCapacity &&
+        isCapacitySport(w.sport) &&
+        plan.context.trainingCapacity.sports[w.sport].confidence === 'low' &&
+        isHighWorkoutType(w.workoutType)
+      ) {
+        violations.push({
+          rule: 'anchor_confidence_allows_precision',
+          dayIndex,
+          details: `第 ${dayIndex} 天是 ${w.workoutType} 高强度课，但 ${sportZh(w.sport)} 的近期可靠数据不足，不应安排精准阈值/VO2/间歇。`,
+        });
+      }
     }
   }
 
@@ -145,15 +202,17 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
     }
   }
   const hardDays = Array.from(hardDayIndexes).sort((a, b) => a - b);
-  for (let i = 1; i < hardDays.length; i += 1) {
-    if (
-      hardDays[i] === hardDays[i - 1] + 1
-    ) {
-      violations.push({
-        rule: 'no_consecutive_hard_days',
-        dayIndex: hardDays[i],
-        details: `第 ${hardDays[i - 1]} 天和第 ${hardDays[i]} 天连续为高强度课。`,
-      });
+  if (plan.context.forceRequestedSchedule !== true) {
+    for (let i = 1; i < hardDays.length; i += 1) {
+      if (
+        hardDays[i] === hardDays[i - 1] + 1
+      ) {
+        violations.push({
+          rule: 'no_consecutive_hard_days',
+          dayIndex: hardDays[i],
+          details: `第 ${hardDays[i - 1]} 天和第 ${hardDays[i]} 天连续为高强度课。`,
+        });
+      }
     }
   }
 
@@ -169,8 +228,25 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
     });
   }
 
+  if (
+    plan.context.trainingCapacity &&
+    !plan.context.trainingCapacity.guardrails.allowHighIntensity &&
+    hardCount > 0
+  ) {
+    violations.push({
+      rule: 'readiness_allows_intensity',
+      details: `训练容量/恢复评估为 ${plan.context.trainingCapacity.overall.readiness}，本周不允许高强度课，但计划包含 ${hardCount} 天高强度。`,
+    });
+  }
+
+  if (plan.context.trainingCapacity) {
+    violations.push(...validateIntensityDistribution(plan));
+    violations.push(...validateLongSessionShare(plan));
+  }
+
   // recent_high_stim_cooldown
   if (
+    plan.context.forceRequestedSchedule !== true &&
     HARD_STIMULI.has(plan.context.latestStimulus) &&
     plan.context.hoursSinceLatest < 24 &&
     plan.workouts.length >= 1 &&
@@ -183,5 +259,182 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
     });
   }
 
+  const weeklyMaxMinutes = plan.context.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES;
+  const activeMinutes = sumActiveTrainingMinutes(plan);
+  if (activeMinutes > weeklyMaxMinutes + 1) {
+    const longest = findLongestActiveWorkout(plan);
+    violations.push({
+      rule: 'weekly_duration_within_user_limit',
+      dayIndex: longest?.dayIndex,
+      details: `本周训练总时长 ${activeMinutes} 分钟 > 用户周上限 ${weeklyMaxMinutes} 分钟。`,
+    });
+  }
+
   return violations;
+}
+
+function sumActiveTrainingMinutes(plan: PlanForValidation): number {
+  let total = 0;
+  for (let i = 0; i < Math.min(plan.workouts.length, plan.schedule.length); i += 1) {
+    const s = plan.schedule[i];
+    if (s.sport === 'rest' || s.sport === 'mobility') continue;
+    const minutes = Number(plan.workouts[i].durationMinutes);
+    if (Number.isFinite(minutes) && minutes > 0) total += minutes;
+  }
+  return total;
+}
+
+function findLongestActiveWorkout(
+  plan: PlanForValidation,
+): { dayIndex: number; minutes: number } | null {
+  let longest: { dayIndex: number; minutes: number } | null = null;
+  for (let i = 0; i < Math.min(plan.workouts.length, plan.schedule.length); i += 1) {
+    const s = plan.schedule[i];
+    if (s.sport === 'rest' || s.sport === 'mobility') continue;
+    const minutes = Number(plan.workouts[i].durationMinutes);
+    if (!Number.isFinite(minutes) || minutes <= 0) continue;
+    if (!longest || minutes > longest.minutes) {
+      longest = { dayIndex: s.dayIndex, minutes };
+    }
+  }
+  return longest;
+}
+
+function validateIntensityDistribution(plan: PlanForValidation): Violation[] {
+  const capacity = plan.context.trainingCapacity;
+  if (!capacity) return [];
+
+  let totalMinutes = 0;
+  let lowMinutes = 0;
+  let highMinutes = 0;
+  let longestHigh: { dayIndex: number; minutes: number } | null = null;
+  let longestModerate: { dayIndex: number; minutes: number } | null = null;
+
+  for (let i = 0; i < Math.min(plan.workouts.length, plan.schedule.length); i += 1) {
+    const w = plan.workouts[i];
+    const s = plan.schedule[i];
+    if (s.sport === 'rest' || s.sport === 'mobility') continue;
+    const minutes = Number(w.durationMinutes);
+    if (!Number.isFinite(minutes) || minutes <= 0) continue;
+    totalMinutes += minutes;
+
+    const zone = intensityZone(w.workoutType, w.intensity);
+    if (zone === 'low') {
+      lowMinutes += minutes;
+    } else if (zone === 'high') {
+      highMinutes += minutes;
+      if (!longestHigh || minutes > longestHigh.minutes) {
+        longestHigh = { dayIndex: s.dayIndex, minutes };
+      }
+    } else if (!longestModerate || minutes > longestModerate.minutes) {
+      longestModerate = { dayIndex: s.dayIndex, minutes };
+    }
+  }
+
+  if (totalMinutes < 60) return [];
+
+  const violations: Violation[] = [];
+  const highShare = highMinutes / totalMinutes;
+  const highLimit = capacity.guardrails.maxHighMinutesShare;
+  if (highShare > highLimit + 0.01 && longestHigh) {
+    violations.push({
+      rule: 'intensity_distribution_within_week',
+      dayIndex: longestHigh.dayIndex,
+      details: `本周高强度分钟占比 ${formatPct(highShare)} > 容量上限 ${formatPct(highLimit)}；应先降级最长高强度课。`,
+    });
+  }
+
+  const lowShare = lowMinutes / totalMinutes;
+  const lowFloor = capacity.guardrails.minLowMinutesShare;
+  if (totalMinutes >= 120 && lowShare < lowFloor - 0.1 && longestModerate) {
+    violations.push({
+      rule: 'low_intensity_floor_within_week',
+      dayIndex: longestModerate.dayIndex,
+      details: `本周低强度分钟占比 ${formatPct(lowShare)}，明显低于目标 ${formatPct(lowFloor)}；应把一节中强度课改为有氧/技术课。`,
+    });
+  }
+
+  return violations;
+}
+
+function validateLongSessionShare(plan: PlanForValidation): Violation[] {
+  const capacity = plan.context.trainingCapacity;
+  if (!capacity) return [];
+
+  const sportTotals = new Map<CapacitySport, { minutes: number; sessions: number }>();
+  for (let i = 0; i < Math.min(plan.workouts.length, plan.schedule.length); i += 1) {
+    const w = plan.workouts[i];
+    if (!isCapacitySport(w.sport)) continue;
+    const minutes = Number(w.durationMinutes);
+    if (!Number.isFinite(minutes) || minutes <= 0) continue;
+    const current = sportTotals.get(w.sport) ?? { minutes: 0, sessions: 0 };
+    current.minutes += minutes;
+    current.sessions += 1;
+    sportTotals.set(w.sport, current);
+  }
+
+  const violations: Violation[] = [];
+  for (let i = 0; i < Math.min(plan.workouts.length, plan.schedule.length); i += 1) {
+    const w = plan.workouts[i];
+    const s = plan.schedule[i];
+    if (!isCapacitySport(w.sport)) continue;
+    if (!LONG_WORKOUT_TYPES.has(w.workoutType)) continue;
+    const total = sportTotals.get(w.sport);
+    if (!total || total.sessions < 3 || total.minutes <= 0) continue;
+    const shareCap = longSessionShareCap(w.sport, capacity.overall.level);
+    const share = w.durationMinutes / total.minutes;
+    if (share > shareCap + 0.02) {
+      violations.push({
+        rule: 'long_session_share_within_capacity',
+        dayIndex: s.dayIndex,
+        details: `第 ${s.dayIndex} 天长课占 ${sportZh(w.sport)} 周训练分钟的 ${formatPct(share)}，超过 ${formatPct(shareCap)} 上限；应缩短长课或增加低强度基础课。`,
+      });
+    }
+  }
+  return violations;
+}
+
+function intensityZone(
+  workoutType: string,
+  fallback: ParameterizedWorkout['intensity'],
+): 'low' | 'moderate' | 'high' {
+  if (HIGH_WORKOUT_TYPES.has(workoutType)) return 'high';
+  if (LOW_WORKOUT_TYPES.has(workoutType)) return 'low';
+  if (fallback === 'high') return 'high';
+  if (fallback === 'low') return 'low';
+  return 'moderate';
+}
+
+function isHighWorkoutType(workoutType: string): boolean {
+  return HIGH_WORKOUT_TYPES.has(workoutType);
+}
+
+function longSessionShareCap(sport: CapacitySport, level: CapacityLevel): number {
+  if (sport === 'running') {
+    if (level === 'novice') return 0.3;
+    if (level === 'developing') return 0.35;
+    if (level === 'trained') return 0.4;
+    return 0.45;
+  }
+  if (sport === 'cycling') {
+    if (level === 'novice') return 0.35;
+    if (level === 'developing') return 0.45;
+    if (level === 'trained') return 0.5;
+    return 0.55;
+  }
+  return 0.4;
+}
+
+function isCapacitySport(sport: string): sport is CapacitySport {
+  return sport === 'running' || sport === 'cycling' || sport === 'swimming';
+}
+
+function sportZh(sport: CapacitySport): string {
+  if (sport === 'running') return '跑步';
+  if (sport === 'cycling') return '骑行';
+  return '游泳';
+}
+
+function formatPct(value: number): string {
+  return `${Math.round(value * 100)}%`;
 }

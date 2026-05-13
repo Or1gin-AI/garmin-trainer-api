@@ -86,6 +86,24 @@ export function parameterizeWorkout(args: ParameterizeArgs): ParameterizedWorkou
     if (value.kind === 'unresolved') continue;
     replaced[key] = formatForReplacedRecord(value);
   }
+  // Some derived variables reference targets declared later in the template
+  // object, e.g. distance / targetPace duration formulas. Retry unresolved
+  // derived values once after all direct profile/default values are known.
+  for (const [key, variable] of Object.entries(template.variables)) {
+    if (variable.source.kind !== 'derived') continue;
+    if (resolved.get(key)?.kind !== 'unresolved') continue;
+    const value = resolveVariable(key, variable, {
+      template,
+      athleteProfile,
+      recentState,
+      tuning,
+      progression,
+      resolved,
+    });
+    resolved.set(key, value);
+    if (value.kind === 'unresolved') continue;
+    replaced[key] = formatForReplacedRecord(value);
+  }
 
   // Compute durationMinutes by summing minute-quantified phases (and minute-
   // valued variables they reference) using the resolved values.
@@ -94,6 +112,7 @@ export function parameterizeWorkout(args: ParameterizeArgs): ParameterizedWorkou
     template,
     computedDurationMinutes,
     request.dailyPreferredMinutes ?? null,
+    scheduleEntry.durationCapMinutes ?? null,
   );
 
   // Build target strings.
@@ -224,7 +243,7 @@ function resolveVariable(
       return formatted;
     }
     case 'derived': {
-      return resolveDerived(key, src.rule, ctx);
+      return resolveDerived(key, src.rule, src.from, src.unit, ctx);
     }
     case 'llm_choice': {
       const min = src.min ?? src.default ?? 0;
@@ -290,7 +309,13 @@ function coerceProfileValue(
   return { kind: 'unresolved' };
 }
 
-function resolveDerived(key: string, rule: string, ctx: ResolveCtx): ResolvedValue {
+function resolveDerived(
+  key: string,
+  rule: string,
+  from: string,
+  targetUnit: string | undefined,
+  ctx: ResolveCtx,
+): ResolvedValue {
   // FTP-derived percentages.
   const ftp = ctx.athleteProfile.cycling?.ftpWatts ?? null;
   const pctRange = parsePercentRange(rule);
@@ -302,15 +327,8 @@ function resolveDerived(key: string, rule: string, ctx: ResolveCtx): ResolvedVal
       unit: 'W',
     };
   }
-  const pctSingle = parsePercentSingle(rule);
-  if (pctSingle && ftp && ftp > 0) {
-    return {
-      kind: 'number',
-      value: Math.round((ftp * pctSingle.value) / 100),
-      unit: 'W',
-    };
-  }
-  // < 55% FTP style upper-bound.
+  // <55% / >150% must be checked before single-percent parsing, otherwise
+  // caps/floors collapse into exact targets.
   const pctUpper = parsePercentUpper(rule);
   if (pctUpper && ftp && ftp > 0) {
     return {
@@ -319,33 +337,51 @@ function resolveDerived(key: string, rule: string, ctx: ResolveCtx): ResolvedVal
       unit: 'W_upper',
     };
   }
+  const pctLower = parsePercentLower(rule);
+  if (pctLower && ftp && ftp > 0) {
+    return {
+      kind: 'number',
+      value: Math.round((ftp * pctLower.value) / 100),
+      unit: 'W_lower',
+    };
+  }
+  const pctSingle = parsePercentSingle(rule);
+  if (pctSingle && ftp && ftp > 0) {
+    return {
+      kind: 'number',
+      value: Math.round((ftp * pctSingle.value) / 100),
+      unit: 'W',
+    };
+  }
 
   // Pace adjustments referencing easyPace, longPace, etc.
-  const paceAdj = parsePaceOffset(rule);
+  const paceAdj = parsePaceOffset(rule, from);
   if (paceAdj) {
     const basePath = paceAdj.basePath;
     const baseRaw = lookupPath(ctx.athleteProfile, basePath);
     if (typeof baseRaw === 'number' && Number.isFinite(baseRaw)) {
       if (paceAdj.range) {
+        const low = baseRaw + paceAdj.range[0];
+        const high = baseRaw + paceAdj.range[1];
         return {
           kind: 'range',
-          low: baseRaw + paceAdj.range[0],
-          high: baseRaw + paceAdj.range[1],
-          unit: 's/km',
+          low: Math.min(low, high),
+          high: Math.max(low, high),
+          unit: paceAdj.unit,
         };
       }
       return {
         kind: 'number',
         value: baseRaw + paceAdj.singleOffset,
-        unit: 's/km_upper',
+        unit: `${paceAdj.unit}_upper`,
       };
     }
   }
 
-  // mainDurationTotal style: composed from already-resolved variables.
-  const composed = composeMinutesFromOtherVars(rule, ctx);
-  if (composed !== null) {
-    return { kind: 'number', value: composed, unit: 'minutes' };
+  // mainDurationTotal / mainTotalMeters style: composed from already-resolved variables.
+  const composed = composeNumberFromOtherVars(rule, ctx, targetUnit);
+  if (composed) {
+    return composed;
   }
 
   return { kind: 'unresolved' };
@@ -376,17 +412,26 @@ function parsePercentUpper(rule: string): { value: number } | null {
   return { value: Number(match[1]) };
 }
 
+function parsePercentLower(rule: string): { value: number } | null {
+  const match = rule.match(/>\s*(\d+)\s*%/);
+  if (!match) return null;
+  return { value: Number(match[1]) };
+}
+
 interface PaceOffsetParse {
   basePath: string;
+  unit: 's/km' | 's/100m';
   range: [number, number] | null;
   singleOffset: number;
 }
 
-function parsePaceOffset(rule: string): PaceOffsetParse | null {
+function parsePaceOffset(rule: string, from: string): PaceOffsetParse | null {
   // Examples:
   //   '+30..+50 s/km'          -> base inferred from `from` (caller passes
   //                              athleteProfile.running.<x>SecPerKm typically)
   //   'easyPace + 10..30 s/km' -> base = athleteProfile.running.easyPaceSecPerKm
+  //   'easyPace - 10..25 s/km' -> faster-than-easy progression finish
+  //   'cssPace 到 cssPace + 5 s/100m' -> CSS threshold range
   //   '+20 s/km (上限，可选)'   -> singleOffset = 20
   //   '+5..15 s/100m (上限)'   -> swimming offset
   const baseMap: Record<string, string> = {
@@ -394,10 +439,16 @@ function parsePaceOffset(rule: string): PaceOffsetParse | null {
     longPace: 'athleteProfile.running.longPaceSecPerKm',
     tempoPace: 'athleteProfile.running.tempoPaceSecPerKm',
     thresholdPace: 'athleteProfile.running.thresholdPaceSecPerKm',
+    intervalPace: 'athleteProfile.running.intervalPaceSecPerKm',
+    vo2Pace: 'athleteProfile.running.vo2PaceSecPerKm',
     racePace: 'athleteProfile.running.racePaceSecPerKm',
+    aerobicPace: 'athleteProfile.swimming.aerobicPaceSecPer100m',
+    endurancePace: 'athleteProfile.swimming.endurancePaceSecPer100m',
     cssPace: 'athleteProfile.swimming.cssPaceSecPer100m',
+    sprintPace: 'athleteProfile.swimming.sprintPaceSecPer100m',
   };
 
+  const unit = rule.includes('s/100m') || from.includes('SecPer100m') ? 's/100m' : 's/km';
   let basePath: string | null = null;
   for (const [key, path] of Object.entries(baseMap)) {
     if (rule.includes(key)) {
@@ -405,62 +456,202 @@ function parsePaceOffset(rule: string): PaceOffsetParse | null {
       break;
     }
   }
-  // If no explicit base name appears, only handle `+N s/km` upper-bound style.
+  if (!basePath && from.startsWith('athleteProfile.')) {
+    basePath = from;
+  }
+  // If no explicit base name appears, only handle offset style with an
+  // inferred easy running / CSS swimming base.
   if (!basePath) {
-    const upper = rule.match(/\+\s*(\d+)\s*s\/km/);
-    if (upper) {
+    const offset = rule.match(/([+-])\s*(\d+)\s*s\/km/);
+    if (offset) {
       return {
         basePath: 'athleteProfile.running.easyPaceSecPerKm',
+        unit: 's/km',
         range: null,
-        singleOffset: Number(upper[1]),
+        singleOffset: signedNumber(offset[1], offset[2]),
       };
     }
-    const upper100 = rule.match(/\+\s*(\d+)\s*s\/100m/);
-    if (upper100) {
+    const offset100 = rule.match(/([+-])\s*(\d+)\s*s\/100m/);
+    if (offset100) {
       return {
         basePath: 'athleteProfile.swimming.cssPaceSecPer100m',
+        unit: 's/100m',
         range: null,
-        singleOffset: Number(upper100[1]),
+        singleOffset: signedNumber(offset100[1], offset100[2]),
       };
     }
     return null;
   }
 
-  const rangeMatch = rule.match(/(\d+)\s*\.\.+\s*(\d+)\s*s\/(km|100m)/);
-  if (rangeMatch) {
+  const toRangeMatch = rule.match(
+    /(\w+)\s*到\s*(\w+)\s*([+-])\s*(\d+)\s*s\/(km|100m)/,
+  );
+  const toRangeBasePath = toRangeMatch ? baseMap[toRangeMatch[1]] : null;
+  const toRangeEndPath = toRangeMatch ? baseMap[toRangeMatch[2]] : null;
+  if (toRangeMatch && toRangeBasePath && toRangeBasePath === toRangeEndPath) {
     return {
-      basePath,
-      range: [Number(rangeMatch[1]), Number(rangeMatch[2])],
+      basePath: toRangeBasePath,
+      unit: toRangeMatch[5] === '100m' ? 's/100m' : 's/km',
+      range: [0, signedNumber(toRangeMatch[3], toRangeMatch[4])],
       singleOffset: 0,
     };
   }
-  const upper = rule.match(/\+\s*(\d+)\s*s\/(km|100m)/);
+
+  const rangeMatch = rule.match(
+    /([+-])?\s*(\d+)\s*\.\.+\s*([+-])?\s*(\d+)\s*s\/(km|100m)/,
+  );
+  if (rangeMatch) {
+    const firstSign = rangeMatch[1] ?? '+';
+    const secondSign = rangeMatch[3] ?? firstSign;
+    return {
+      basePath,
+      unit: rangeMatch[5] === '100m' ? 's/100m' : unit,
+      range: [signedNumber(firstSign, rangeMatch[2]), signedNumber(secondSign, rangeMatch[4])],
+      singleOffset: 0,
+    };
+  }
+  const upper = rule.match(/([+-])\s*(\d+)\s*s\/(km|100m)/);
   if (upper) {
-    return { basePath, range: null, singleOffset: Number(upper[1]) };
+    return {
+      basePath,
+      unit: upper[3] === '100m' ? 's/100m' : unit,
+      range: null,
+      singleOffset: signedNumber(upper[1], upper[2]),
+    };
   }
   return null;
 }
 
-function composeMinutesFromOtherVars(rule: string, ctx: ResolveCtx): number | null {
-  // Only handle the canonical "n * a + (n - 1) * b" interval-block formula, where
-  // 'n' is repeats, 'a' is rep duration, 'b' is recovery duration. We map to
-  // already-resolved variables matching naming patterns.
-  // Example: "thresholdRepeats * thresholdDuration + (thresholdRepeats - 1) * recoveryDuration"
-  const match = rule.match(
+function signedNumber(sign: string, value: string): number {
+  const n = Number(value);
+  return sign === '-' ? -n : n;
+}
+
+function composeNumberFromOtherVars(
+  rule: string,
+  ctx: ResolveCtx,
+  targetUnit: string | undefined,
+): ResolvedValue | null {
+  // "n * work + (n - 1) * recovery" interval-block formula.
+  const intervalMinutes = rule.match(
     /(\w+)\s*\*\s*(\w+)\s*\+\s*\(\s*\1\s*-\s*1\s*\)\s*\*\s*(\w+)/,
   );
-  if (!match) return null;
-  const reps = readNumberFromResolved(ctx.resolved.get(match[1]));
-  const dur = readNumberFromResolved(ctx.resolved.get(match[2]));
-  const rec = readNumberFromResolved(ctx.resolved.get(match[3]));
-  if (reps === null || dur === null || rec === null) return null;
-  return roundSmart(reps * dur + (reps - 1) * rec);
+  if (intervalMinutes) {
+    const reps = readNumberFromResolved(ctx.resolved.get(intervalMinutes[1]));
+    const dur = readMinutesFromResolved(ctx.resolved.get(intervalMinutes[2]));
+    const rec = readMinutesFromResolved(ctx.resolved.get(intervalMinutes[3]));
+    if (reps !== null && dur !== null && rec !== null) {
+      return { kind: 'number', value: roundSmart(reps * dur + (reps - 1) * rec), unit: 'minutes' };
+    }
+  }
+
+  // "n * distance / pace + (n - 1) * recovery" race/interval formula.
+  const distancePace = rule.match(
+    /(\w+)\s*\*\s*(\w+)\s*\/\s*(\w+)\s*\+\s*\(\s*(\w+)\s*-\s*1\s*\)\s*\*\s*(\w+)/,
+  );
+  if (distancePace && (distancePace[1] === distancePace[4] || distancePace[4] === 'n')) {
+    const reps = readNumberFromResolved(ctx.resolved.get(distancePace[1]));
+    const distance = ctx.resolved.get(distancePace[2]);
+    const pace = readPaceSeconds(ctx.resolved.get(distancePace[3]));
+    const rec = readMinutesFromResolved(ctx.resolved.get(distancePace[5]));
+    const workMinutes = distance && pace ? durationFromDistanceAndPace(distance, pace) : null;
+    if (reps !== null && workMinutes !== null && rec !== null) {
+      return { kind: 'number', value: roundSmart(reps * workMinutes + (reps - 1) * rec), unit: 'minutes' };
+    }
+  }
+
+  // "n * (duration + recovery) seconds" for hill/stride blocks.
+  const parenSeconds = rule.match(
+    /(\w+)\s*\*\s*\(\s*(\w+)\s*\+\s*(\w+)\s*\)\s*seconds/,
+  );
+  if (parenSeconds) {
+    const reps = readNumberFromResolved(ctx.resolved.get(parenSeconds[1]));
+    const dur = readNumberFromResolved(ctx.resolved.get(parenSeconds[2]));
+    const rec = readNumberFromResolved(ctx.resolved.get(parenSeconds[3]));
+    if (reps !== null && dur !== null && rec !== null) {
+      return { kind: 'number', value: roundSmart(reps * (dur + rec)), unit: 'seconds' };
+    }
+  }
+
+  // "n * (duration + recovery) - recovery" for repeated blocks in minutes.
+  const parenMinus = rule.match(
+    /(\w+)\s*\*\s*\(\s*(\w+)\s*\+\s*(\w+)\s*\)\s*-\s*(\w+)/,
+  );
+  if (parenMinus && parenMinus[3] === parenMinus[4]) {
+    const reps = readNumberFromResolved(ctx.resolved.get(parenMinus[1]));
+    const dur = readMinutesFromResolved(ctx.resolved.get(parenMinus[2]));
+    const rec = readMinutesFromResolved(ctx.resolved.get(parenMinus[3]));
+    if (reps !== null && dur !== null && rec !== null) {
+      return { kind: 'number', value: roundSmart(reps * (dur + rec) - rec), unit: 'minutes' };
+    }
+  }
+
+  // "n * (seconds/60 + minutes)" for sprint blocks.
+  const secondsPlusMinutes = rule.match(
+    /(\w+)\s*\*\s*\(\s*(\w+)\/60\s*\+\s*(\w+)\s*\)/,
+  );
+  if (secondsPlusMinutes) {
+    const reps = readNumberFromResolved(ctx.resolved.get(secondsPlusMinutes[1]));
+    const seconds = readNumberFromResolved(ctx.resolved.get(secondsPlusMinutes[2]));
+    const minutes = readMinutesFromResolved(ctx.resolved.get(secondsPlusMinutes[3]));
+    if (reps !== null && seconds !== null && minutes !== null) {
+      return { kind: 'number', value: roundSmart(reps * (seconds / 60 + minutes)), unit: 'minutes' };
+    }
+  }
+
+  // Simple products used for swim/run distance totals: "reps * distance" or
+  // "reps * 50". Only apply when the rule is exactly the product.
+  const product = rule.match(/^(\w+)\s*\*\s*(\w+|\d+(?:\.\d+)?)$/);
+  if (product) {
+    const left = readNumberFromResolved(ctx.resolved.get(product[1]));
+    const right = /^\d/.test(product[2])
+      ? Number(product[2])
+      : readNumberFromResolved(ctx.resolved.get(product[2]));
+    if (left !== null && right !== null && Number.isFinite(right)) {
+      return { kind: 'number', value: roundSmart(left * right), unit: targetUnit };
+    }
+  }
+
+  return null;
 }
 
 function readNumberFromResolved(v: ResolvedValue | undefined): number | null {
   if (!v) return null;
   if (v.kind === 'number') return v.value;
   return null;
+}
+
+function readMinutesFromResolved(v: ResolvedValue | undefined): number | null {
+  if (!v || v.kind !== 'number') return null;
+  if (v.unit === 'seconds') return v.value / 60;
+  return v.value;
+}
+
+function readPaceSeconds(v: ResolvedValue | undefined): { seconds: number; unit: 's/km' | 's/100m' } | null {
+  if (!v) return null;
+  if (v.kind === 'number' && (v.unit === 's/km' || v.unit === 's/100m')) {
+    return { seconds: v.value, unit: v.unit };
+  }
+  if (v.kind === 'range' && (v.unit === 's/km' || v.unit === 's/100m')) {
+    return { seconds: (v.low + v.high) / 2, unit: v.unit };
+  }
+  return null;
+}
+
+function durationFromDistanceAndPace(
+  distance: ResolvedValue,
+  pace: { seconds: number; unit: 's/km' | 's/100m' },
+): number | null {
+  if (distance.kind !== 'number' || !Number.isFinite(distance.value) || distance.value <= 0) {
+    return null;
+  }
+  if (pace.seconds <= 0) return null;
+  if (pace.unit === 's/km') {
+    const km = distance.unit === '米' ? distance.value / 1000 : distance.value;
+    return (km * pace.seconds) / 60;
+  }
+  const meters = distance.unit === 'km' ? distance.value * 1000 : distance.value;
+  return ((meters / 100) * pace.seconds) / 60;
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +692,7 @@ function buildHeartRateString(
       return `${Math.round(v.low)}-${Math.round(v.high)} bpm`;
     }
     if (v.kind === 'number') {
-      if (v.unit === 'W' || v.unit === 'W_upper') continue;
+      if (v.unit === 'W' || v.unit === 'W_upper' || v.unit === 'W_lower') continue;
       return `<${Math.round(v.value)} bpm`;
     }
   }
@@ -524,9 +715,9 @@ function buildPaceString(
     'cssPaceRange',
     'cssPace',
     'easyPaceCap',
+    'sprintPace',
     'easyPace',
     'tempoPace',
-    'sprintPace',
   ];
   const swimUnit = '/100m';
   const runUnit = '/km';
@@ -544,7 +735,7 @@ function buildPaceString(
         key === 'longPaceCap' ||
         key === 'targetPaceCap' ||
         key === 'easyPaceCap';
-      if (v.unit === 's/km_upper' || isUpperCap) {
+      if (v.unit === 's/km_upper' || v.unit === 's/100m_upper' || isUpperCap) {
         return `不快于 ${formatSeconds(v.value)}${unit}`;
       }
       if (v.unit === 's/km' || v.unit === 's/100m') {
@@ -582,6 +773,16 @@ function buildPowerString(
     'underPower',
     'overPower',
   ];
+  const underPower = resolved.get('underPower');
+  const overPower = resolved.get('overPower');
+  if (
+    underPower?.kind === 'number' &&
+    overPower?.kind === 'number' &&
+    underPower.unit === 'W' &&
+    overPower.unit === 'W'
+  ) {
+    return `${Math.round(underPower.value)} W / ${Math.round(overPower.value)} W`;
+  }
   for (const key of candidates) {
     const v = resolved.get(key);
     if (!v) continue;
@@ -591,6 +792,7 @@ function buildPowerString(
     if (v.kind === 'number') {
       if (v.unit === 'W') return `${Math.round(v.value)} W`;
       if (v.unit === 'W_upper') return `<${Math.round(v.value)} W`;
+      if (v.unit === 'W_lower') return `>${Math.round(v.value)} W`;
     }
   }
   return NA;
@@ -647,11 +849,9 @@ function applyPreferredDuration(
   template: WorkoutTemplate,
   durationMinutes: number,
   preferredMinutes: number | null,
+  capacityCapMinutes: number | null,
 ): number {
   if (
-    preferredMinutes === null ||
-    !Number.isFinite(preferredMinutes) ||
-    preferredMinutes <= 0 ||
     template.fixed.sport === 'rest' ||
     template.fixed.sport === 'mobility' ||
     durationMinutes <= 0
@@ -659,10 +859,28 @@ function applyPreferredDuration(
     return durationMinutes;
   }
 
-  const preferred = Math.round(preferredMinutes);
-  const lower = Math.max(15, template.fixed.minDurationMinutes);
+  let resolved = durationMinutes;
+  if (
+    preferredMinutes !== null &&
+    Number.isFinite(preferredMinutes) &&
+    preferredMinutes > 0
+  ) {
+    // User-provided minutes are treated as an availability cap, not a target to
+    // stretch every workout toward. This prevents long availability from
+    // inflating threshold/VO2 sessions.
+    resolved = Math.min(resolved, Math.round(preferredMinutes));
+  }
+  if (
+    capacityCapMinutes !== null &&
+    Number.isFinite(capacityCapMinutes) &&
+    capacityCapMinutes > 0
+  ) {
+    resolved = Math.min(resolved, Math.round(capacityCapMinutes));
+  }
+
+  const lower = Math.max(15, Math.min(template.fixed.minDurationMinutes, resolved));
   const upper = Math.max(lower, template.fixed.maxDurationMinutes);
-  return clamp(preferred, lower, upper);
+  return clamp(resolved, lower, upper);
 }
 
 function resolvePhaseMinutes(
@@ -698,11 +916,16 @@ function estimateDistanceKm(
   resolved: Map<string, ResolvedValue>,
   durationMinutes: number,
 ): number | null {
-  // Swimming: sum total meters across phases.
+  // Swimming: prefer template totalMeters when present. It is the intended
+  // total volume, while phase meter variables are the detailed breakdown.
   if (template.fixed.sport === 'swimming') {
+    const declaredTotal = resolved.get('totalMeters');
+    if (declaredTotal?.kind === 'number' && declaredTotal.value > 0) {
+      return Math.round(declaredTotal.value) / 1000;
+    }
+
     let totalMeters = 0;
     for (const key of [
-      'totalMeters',
       'warmupMeters',
       'mainTotalMeters',
       'drillTotalMeters',
@@ -775,7 +998,9 @@ function describePhase(
     if (suffix.includes('米')) {
       durationLabel = `${Math.round(v.value)} 米`;
     } else if (v.unit === 'seconds') {
-      durationLabel = `${Math.round(v.value)} 秒`;
+      durationLabel = v.value >= 60
+        ? `${Math.round(v.value / 60)} 分钟`
+        : `${Math.round(v.value)} 秒`;
     } else {
       durationLabel = `${Math.round(v.value)} 分钟`;
     }
@@ -817,7 +1042,7 @@ function buildTargetsArray(args: {
     durationMinutes > 0 &&
     Math.round(preferredDurationMinutes) === durationMinutes
   ) {
-    out.push(`已按每日偏好时长 ${durationMinutes} 分钟安排`);
+    out.push(`已按单日可用时长上限 ${durationMinutes} 分钟安排`);
   }
 
   if (distanceKm !== null && distanceKm > 0) {
@@ -827,10 +1052,33 @@ function buildTargetsArray(args: {
   if (targetHeartRate !== NA) out.push(`目标心率 ${targetHeartRate}`);
   if (targetPace !== NA) out.push(`目标配速 ${targetPace}`);
   if (targetPower !== NA) out.push(`目标功率 ${targetPower}`);
+  const fueling = fuelingGuidance(template, durationMinutes);
+  if (fueling) out.push(fueling);
 
   // Ensure at least one number-bearing bullet for non-rest workouts.
   if (out.length === 0) out.push('参考强度 不适用');
   return out;
+}
+
+function fuelingGuidance(template: WorkoutTemplate, durationMinutes: number): string | null {
+  if (!Number.isFinite(durationMinutes) || durationMinutes < 75) return null;
+  const type = template.fixed.workoutType;
+  const isLong =
+    type === 'lsd' ||
+    type === 'long_ride' ||
+    type === 'endurance' ||
+    durationMinutes >= 90;
+  if (!isLong) return null;
+  if (template.fixed.sport === 'running') {
+    return '长课补给：超过 75 分钟时，每小时 30-60g 碳水，按天气补水和电解质';
+  }
+  if (template.fixed.sport === 'cycling') {
+    return '长课补给：每小时 30-60g 碳水，90 分钟以上可逐步接近 60-90g，并每 15-20 分钟补水';
+  }
+  if (template.fixed.sport === 'swimming') {
+    return '长课补给：下水前补足碳水和水分，训练间隙准备饮水';
+  }
+  return null;
 }
 
 function buildAdaptation(template: WorkoutTemplate, durationMinutes: number): string {

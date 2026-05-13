@@ -36,6 +36,10 @@ import {
   type Sport,
 } from './templates/index.js';
 import { DEFAULT_MAX_HARD_SESSIONS_PER_WEEK } from './templates/variables.js';
+import {
+  getCapacityDurationCap,
+  type TrainingCapacity,
+} from './training-capacity.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -58,9 +62,11 @@ export interface ScheduleRequest {
   preferredKeyWorkoutDays?: string[];
   preferredTrainingWindows?: string[];
   dailyPreferredMinutes?: number | null;
+  weeklyMaxMinutes?: number | null;
   expectedLoad?: number | null;
   allowAdvancedWorkouts?: boolean;
   allowDoubleDays?: boolean;
+  forceRequestedSchedule?: boolean;
   exportFormats?: Array<'intervals_icu' | 'word' | 'pdf' | 'excel'>;
   maxHardSessionsPerWeek: number | null;
   targetMetricPreference: 'auto' | 'heart_rate' | 'pace';
@@ -76,6 +82,8 @@ export interface ScheduleEntry {
   sessionLabel?: string;
   timeOfDay?: 'morning' | 'midday' | 'afternoon' | 'evening';
   reason?: string;
+  durationCapMinutes?: number;
+  durationCapReason?: string;
 }
 
 export interface ScheduleResult {
@@ -99,7 +107,24 @@ const DAY_NAME_TO_INDEX: Record<string, number> = {
   sunday: 7,
 };
 
+const DAY_REFERENCE_PATTERNS: ReadonlyArray<{ dayIndex: number; pattern: RegExp }> = [
+  { dayIndex: 1, pattern: /(周一|星期一|礼拜一|\bmonday\b|\bmon\b|第\s*1\s*天|day\s*1)/gi },
+  { dayIndex: 2, pattern: /(周二|星期二|礼拜二|\btuesday\b|\btue\b|第\s*2\s*天|day\s*2)/gi },
+  { dayIndex: 3, pattern: /(周三|星期三|礼拜三|\bwednesday\b|\bwed\b|第\s*3\s*天|day\s*3)/gi },
+  { dayIndex: 4, pattern: /(周四|星期四|礼拜四|\bthursday\b|\bthu\b|第\s*4\s*天|day\s*4)/gi },
+  { dayIndex: 5, pattern: /(周五|星期五|礼拜五|\bfriday\b|\bfri\b|第\s*5\s*天|day\s*5)/gi },
+  { dayIndex: 6, pattern: /(周六|星期六|礼拜六|\bsaturday\b|\bsat\b|第\s*6\s*天|day\s*6)/gi },
+  { dayIndex: 7, pattern: /(周日|周天|星期日|星期天|礼拜日|礼拜天|\bsunday\b|\bsun\b|第\s*7\s*天|day\s*7)/gi },
+];
+
+const TRAINING_DAY_INTENT_RE =
+  /(训练|跑步|跑|骑行|骑车|骑|游泳|游|加练|两练|双练|双课|第二练|质量课|长跑|长骑|有空|可训练|可以训练|安排|not\s*rest|don'?t\s*rest|no\s*rest|train|workout|session|run|ride|bike|cycle|swim)/i;
+
+const REST_INTENT_RE = /(休息|不练|没空|不可训练|不能训练|\brest\b|\boff\b)/i;
+const NEGATED_REST_INTENT_RE = /(不|别|不要|不能|不可|no|not|don'?t)\s*(安排)?\s*(休息|rest|off)/i;
+
 const HARD_STIMULI: ReadonlySet<string> = new Set(['threshold', 'vo2max', 'anaerobic']);
+export const MAX_WEEKLY_TRAINING_MINUTES = 1200;
 
 // Default rest-day arrangement (1-indexed) for each daysPerWeek.
 // Spec: rest day is preferred on Monday (recovery from weekend) and Sunday
@@ -125,10 +150,12 @@ export interface BuildScheduleArgs {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
   recentState: RecentState;
+  trainingCapacity?: TrainingCapacity;
 }
 
 export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
-  const { request, athleteProfile, recentState } = args;
+  const { request, athleteProfile, recentState, trainingCapacity } = args;
+  const forceRequestedSchedule = request.forceRequestedSchedule === true;
 
   const enabledSports = getEnabledSports(request);
   const notes: string[] = [];
@@ -137,13 +164,25 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
     // Nothing enabled — fall back to a fully-rest week.
     notes.push('未选择任何运动，本周安排完全休息。');
     return {
-      days: buildAllRestWeek(request.weekStartDate, recentState),
+      days: buildAllRestWeek(request.weekStartDate, recentState, trainingCapacity),
       notes,
     };
   }
 
-  const daysPerWeek = clamp(Math.round(request.daysPerWeek), 1, 7);
-  const restDays = decideRestDays(daysPerWeek, request.preferredRestDay);
+  const requestedDaysPerWeek = normalizeDaysPerWeek(request.daysPerWeek);
+  const protectedTrainingDays = requestedTrainingDayIndexes(request);
+  const daysPerWeek = Math.max(requestedDaysPerWeek, protectedTrainingDays.size);
+  if (protectedTrainingDays.size > 0) {
+    notes.push(
+      `用户指定训练日 ${formatDayIndexes(protectedTrainingDays)} 已锁定为训练日，不会被默认休息日覆盖。`,
+    );
+    if (protectedTrainingDays.size > requestedDaysPerWeek) {
+      notes.push(
+        `用户指定训练日数量 ${protectedTrainingDays.size} 天超过每周训练天数 ${requestedDaysPerWeek} 天，已优先按指定训练日生成。`,
+      );
+    }
+  }
+  const restDays = decideRestDays(daysPerWeek, request.preferredRestDay, protectedTrainingDays);
 
   const trainingDayIndexes = [1, 2, 3, 4, 5, 6, 7].filter(
     (d) => !restDays.includes(d),
@@ -152,15 +191,31 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
   const sportOrder = decideSportOrder(request, enabledSports);
   const dayToSport = assignSports(trainingDayIndexes, sportOrder);
 
-  // Effective hard-session cap.
-  const baseCap =
-    request.maxHardSessionsPerWeek ?? DEFAULT_MAX_HARD_SESSIONS_PER_WEEK;
-  let hardCap = Math.min(baseCap, 2);
-  if (
-    athleteProfile.experienceLevel === 'advanced' &&
-    (recentState.fatigue === 'fresh' || recentState.fatigue === 'normal')
-  ) {
-    hardCap = Math.min(baseCap, 3);
+  // Effective hard-session cap. If the user supplied a cap, treat it as their
+  // requested boundary instead of silently shrinking it with defaults.
+  const userHardCap = request.maxHardSessionsPerWeek;
+  const baseCap = userHardCap ?? DEFAULT_MAX_HARD_SESSIONS_PER_WEEK;
+  let hardCap =
+    userHardCap !== null && userHardCap !== undefined
+      ? clamp(Math.round(userHardCap), 0, 7)
+      : Math.min(baseCap, athleteProfile.experienceLevel === 'advanced' ? 3 : 2);
+  if (trainingCapacity) {
+    notes.push(...trainingCapacity.guardrails.notes);
+    const capacityCap = trainingCapacity.guardrails.maxHardSessionsPerWeek;
+    if (forceRequestedSchedule || (userHardCap !== null && userHardCap !== undefined)) {
+      if (capacityCap < hardCap) {
+        notes.push(
+          `用户要求高强度上限 ${hardCap} 次；系统未应用容量建议上限 ${capacityCap} 次，只保留风险提示。`,
+        );
+      }
+    } else {
+      if (capacityCap < hardCap) {
+        notes.push(
+          `由于恢复/训练容量评估，本周未按原高强度要求生成，已从 ${hardCap} 次降至 ${capacityCap} 次。`,
+        );
+      }
+      hardCap = Math.min(hardCap, capacityCap);
+    }
   }
   notes.push(`本周高强度课上限 ${hardCap} 次。`);
 
@@ -168,18 +223,29 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
     const hoursAgo = hoursSince(recentState);
     if (hoursAgo !== null && hoursAgo < 36) {
       notes.push(
-        `近 36 小时内有 ${recentState.latestStimulus} 刺激，本周开局优先恢复。`,
+        forceRequestedSchedule
+          ? `近 36 小时内有 ${recentState.latestStimulus} 刺激；系统按用户要求生成，仅保留风险提示。`
+          : `近 36 小时内有 ${recentState.latestStimulus} 刺激，本周开局优先恢复。`,
       );
     }
   }
   if (recentState.fatigue === 'high_risk') {
-    notes.push('近期负荷偏高，本周以恢复和低强度有氧为主。');
+    notes.push(
+      forceRequestedSchedule
+        ? '近期负荷偏高；系统按用户要求生成，不因恢复风险自动删减训练日。'
+        : '近期负荷偏高，本周以恢复和低强度有氧为主。',
+    );
   } else if (recentState.fatigue === 'tired') {
-    notes.push('已有疲劳，本周第一次训练以轻松课开局。');
+    notes.push(
+      forceRequestedSchedule
+        ? '已有疲劳；系统按用户要求生成，不因疲劳自动改掉首个训练日。'
+        : '已有疲劳，本周第一次训练以轻松课开局。',
+    );
   }
   if (request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0) {
-    notes.push(`单次训练尽量靠近 ${request.dailyPreferredMinutes} 分钟。`);
+    notes.push(`单日可用时间上限 ${request.dailyPreferredMinutes} 分钟；系统不会为凑满时长而拉长质量课。`);
   }
+  notes.push(`本周总训练时长上限 ${request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES} 分钟。`);
   if (request.preferredTrainingWindows && request.preferredTrainingWindows.length > 0) {
     notes.push(`优先使用偏好时段：${request.preferredTrainingWindows.join('、')}。`);
   }
@@ -223,9 +289,10 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
       athleteProfile,
       recentState,
       request,
+      forceRequestedSchedule,
     });
 
-    days[dayIndex - 1] = {
+    const entry: ScheduleEntry = {
       dayIndex,
       date: addDays(request.weekStartDate, dayIndex - 1),
       dayLabel: DAY_LABELS[dayIndex - 1],
@@ -235,6 +302,8 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
       timeOfDay: chooseTimeOfDay(request, dayIndex),
       reason: pick.reason,
     };
+    applyDurationCap(entry, forceRequestedSchedule ? undefined : trainingCapacity);
+    days[dayIndex - 1] = entry;
 
     if (pick.intensity === 'high') hardScheduled += 1;
     if (pick.templateId === 'run.lsd.v1') longRunScheduled = true;
@@ -244,11 +313,16 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
 
   // Fill rest days.
   for (const dayIndex of restDays) {
-    days[dayIndex - 1] = buildRestEntry(dayIndex, request.weekStartDate, recentState);
+    days[dayIndex - 1] = buildRestEntry(
+      dayIndex,
+      request.weekStartDate,
+      recentState,
+      trainingCapacity,
+    );
   }
 
   // Sanity pass: drop consecutive-hard violations and over-cap.
-  applySanityPass(days, hardCap, notes);
+  applySanityPass(days, hardCap, notes, forceRequestedSchedule);
 
   return {
     days: days.map((d) => d!).slice(0, 7),
@@ -337,6 +411,7 @@ function assignSports(
 function decideRestDays(
   daysPerWeek: number,
   preferredRestDayName: string | undefined,
+  protectedTrainingDays: Set<number> = new Set(),
 ): number[] {
   const defaults = DEFAULT_REST_DAYS_BY_DPW[daysPerWeek] ?? [];
 
@@ -344,6 +419,7 @@ function decideRestDays(
     ? DAY_NAME_TO_INDEX[preferredRestDayName.toLowerCase()] ?? null
     : null;
 
+  let restDays: number[];
   if (preferred && !defaults.includes(preferred)) {
     // Replace one of the default rest days with the preferred one if needed.
     if (defaults.length === 0) {
@@ -352,10 +428,70 @@ function decideRestDays(
     }
     const replacement = [...defaults];
     replacement[0] = preferred;
-    return Array.from(new Set(replacement)).sort((a, b) => a - b);
+    restDays = Array.from(new Set(replacement));
+  } else {
+    restDays = defaults.slice();
   }
 
-  return defaults.slice().sort((a, b) => a - b);
+  if (protectedTrainingDays.size > 0) {
+    const replacementOrder = [5, 3, 7, 1, 2, 4, 6];
+    for (const protectedDay of protectedTrainingDays) {
+      if (!restDays.includes(protectedDay)) continue;
+      restDays = restDays.filter((d) => d !== protectedDay);
+      const replacement = replacementOrder.find(
+        (d) => !restDays.includes(d) && !protectedTrainingDays.has(d),
+      );
+      if (replacement !== undefined) {
+        restDays.push(replacement);
+      }
+    }
+  }
+
+  return Array.from(new Set(restDays)).sort((a, b) => a - b);
+}
+
+export function requestedDoubleDayIndex(request: ScheduleRequest): number | null {
+  if (request.allowDoubleDays !== true) return null;
+  const text = [request.goal, request.notes, request.availableTime]
+    .filter(Boolean)
+    .join('\n');
+  if (!/(一天两练|一日两练|同日两练|双练|双课|第二练|加练|double\s*(day|session|workout)|two-a-day|2\s*(workouts|sessions))/i.test(text)) {
+    return null;
+  }
+  const day = firstDayIndexInText(text);
+  if (day !== null) return day;
+  return null;
+}
+
+export function requestedTrainingDayIndexes(request: ScheduleRequest): Set<number> {
+  const days = new Set<number>();
+
+  const doubleDay = requestedDoubleDayIndex(request);
+  if (doubleDay !== null) days.add(doubleDay);
+
+  for (const raw of request.preferredKeyWorkoutDays ?? []) {
+    const day = firstDayIndexInText(raw);
+    if (day !== null) days.add(day);
+  }
+
+  const text = [request.goal, request.notes, request.availableTime]
+    .filter(Boolean)
+    .join('\n');
+  if (!text) return days;
+
+  for (const spec of DAY_REFERENCE_PATTERNS) {
+    spec.pattern.lastIndex = 0;
+    for (const match of text.matchAll(spec.pattern)) {
+      const index = match.index ?? 0;
+      const around = text.slice(Math.max(0, index - 8), index + match[0].length + 18);
+      const forward = text.slice(index, index + match[0].length + 18);
+      if (NEGATED_REST_INTENT_RE.test(around) || hasTrainingIntent(forward)) {
+        days.add(spec.dayIndex);
+      }
+    }
+  }
+
+  return days;
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +512,7 @@ interface PickInput {
   athleteProfile: AthleteProfile;
   recentState: RecentState;
   request: ScheduleRequest;
+  forceRequestedSchedule: boolean;
 }
 
 interface PickOutput {
@@ -387,26 +524,14 @@ interface PickOutput {
 function pickTemplateForDay(input: PickInput): PickOutput {
   const allowed = filterAllowedTemplates({
     sport: input.sport,
-    athleteProfile: {
-      injuries: input.athleteProfile.injuries,
-      experienceLevel: input.athleteProfile.experienceLevel,
-      running: { confidence: input.athleteProfile.running.confidence },
-      cycling: {
-        confidence: input.athleteProfile.cycling.confidence,
-        ftpWatts: input.athleteProfile.cycling.ftpWatts ?? null,
-      },
-      swimming: { confidence: input.athleteProfile.swimming.confidence },
-    },
-    recentState: {
-      latestStimulus:
-        input.recentState.latestStimulus === 'unknown'
-          ? null
-          : input.recentState.latestStimulus,
-      fatigue:
-        input.recentState.fatigue === 'fresh'
-          ? 'normal'
-          : input.recentState.fatigue,
-    },
+    athleteProfile: filterAthleteProfileForScheduling(
+      input.athleteProfile,
+      input.forceRequestedSchedule,
+    ),
+    recentState: filterRecentStateForScheduling(
+      input.recentState,
+      input.forceRequestedSchedule,
+    ),
     request: {
       sports: input.request.sports as Partial<Record<Sport, boolean>>,
       maxHardSessionsPerWeek: input.hardCap,
@@ -418,7 +543,11 @@ function pickTemplateForDay(input: PickInput): PickOutput {
 
   // Hard recovery rule: if recentState.fatigue is high_risk AND we're in the
   // first 2 training days of the week, force recovery.
-  if (input.recentState.fatigue === 'high_risk' && input.dayIndex <= 2) {
+  if (
+    !input.forceRequestedSchedule &&
+    input.recentState.fatigue === 'high_risk' &&
+    input.dayIndex <= 2
+  ) {
     return forceRecovery(input.sport, allowedIds, '近期高风险疲劳，先做恢复。');
   }
 
@@ -429,7 +558,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
     HARD_STIMULI.has(input.recentState.latestStimulus) &&
     hoursAgo !== null &&
     hoursAgo < 36;
-  if (input.isFirstTraining && recentHardCooldown) {
+  if (!input.forceRequestedSchedule && input.isFirstTraining && recentHardCooldown) {
     return forceAerobic(
       input.sport,
       allowedIds,
@@ -438,7 +567,11 @@ function pickTemplateForDay(input: PickInput): PickOutput {
   }
 
   // Tired + first day -> aerobic.
-  if (input.isFirstTraining && input.recentState.fatigue === 'tired') {
+  if (
+    !input.forceRequestedSchedule &&
+    input.isFirstTraining &&
+    input.recentState.fatigue === 'tired'
+  ) {
     return forceAerobic(input.sport, allowedIds, '已有疲劳，开局做有氧。');
   }
 
@@ -452,11 +585,11 @@ function pickTemplateForDay(input: PickInput): PickOutput {
   if (
     input.sport === 'running' &&
     !input.longRunScheduled &&
-    !input.prevIntensityHigh &&
+    (!input.prevIntensityHigh || input.forceRequestedSchedule) &&
     allowedIds.has('run.lsd.v1') &&
     // Mid/late week is a better LSD slot than day 1.
     input.dayIndex >= 4 &&
-    !recentHardCooldown
+    (!recentHardCooldown || input.forceRequestedSchedule)
   ) {
     return {
       templateId: 'run.lsd.v1',
@@ -467,10 +600,10 @@ function pickTemplateForDay(input: PickInput): PickOutput {
   if (
     input.sport === 'cycling' &&
     !input.longRideScheduled &&
-    !input.prevIntensityHigh &&
+    (!input.prevIntensityHigh || input.forceRequestedSchedule) &&
     allowedIds.has('bike.long_ride.v1') &&
     input.dayIndex >= 4 &&
-    !recentHardCooldown
+    (!recentHardCooldown || input.forceRequestedSchedule)
   ) {
     return {
       templateId: 'bike.long_ride.v1',
@@ -485,7 +618,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
     input.wantsRacePace &&
     !input.racePaceScheduled &&
     !hardCapReached &&
-    !input.prevIntensityHigh &&
+    (!input.prevIntensityHigh || input.forceRequestedSchedule) &&
     allowedIds.has('run.race_pace.v1')
   ) {
     return {
@@ -501,7 +634,10 @@ function pickTemplateForDay(input: PickInput): PickOutput {
   for (const candidateId of rotation) {
     if (!allowedIds.has(candidateId)) continue;
     const intensity = templateIntensity(candidateId);
-    if (intensity === 'high' && (hardCapReached || input.prevIntensityHigh)) {
+    if (
+      intensity === 'high' &&
+      (hardCapReached || (!input.forceRequestedSchedule && input.prevIntensityHigh))
+    ) {
       continue;
     }
     return {
@@ -581,8 +717,7 @@ function forceRecovery(
       return { templateId: id, reason, intensity: templateIntensity(id) };
     }
   }
-  // No recovery template allowed for this sport — fall back to rest.
-  return { templateId: 'rest.full.v1', reason, intensity: 'low' };
+  return activeRecoveryFallback(sport, reason);
 }
 
 function forceAerobic(
@@ -601,7 +736,64 @@ function forceAerobic(
       return { templateId: id, reason, intensity: templateIntensity(id) };
     }
   }
-  return { templateId: 'rest.full.v1', reason, intensity: 'low' };
+  return activeRecoveryFallback(sport, reason);
+}
+
+function activeRecoveryFallback(sport: ActiveSport, reason: string): PickOutput {
+  const templateId =
+    sport === 'running'
+      ? 'run.recovery.v1'
+      : sport === 'cycling'
+        ? 'bike.recovery_spin.v1'
+        : 'swim.recovery.v1';
+  return {
+    templateId,
+    reason: `${reason} 已保留为低强度训练，避免训练日变成休息日。`,
+    intensity: templateIntensity(templateId),
+  };
+}
+
+function filterAthleteProfileForScheduling(
+  profile: AthleteProfile,
+  forceRequestedSchedule: boolean,
+) {
+  return {
+    // Injuries come from the user and should still be respected in strict mode.
+    injuries: profile.injuries,
+    experienceLevel: profile.experienceLevel,
+    running: {
+      confidence: forceRequestedSchedule ? 'high' as const : profile.running.confidence,
+    },
+    cycling: {
+      confidence: forceRequestedSchedule ? 'high' as const : profile.cycling.confidence,
+      ftpWatts: profile.cycling.ftpWatts ?? null,
+    },
+    swimming: {
+      confidence: forceRequestedSchedule ? 'high' as const : profile.swimming.confidence,
+    },
+  };
+}
+
+function filterRecentStateForScheduling(
+  state: RecentState,
+  forceRequestedSchedule: boolean,
+) {
+  if (forceRequestedSchedule) {
+    return {
+      latestStimulus: null,
+      fatigue: 'normal' as const,
+    };
+  }
+  return {
+    latestStimulus:
+      state.latestStimulus === 'unknown'
+        ? null
+        : state.latestStimulus,
+    fatigue:
+      state.fatigue === 'fresh'
+        ? 'normal' as const
+        : state.fatigue,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -612,12 +804,13 @@ function buildRestEntry(
   dayIndex: number,
   weekStartDate: string,
   recentState: RecentState,
+  trainingCapacity?: TrainingCapacity,
 ): ScheduleEntry {
   const restTemplate =
     recentState.fatigue === 'tired' || recentState.fatigue === 'high_risk'
       ? 'rest.full.v1'
       : 'rest.mobility.v1';
-  return {
+  const entry: ScheduleEntry = {
     dayIndex,
     date: addDays(weekStartDate, dayIndex - 1),
     dayLabel: DAY_LABELS[dayIndex - 1],
@@ -628,6 +821,8 @@ function buildRestEntry(
         ? '完全休息日。'
         : '低强度活动恢复。',
   };
+  applyDurationCap(entry, trainingCapacity);
+  return entry;
 }
 
 function chooseTimeOfDay(
@@ -653,10 +848,22 @@ function parseTrainingWindow(raw: string): ScheduleEntry['timeOfDay'] | undefine
 function buildAllRestWeek(
   weekStartDate: string,
   recentState: RecentState,
+  trainingCapacity?: TrainingCapacity,
 ): ScheduleEntry[] {
   return [1, 2, 3, 4, 5, 6, 7].map((d) =>
-    buildRestEntry(d, weekStartDate, recentState),
+    buildRestEntry(d, weekStartDate, recentState, trainingCapacity),
   );
+}
+
+export function applyDurationCap(
+  entry: ScheduleEntry,
+  trainingCapacity?: TrainingCapacity,
+): ScheduleEntry {
+  const cap = getCapacityDurationCap(trainingCapacity, entry.sport, entry.templateId);
+  if (!cap) return entry;
+  entry.durationCapMinutes = cap.minutes;
+  entry.durationCapReason = cap.reason;
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +874,7 @@ function applySanityPass(
   days: Array<ScheduleEntry | null>,
   hardCap: number,
   notes: string[],
+  forceRequestedSchedule: boolean,
 ): void {
   let hardCount = 0;
   let prevHigh = false;
@@ -675,13 +883,15 @@ function applySanityPass(
     if (!entry) continue;
     const intensity = templateIntensity(entry.templateId);
     if (intensity === 'high') {
-      if (prevHigh || hardCount >= hardCap) {
+      if ((!forceRequestedSchedule && prevHigh) || hardCount >= hardCap) {
         // Swap to aerobic / recovery for the sport.
         const sport = entry.sport;
         const replacement = swapToAerobic(sport);
         if (replacement && replacement !== entry.templateId) {
           notes.push(
-            `${entry.dayLabel} 由 ${entry.templateId} 调整为 ${replacement}（避免连续高强度或超出本周上限）。`,
+            `${entry.dayLabel} 由 ${entry.templateId} 调整为 ${replacement}（${
+              hardCount >= hardCap ? '超出用户高强度上限' : '避免连续高强度'
+            }）。`,
           );
           days[i] = {
             ...entry,
@@ -724,6 +934,34 @@ function templateIntensity(templateId: string): 'low' | 'medium' | 'high' {
 function clamp(n: number, min: number, max: number): number {
   if (!Number.isFinite(n)) return min;
   return Math.min(max, Math.max(min, n));
+}
+
+export function normalizeDaysPerWeek(value: number): number {
+  return clamp(Math.round(value), 1, 7);
+}
+
+export function formatDayIndexes(days: Iterable<number>): string {
+  return Array.from(days)
+    .filter((d) => d >= 1 && d <= 7)
+    .sort((a, b) => a - b)
+    .map((d) => DAY_LABELS[d - 1])
+    .join('、');
+}
+
+function firstDayIndexInText(raw: string): number | null {
+  for (const spec of DAY_REFERENCE_PATTERNS) {
+    spec.pattern.lastIndex = 0;
+    if (spec.pattern.test(raw)) return spec.dayIndex;
+  }
+  return null;
+}
+
+function hasTrainingIntent(textWindow: string): boolean {
+  if (NEGATED_REST_INTENT_RE.test(textWindow)) return true;
+  if (REST_INTENT_RE.test(textWindow)) {
+    return false;
+  }
+  return TRAINING_DAY_INTENT_RE.test(textWindow);
 }
 
 function addDays(yyyymmdd: string, offset: number): string {

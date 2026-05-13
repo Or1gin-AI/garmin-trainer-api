@@ -13,7 +13,7 @@ import type {
 import { streamChat } from '../lib/llm.js';
 import type { AthleteProfile } from './athlete-profile.js';
 import type { RecentState } from './recent-state.js';
-import type { ScheduleEntry } from './scheduler.js';
+import { MAX_WEEKLY_TRAINING_MINUTES, type ScheduleEntry } from './scheduler.js';
 import type { ParameterizedWorkout } from './parameterizer.js';
 import type { WorkoutTemplate, PrimaryMetric, Intensity } from './templates/types.js';
 
@@ -98,7 +98,11 @@ export async function llmParameterizeWorkout(
             'adaptation',
           ],
           properties: {
-            durationMinutes: { type: 'integer', minimum: 0, maximum: 360 },
+            durationMinutes: {
+              type: 'integer',
+              minimum: 0,
+              maximum: MAX_WEEKLY_TRAINING_MINUTES,
+            },
             distanceKm: { type: ['number', 'null'] },
             targetMetric: {
               type: 'string',
@@ -195,6 +199,7 @@ export async function llmParameterizeWorkout(
     parsed,
     template,
     request,
+    scheduleEntry,
     progression,
   });
 
@@ -212,12 +217,13 @@ interface ValidateBuildArgs {
   parsed: LlmWorkoutPayload;
   template: WorkoutTemplate;
   request: LlmParameterizeArgs['request'];
+  scheduleEntry: ScheduleEntry;
   progression: 'conservative' | 'normal' | 'aggressive';
 }
 
 function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
   const violations: string[] = [];
-  const { parsed, template, request, progression } = args;
+  const { parsed, template, request, scheduleEntry, progression } = args;
   const sport = template.fixed.sport;
 
   const parsedDurationMinutes = Number.isFinite(parsed.durationMinutes)
@@ -227,6 +233,7 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
     template,
     parsedDurationMinutes,
     request.dailyPreferredMinutes ?? null,
+    scheduleEntry.durationCapMinutes ?? null,
   );
 
   // Distance.
@@ -365,20 +372,33 @@ function applyPreferredDuration(
   template: WorkoutTemplate,
   durationMinutes: number,
   preferredMinutes: number | null,
+  capacityCapMinutes: number | null,
 ): number {
   if (
-    preferredMinutes === null ||
-    !Number.isFinite(preferredMinutes) ||
-    preferredMinutes <= 0 ||
     template.fixed.sport === 'rest' ||
     template.fixed.sport === 'mobility' ||
     durationMinutes <= 0
   ) {
     return durationMinutes;
   }
-  const lower = Math.max(15, template.fixed.minDurationMinutes);
+  let resolved = durationMinutes;
+  if (
+    preferredMinutes !== null &&
+    Number.isFinite(preferredMinutes) &&
+    preferredMinutes > 0
+  ) {
+    resolved = Math.min(resolved, Math.round(preferredMinutes));
+  }
+  if (
+    capacityCapMinutes !== null &&
+    Number.isFinite(capacityCapMinutes) &&
+    capacityCapMinutes > 0
+  ) {
+    resolved = Math.min(resolved, Math.round(capacityCapMinutes));
+  }
+  const lower = Math.max(15, Math.min(template.fixed.minDurationMinutes, resolved));
   const upper = Math.max(lower, template.fixed.maxDurationMinutes);
-  return Math.min(upper, Math.max(lower, Math.round(preferredMinutes)));
+  return Math.min(upper, Math.max(lower, resolved));
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +445,21 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   );
   if (args.request.dailyPreferredMinutes && args.request.dailyPreferredMinutes > 0) {
     systemParts.push(
-      `- 用户填写了每日偏好时长 ${args.request.dailyPreferredMinutes} 分钟；非休息/恢复课的总时长应尽量接近该值，同时不得超出模板 min/max。`,
+      `- 用户填写的 ${args.request.dailyPreferredMinutes} 分钟是单日可用上限，不是必须凑满的目标；若模板默认时长更短，不要为了凑时长增加阈值/VO2/间歇总量。`,
+    );
+  }
+  if (args.scheduleEntry.durationCapMinutes && args.scheduleEntry.durationCapMinutes > 0) {
+    systemParts.push(
+      `- 训练容量保护：本节课总时长不得超过 ${args.scheduleEntry.durationCapMinutes} 分钟（${args.scheduleEntry.durationCapReason ?? '容量上限'}）。`,
+    );
+  }
+  if (
+    args.template.fixed.workoutType === 'lsd' ||
+    args.template.fixed.workoutType === 'long_ride' ||
+    args.template.fixed.maxDurationMinutes >= 90
+  ) {
+    systemParts.push(
+      '- 若最终总时长 >=75 分钟，targets 必须包含补给/补水建议：长课每小时 30-60g 碳水，骑行 90 分钟以上可接近 60-90g，并按天气补水和电解质。',
     );
   }
   if (args.request.availableTime) {

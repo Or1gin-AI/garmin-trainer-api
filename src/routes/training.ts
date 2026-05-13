@@ -4,6 +4,7 @@
 //   POST   /api/training/plans                           SSE; generate plan
 //   GET    /api/training/plans                           list user's plans
 //   GET    /api/training/plans/:id                       plan + workouts + chat
+//   DELETE /api/training/plans/:id                       delete local plan
 //   POST   /api/training/plans/:id/regenerate-day        SSE; regen one day
 //   PATCH  /api/training/workouts/:id                    update status
 //
@@ -20,6 +21,7 @@ import { and, asc, desc, eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import {
   activityCache,
+  garminPushedWorkout,
   trainingPlan,
   workout,
   userCalendar,
@@ -45,6 +47,7 @@ import { requireProAndQuota, consumeQuota } from '../lib/quota.js';
 import { openSse, writeEvent, endSse, startHeartbeat, emitToolEvent, type ToolEventPayload } from '../lib/sse.js';
 import {
   TOOL_DISPLAY,
+  summarizeAddSecondWorkout,
   summarizeRegenerateDay,
   summarizeUpdateStatus,
 } from '../training/tool-event-labels.js';
@@ -54,8 +57,9 @@ import { classifyActivityQuality } from '../training/activity-quality.js';
 import type { QualityResult } from '../training/activity-quality.js';
 import { deriveRecentTrainingState } from '../training/recent-state.js';
 import { buildAthleteProfile } from '../training/athlete-profile.js';
+import { deriveTrainingCapacity } from '../training/training-capacity.js';
 import { expandMultiSessionSchedule, generatePlan } from '../training/orchestrator.js';
-import { buildWeeklySchedule } from '../training/scheduler.js';
+import { buildWeeklySchedule, MAX_WEEKLY_TRAINING_MINUTES } from '../training/scheduler.js';
 import type { ScheduleRequest, ScheduleEntry } from '../training/scheduler.js';
 import { parameterizeWorkout } from '../training/parameterizer.js';
 import type { ParameterizedWorkout } from '../training/parameterizer.js';
@@ -92,11 +96,13 @@ const planRequestSchema = z.object({
   daysPerWeek: z.number().int().min(1).max(7),
   preferredRestDay: z.string().max(20).optional(),
   availableTime: z.string().max(200).optional(),
-  preferredTrainingWindows: z.array(z.string().max(50)).max(6).optional(),
-  dailyPreferredMinutes: z.number().int().min(15).max(600).nullable().optional(),
+  preferredTrainingWindows: z.array(z.string().max(50)).max(7).optional(),
+  dailyPreferredMinutes: z.number().int().min(15).max(MAX_WEEKLY_TRAINING_MINUTES).nullable().optional(),
+  weeklyMaxMinutes: z.number().int().min(15).max(MAX_WEEKLY_TRAINING_MINUTES).nullable().optional(),
   expectedLoad: z.number().min(0).max(5000).nullable().optional(),
   allowAdvancedWorkouts: z.boolean().optional(),
   allowDoubleDays: z.boolean().optional(),
+  forceRequestedSchedule: z.boolean().optional(),
   exportFormats: z.array(z.enum(['intervals_icu', 'word', 'pdf', 'excel'])).max(4).optional(),
   injuries: z.string().max(500).optional(),
   notes: z.string().max(2000).optional(),
@@ -107,7 +113,7 @@ const planRequestSchema = z.object({
     )
     .optional(),
   preferredKeyWorkoutDays: z.array(z.string()).optional(),
-  maxHardSessionsPerWeek: z.number().int().min(0).max(7).nullable(),
+  maxHardSessionsPerWeek: z.number().int().min(0).max(7).nullable().optional(),
   targetMetricPreference: z.enum(['auto', 'heart_rate', 'pace']),
 });
 
@@ -152,11 +158,13 @@ const trainingEvaluationSchema = z.object({
 
 const ACTIVITY_LOOKBACK_DAYS = 56;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_TRAINING_PLANS_PER_USER = 10;
 
 interface DerivedContext {
   request: ScheduleRequest;
   athleteProfile: ReturnType<typeof buildAthleteProfile>;
   recentState: ReturnType<typeof deriveRecentTrainingState>;
+  trainingCapacity: ReturnType<typeof deriveTrainingCapacity>;
   qualities: Map<string, QualityResult>;
   activities: NormalizedActivity[];
 }
@@ -264,17 +272,22 @@ async function loadDerivedContext(
       goalDistance: request.goalDistance ?? null,
     },
   });
+  const trainingCapacity = deriveTrainingCapacity({
+    activities,
+    qualities,
+    asOf: new Date(),
+  });
 
   emitFn({
     id: profileId,
     name: 'load_athlete_profile',
     displayName: TOOL_DISPLAY.load_athlete_profile,
     phase: 'done',
-    summary: summarizeProfileShort(athleteProfile, recentState),
+    summary: `${summarizeProfileShort(athleteProfile, recentState)} · 容量 ${trainingCapacity.overall.readiness}`,
     durationMs: Date.now() - profileStart,
   });
 
-  return { request, athleteProfile, recentState, qualities, activities };
+  return { request, athleteProfile, recentState, trainingCapacity, qualities, activities };
 }
 
 function summarizeProfileShort(
@@ -298,6 +311,8 @@ function summarizeProfileShort(
 }
 
 function toScheduleRequest(parsed: z.infer<typeof planRequestSchema>): ScheduleRequest {
+  const forceRequestedSchedule =
+    parsed.forceRequestedSchedule !== false || hasStrongScheduleOverrideIntent(parsed);
   return {
     weekStartDate: parsed.weekStartDate,
     goal: parsed.goal,
@@ -308,18 +323,32 @@ function toScheduleRequest(parsed: z.infer<typeof planRequestSchema>): ScheduleR
     availableTime: parsed.availableTime,
     preferredTrainingWindows: parsed.preferredTrainingWindows,
     dailyPreferredMinutes: parsed.dailyPreferredMinutes ?? null,
+    weeklyMaxMinutes: parsed.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES,
     expectedLoad: parsed.expectedLoad ?? null,
     allowAdvancedWorkouts: parsed.allowAdvancedWorkouts,
     allowDoubleDays: parsed.allowDoubleDays,
+    forceRequestedSchedule,
     exportFormats: parsed.exportFormats,
     injuries: parsed.injuries,
     notes: parsed.notes,
     sports: parsed.sports,
     sportPriorities: parsed.sportPriorities,
     preferredKeyWorkoutDays: parsed.preferredKeyWorkoutDays,
-    maxHardSessionsPerWeek: parsed.maxHardSessionsPerWeek,
+    maxHardSessionsPerWeek: parsed.maxHardSessionsPerWeek ?? null,
     targetMetricPreference: parsed.targetMetricPreference,
   };
+}
+
+function hasStrongScheduleOverrideIntent(parsed: z.infer<typeof planRequestSchema>): boolean {
+  const text = [
+    parsed.goal,
+    parsed.notes,
+    parsed.availableTime,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  if (!text) return false;
+  return /强烈要求|坚持生成|坚持按|强制生成|强制安排|无论如何|不要降级|不要保守|按我的要求|照我说的|force|override|insist/i.test(text);
 }
 
 interface TrainingPlanSummary {
@@ -339,6 +368,56 @@ function toPlanSummary(row: TrainingPlan): TrainingPlanSummary {
     summary: row.summary,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+async function countHeldTrainingPlans(userId: string): Promise<number> {
+  const rows = await db
+    .select({ id: trainingPlan.id })
+    .from(trainingPlan)
+    .where(eq(trainingPlan.userId, userId))
+    .limit(MAX_TRAINING_PLANS_PER_USER + 1);
+  return rows.length;
+}
+
+async function getBlockingGarminUploads(
+  userId: string,
+  planId: string,
+): Promise<{
+  activeCount: number;
+  regions: Array<{ region: 'cn' | 'global'; activeCount: number }>;
+}> {
+  const rows = await db
+    .select({
+      region: garminPushedWorkout.region,
+      status: garminPushedWorkout.status,
+      garminWorkoutId: garminPushedWorkout.garminWorkoutId,
+      garminScheduleId: garminPushedWorkout.garminScheduleId,
+    })
+    .from(garminPushedWorkout)
+    .where(
+      and(
+        eq(garminPushedWorkout.userId, userId),
+        eq(garminPushedWorkout.planId, planId),
+      ),
+    );
+
+  const byRegion = new Map<'cn' | 'global', number>();
+  for (const row of rows) {
+    if (row.status === 'deleted') continue;
+    const hasRemoteObject = Boolean(row.garminWorkoutId || row.garminScheduleId);
+    if (!hasRemoteObject && row.status === 'failed') continue;
+    const region = row.region === 'global' ? 'global' : 'cn';
+    byRegion.set(region, (byRegion.get(region) ?? 0) + 1);
+  }
+
+  const regions = Array.from(byRegion.entries()).map(([region, activeCount]) => ({
+    region,
+    activeCount,
+  }));
+  return {
+    activeCount: regions.reduce((sum, item) => sum + item.activeCount, 0),
+    regions,
   };
 }
 
@@ -766,6 +845,16 @@ trainingRouter.post(
     }
     const request = toScheduleRequest(parsed.data);
 
+    const heldCount = await countHeldTrainingPlans(userId);
+    if (heldCount >= MAX_TRAINING_PLANS_PER_USER) {
+      res.status(409).json({
+        error: 'training_plan_limit_reached',
+        limit: MAX_TRAINING_PLANS_PER_USER,
+        count: heldCount,
+      });
+      return;
+    }
+
     // Insert generating row first so we have an id to stream.
     const planId = crypto.randomUUID();
     const now = new Date();
@@ -775,7 +864,11 @@ trainingRouter.post(
         userId,
         weekStartDate: request.weekStartDate,
         status: 'generating',
-        request: parsed.data,
+        request: {
+          ...parsed.data,
+          forceRequestedSchedule: request.forceRequestedSchedule === true,
+          weeklyMaxMinutes: request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES,
+        },
         createdAt: now,
         updatedAt: now,
       });
@@ -809,6 +902,13 @@ trainingRouter.post(
           cycling: ctx.athleteProfile.cycling,
           swimming: ctx.athleteProfile.swimming,
         },
+        trainingCapacity: {
+          overall: ctx.trainingCapacity.overall,
+          load: ctx.trainingCapacity.load,
+          recovery: ctx.trainingCapacity.recovery,
+          guardrails: ctx.trainingCapacity.guardrails,
+        },
+        forceRequestedSchedule: request.forceRequestedSchedule === true,
       });
 
       // Buffer summary deltas streamed during generation; we forward them to
@@ -822,6 +922,7 @@ trainingRouter.post(
         request,
         athleteProfile: ctx.athleteProfile,
         recentState: ctx.recentState,
+        trainingCapacity: ctx.trainingCapacity,
         onSummaryDelta: (delta) => {
           summaryDeltas.push(delta);
         },
@@ -866,6 +967,14 @@ trainingRouter.post(
                   loadTrend: ctx.recentState.loadTrend,
                   recommendation: ctx.recentState.recommendation,
                 },
+                trainingCapacity: {
+                  overall: ctx.trainingCapacity.overall,
+                  load: ctx.trainingCapacity.load,
+                  recovery: ctx.trainingCapacity.recovery,
+                  guardrails: ctx.trainingCapacity.guardrails,
+                },
+                scheduleNotes: plan.schedule.notes,
+                forceRequestedSchedule: request.forceRequestedSchedule === true,
               },
               modelMeta: plan.modelMeta,
               updatedAt: new Date(),
@@ -962,6 +1071,31 @@ trainingRouter.get('/plans', requireUser, async (req, res) => {
     .orderBy(desc(trainingPlan.weekStartDate))
     .limit(20);
   res.json({ plans: rows.map(toPlanSummary) });
+});
+
+trainingRouter.delete('/plans/:id', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const planId = String(req.params.id);
+  const planRow = await loadOwnedPlan(userId, planId);
+  if (!planRow) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+
+  const blocking = await getBlockingGarminUploads(userId, planId);
+  if (blocking.activeCount > 0) {
+    res.status(409).json({
+      error: 'garmin_plan_uploaded',
+      activeCount: blocking.activeCount,
+      regions: blocking.regions,
+    });
+    return;
+  }
+
+  await db
+    .delete(trainingPlan)
+    .where(and(eq(trainingPlan.id, planId), eq(trainingPlan.userId, userId)));
+  res.json({ deletedPlanId: planId });
 });
 
 // ---------------------------------------------------------------------------
@@ -1448,8 +1582,15 @@ trainingRouter.post(
         request,
         athleteProfile: ctx.athleteProfile,
         recentState: ctx.recentState,
+        trainingCapacity: ctx.trainingCapacity,
       });
-      schedule = expandMultiSessionSchedule(schedule, request, ctx.athleteProfile, ctx.recentState);
+      schedule = expandMultiSessionSchedule(
+        schedule,
+        request,
+        ctx.athleteProfile,
+        ctx.recentState,
+        ctx.trainingCapacity,
+      );
 
       const dayIndex = parsed.data.dayIndex;
       const slotIndex = parsed.data.slotIndex ?? 1;
@@ -1545,7 +1686,14 @@ trainingRouter.post(
         workouts: workoutsForValidation,
         context: {
           maxHardSessionsPerWeek:
-            request.maxHardSessionsPerWeek ?? 2,
+            ctx.trainingCapacity &&
+            request.forceRequestedSchedule !== true &&
+            request.maxHardSessionsPerWeek === null
+              ? Math.min(
+                  request.maxHardSessionsPerWeek ?? 2,
+                  ctx.trainingCapacity.guardrails.maxHardSessionsPerWeek,
+                )
+              : request.maxHardSessionsPerWeek ?? 2,
           hardSessionsAlreadyDoneThisWeek: ctx.recentState.hardSessionsLast7d,
           latestStimulus: ctx.recentState.latestStimulus,
           hoursSinceLatest: ctx.recentState.latestReliableActivity?.startTimeLocal
@@ -1553,6 +1701,9 @@ trainingRouter.post(
               (60 * 60 * 1000)
             : Number.POSITIVE_INFINITY,
           fatigue: ctx.recentState.fatigue,
+          forceRequestedSchedule: request.forceRequestedSchedule === true,
+          weeklyMaxMinutes: request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES,
+          trainingCapacity: request.forceRequestedSchedule === true ? undefined : ctx.trainingCapacity,
         },
       });
       emitToolEv({
@@ -1885,9 +2036,13 @@ trainingRouter.post(
             throw err;
           }
           if (dispatched.updatedWorkout) {
-            workoutsSnapshot = workoutsSnapshot.map((w) =>
-              w.id === dispatched.updatedWorkout!.id ? dispatched.updatedWorkout! : w,
-            );
+            const existed = workoutsSnapshot.some((w) => w.id === dispatched.updatedWorkout!.id);
+            workoutsSnapshot = (existed
+              ? workoutsSnapshot.map((w) =>
+                  w.id === dispatched.updatedWorkout!.id ? dispatched.updatedWorkout! : w,
+                )
+              : [...workoutsSnapshot, dispatched.updatedWorkout]
+            ).sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
             writeEvent(res, 'workout_updated', {
               workout: dispatched.updatedWorkout,
             });
@@ -1902,6 +2057,13 @@ trainingRouter.post(
               summary = summarizeRegenerateDay(call.arguments.dayIndex, w.sport as string);
             } else {
               summary = `第 ${call.arguments.dayIndex} 天处理完成`;
+            }
+          } else if (call.name === 'add_second_workout') {
+            const w = dispatched.updatedWorkout;
+            if (w) {
+              summary = summarizeAddSecondWorkout(call.arguments.dayIndex, w.sport as string);
+            } else {
+              summary = `第 ${call.arguments.dayIndex} 天加练处理完成`;
             }
           } else if (call.name === 'update_workout_field') {
             summary = summarizeUpdateStatus(call.arguments.value);
@@ -2182,6 +2344,109 @@ async function dispatchChatToolCall(
     };
   }
 
+  if (call.name === 'add_second_workout') {
+    const dayIndex = call.arguments.dayIndex;
+    const candidates = workoutsSnapshot
+      .filter((w) => w.dayIndex === dayIndex)
+      .sort((a, b) => (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
+    if (candidates.length === 0) {
+      return {
+        toolResult: JSON.stringify({
+          error: `day ${dayIndex} not found in current plan`,
+        }),
+      };
+    }
+
+    const usedSlots = new Set(candidates.map((w) => w.slotIndex ?? 1));
+    const slotIndex = [2, 3].find((slot) => !usedSlots.has(slot));
+    if (!slotIndex) {
+      return {
+        toolResult: JSON.stringify({
+          error: `day ${dayIndex} already has maximum workout slots`,
+          candidates: candidates.map((w) => ({
+            workoutId: w.id,
+            slotIndex: w.slotIndex ?? 1,
+            sessionLabel: w.sessionLabel,
+            title: w.title,
+          })),
+        }),
+      };
+    }
+
+    const templateId = chooseSecondWorkoutTemplate({
+      requestedSport: call.arguments.sport,
+      requestedTemplateId: call.arguments.templateId,
+      dayWorkouts: candidates,
+      athleteProfile: ctx.athleteProfile,
+    });
+    const tpl = getTemplate(templateId);
+    if (!tpl) {
+      return {
+        toolResult: JSON.stringify({
+          error: `template ${templateId} not found`,
+        }),
+      };
+    }
+
+    const entry: ScheduleEntry = {
+      dayIndex,
+      date: String(candidates[0].date),
+      dayLabel: '周' + '一二三四五六日'[dayIndex - 1],
+      sport: tpl.fixed.sport,
+      templateId,
+      slotIndex,
+      sessionLabel: slotIndex === 2 ? '下午' : '加练',
+      timeOfDay: slotIndex === 2 ? 'afternoon' : 'evening',
+      reason: call.arguments.reason,
+      durationCapMinutes: secondWorkoutDurationCap(templateId),
+      durationCapReason: '聊天加练：第二课时默认控制为短低压力训练。',
+    };
+
+    const progression =
+      ctx.recentState.fatigue === 'tired' || ctx.recentState.fatigue === 'high_risk'
+        ? 'conservative'
+        : 'normal';
+    const parameterized = parameterizeWorkout({
+      template: tpl,
+      athleteProfile: ctx.athleteProfile,
+      recentState: ctx.recentState,
+      request: {
+        targetMetricPreference: request.targetMetricPreference,
+        availableTime: request.availableTime,
+        dailyPreferredMinutes: null,
+      },
+      scheduleEntry: entry,
+      progression,
+    });
+
+    const row = buildWorkoutRow(planId, entry, parameterized);
+    const inserted = (
+      await db
+        .insert(workout)
+        .values(row)
+        .returning()
+    )[0];
+
+    if (!inserted) {
+      return {
+        toolResult: JSON.stringify({
+          error: `failed to persist second workout for day ${dayIndex}`,
+        }),
+      };
+    }
+
+    return {
+      toolResult: JSON.stringify({
+        ok: true,
+        dayIndex,
+        slotIndex,
+        workout: parameterized,
+      }),
+      updatedWorkout: inserted,
+      refEntry: { workoutId: inserted.id, before: null, after: inserted },
+    };
+  }
+
   if (call.name === 'update_workout_field') {
     const { workoutId, value } = call.arguments;
     const before = workoutsSnapshot.find((w) => w.id === workoutId);
@@ -2216,4 +2481,54 @@ async function dispatchChatToolCall(
   return {
     toolResult: JSON.stringify({ error: 'unknown tool call' }),
   };
+}
+
+function chooseSecondWorkoutTemplate(args: {
+  requestedSport?: 'running' | 'cycling' | 'swimming' | 'mobility';
+  requestedTemplateId?: string;
+  dayWorkouts: Workout[];
+  athleteProfile: ReturnType<typeof buildAthleteProfile>;
+}): string {
+  if (args.requestedTemplateId) {
+    return args.requestedTemplateId;
+  }
+
+  const bySport: Record<'running' | 'cycling' | 'swimming' | 'mobility', string> = {
+    running: 'run.recovery.v1',
+    cycling: 'bike.recovery_spin.v1',
+    swimming: 'swim.recovery.v1',
+    mobility: 'rest.mobility.v1',
+  };
+  if (args.requestedSport) {
+    return bySport[args.requestedSport];
+  }
+
+  const existingSports = new Set(args.dayWorkouts.map((w) => w.sport));
+  const profile = args.athleteProfile;
+
+  // Default product behavior: second sessions should be low-pressure and
+  // preferably cross-training. This handles "你自己决定" without asking the
+  // model to invent a slot or pick a hard workout.
+  if (profile.swimming.available && !existingSports.has('swimming')) {
+    return 'swim.recovery.v1';
+  }
+  if (profile.cycling.available && !existingSports.has('cycling')) {
+    return 'bike.recovery_spin.v1';
+  }
+  if (profile.running.available && !existingSports.has('running')) {
+    return 'run.recovery.v1';
+  }
+  if (profile.swimming.available) return 'swim.recovery.v1';
+  if (profile.cycling.available) return 'bike.recovery_spin.v1';
+  if (profile.running.available) return 'run.recovery.v1';
+  return 'rest.mobility.v1';
+}
+
+function secondWorkoutDurationCap(templateId: string): number {
+  if (templateId === 'rest.mobility.v1') return 20;
+  if (templateId === 'rest.walk.v1') return 30;
+  if (templateId.startsWith('swim.')) return 40;
+  if (templateId.startsWith('bike.')) return 45;
+  if (templateId.startsWith('run.')) return 35;
+  return 40;
 }
