@@ -55,6 +55,7 @@ import { normalizeActivity } from '../training/activity-normalizer.js';
 import type { NormalizedActivity } from '../training/activity-normalizer.js';
 import { classifyActivityQuality } from '../training/activity-quality.js';
 import type { QualityResult } from '../training/activity-quality.js';
+import { evaluateTrainingDay, type TrainingEvaluationResult } from '../training/evaluation.js';
 import { deriveRecentTrainingState } from '../training/recent-state.js';
 import { buildAthleteProfile } from '../training/athlete-profile.js';
 import { deriveTrainingCapacity } from '../training/training-capacity.js';
@@ -481,14 +482,16 @@ interface CalendarEvaluation {
   plannedWorkoutIds: string[];
   activityRefs: Array<{ region: 'cn' | 'global' | 'manual'; activityId: string }>;
   status: string;
-  result: {
-    title: string;
-    summary: string;
-    plannedWorkoutCount: number;
-    activityCount: number;
-  } | null;
+  result: TrainingEvaluationResult | LegacyEvaluationResult | null;
   note: string | null;
   createdAt: string;
+}
+
+interface LegacyEvaluationResult {
+  title: string;
+  summary: string;
+  plannedWorkoutCount: number;
+  activityCount: number;
 }
 
 interface CalendarActivitySourceStatus {
@@ -691,13 +694,13 @@ function activityToCalendarEvent(
   };
 }
 
-async function loadActivityEvents(
+async function loadRawActivityMap(
   userId: string,
   from: string,
   to: string,
 ): Promise<{
-  events: CalendarEvent[];
-  sources: CalendarActivitySourceStatus[];
+  byActivity: Map<string, { activity: NormalizedActivity; raw: unknown }>;
+  live: Awaited<ReturnType<typeof fetchCalendarActivities>>;
 }> {
   const byActivity = new Map<string, { activity: NormalizedActivity; raw: unknown }>();
   const rows = await db
@@ -728,6 +731,18 @@ async function loadActivityEvents(
     byActivity.set(`${activity.region}:${String(activity.activityId)}`, { activity, raw });
   }
 
+  return { byActivity, live };
+}
+
+async function loadActivityEvents(
+  userId: string,
+  from: string,
+  to: string,
+): Promise<{
+  events: CalendarEvent[];
+  sources: CalendarActivitySourceStatus[];
+}> {
+  const { byActivity, live } = await loadRawActivityMap(userId, from, to);
   return {
     events: Array.from(byActivity.values()).map(({ activity, raw }) =>
       activityToCalendarEvent(activity, raw),
@@ -737,6 +752,18 @@ async function loadActivityEvents(
       { region: 'global', count: live.global.count, error: live.global.error },
     ],
   };
+}
+
+async function loadNormalizedActivitiesForDate(
+  userId: string,
+  date: string,
+): Promise<Map<string, NormalizedActivity>> {
+  const { byActivity } = await loadRawActivityMap(userId, date, date);
+  const result = new Map<string, NormalizedActivity>();
+  for (const [key, { activity }] of byActivity) {
+    result.set(key, activity);
+  }
+  return result;
 }
 
 function buildEvaluationPlaceholder(
@@ -1132,8 +1159,16 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
     activePlan = toPlanSummary(active.plan);
     events.push(...expandPlanWorkoutsAcrossRange(active.plan, active.workouts, from, to));
   }
-  const activityLoad = await loadActivityEvents(userId, from, to);
-  events.push(...activityLoad.events);
+
+  const { byActivity, live } = await loadRawActivityMap(userId, from, to);
+  const activityEvents = Array.from(byActivity.values()).map(({ activity, raw }) =>
+    activityToCalendarEvent(activity, raw),
+  );
+  const activitySources: CalendarActivitySourceStatus[] = [
+    { region: 'cn', count: live.cn.count, error: live.cn.error },
+    { region: 'global', count: live.global.count, error: live.global.error },
+  ];
+  events.push(...activityEvents);
 
   events.sort((a, b) => {
     const dateCmp = a.date.localeCompare(b.date);
@@ -1142,7 +1177,85 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
     if (sourceCmp !== 0) return sourceCmp;
     return (a.slotIndex ?? 99) - (b.slotIndex ?? 99);
   });
-  const evaluations = await loadCalendarEvaluations(userId, from, to);
+
+  let evaluations = await loadCalendarEvaluations(userId, from, to);
+
+  // Auto-evaluate past days that have planned workouts + activities but no evaluation
+  if (active) {
+    const todayStr = localDateString(today);
+    const evaluatedDates = new Set(evaluations.map((e) => e.date));
+
+    // Group activities by date
+    const activitiesByDate = new Map<string, NormalizedActivity[]>();
+    for (const { activity } of byActivity.values()) {
+      if (!activity.startTimeLocal) continue;
+      const date = localDateString(activity.startTimeLocal);
+      if (!activitiesByDate.has(date)) activitiesByDate.set(date, []);
+      activitiesByDate.get(date)!.push(activity);
+    }
+
+    const newEvaluations: CalendarEvaluation[] = [];
+    for (const [date, dayActivities] of activitiesByDate) {
+      if (date > todayStr) continue;
+      if (evaluatedDates.has(date)) continue;
+
+      const workoutsForDay = planWorkoutsForDate(active.plan, active.workouts, date);
+      if (workoutsForDay.length === 0) continue;
+
+      const qualities = new Map<string, QualityResult>();
+      for (const a of dayActivities) {
+        qualities.set(a.id, classifyActivityQuality(a));
+      }
+      const activityRefs = dayActivities.map((a) => ({
+        region: a.region,
+        activityId: String(a.activityId),
+      }));
+      const result = evaluateTrainingDay({
+        plannedWorkouts: workoutsForDay.map((w) => ({
+          id: w.id,
+          title: w.title,
+          sport: w.sport,
+          intensity: w.intensity,
+          durationMinutes: w.durationMinutes,
+          distanceKm: w.distanceKm,
+          targetMetric: w.targetMetric,
+          targetHeartRate: w.targetHeartRate,
+          targetPace: w.targetPace,
+          targetPower: w.targetPower,
+          workoutType: w.workoutType,
+        })),
+        activities: dayActivities,
+        activityQualities: qualities,
+      });
+
+      const now = new Date();
+      const row = (
+        await db
+          .insert(trainingEvaluation)
+          .values({
+            id: crypto.randomUUID(),
+            userId,
+            planId: active.plan.id,
+            evaluationDate: date,
+            plannedWorkoutIds: workoutsForDay.map((w) => w.id),
+            activityRefs,
+            status: 'ready',
+            result,
+            note: null,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning()
+      )[0];
+      newEvaluations.push(evaluationToSummary(row));
+    }
+
+    if (newEvaluations.length > 0) {
+      evaluations = [...evaluations, ...newEvaluations].sort(
+        (a, b) => b.date.localeCompare(a.date),
+      );
+    }
+  }
 
   res.json({
     calendar: {
@@ -1150,7 +1263,7 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
       activePlanId: activePlan?.id ?? null,
       from,
       to,
-      activitySources: activityLoad.sources,
+      activitySources,
     },
     events,
     evaluations,
@@ -1192,12 +1305,38 @@ trainingRouter.post('/calendar/evaluations', requireUser, async (req, res) => {
     return;
   }
 
-  const plannedWorkoutIds = planWorkoutsForDate(
+  const plannedWorkoutRows = planWorkoutsForDate(
     active.plan,
     active.workouts,
     parsed.data.date,
-  ).map((row) => row.id);
-  const result = buildEvaluationPlaceholder(plannedWorkoutIds, requested);
+  );
+  const plannedWorkoutIds = plannedWorkoutRows.map((row) => row.id);
+
+  const activityMap = await loadNormalizedActivitiesForDate(userId, parsed.data.date);
+  const normalizedActivities = requested
+    .map((ref) => activityMap.get(`${ref.region}:${ref.activityId}`))
+    .filter((a): a is NormalizedActivity => a != null);
+  const qualities = new Map<string, QualityResult>();
+  for (const a of normalizedActivities) {
+    qualities.set(a.id, classifyActivityQuality(a));
+  }
+  const result = evaluateTrainingDay({
+    plannedWorkouts: plannedWorkoutRows.map((w) => ({
+      id: w.id,
+      title: w.title,
+      sport: w.sport,
+      intensity: w.intensity,
+      durationMinutes: w.durationMinutes,
+      distanceKm: w.distanceKm,
+      targetMetric: w.targetMetric,
+      targetHeartRate: w.targetHeartRate,
+      targetPace: w.targetPace,
+      targetPower: w.targetPower,
+      workoutType: w.workoutType,
+    })),
+    activities: normalizedActivities,
+    activityQualities: qualities,
+  });
   const now = new Date();
   const row = (
     await db
