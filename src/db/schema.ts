@@ -221,7 +221,8 @@ export const trainingPlan = pgTable(
   ],
 );
 
-// Workout slots, normalized 1 plan x 7 days. dayIndex 1..7.
+// Workout slots, normalized by plan/day/session. dayIndex 1..7; slotIndex
+// allows double days such as AM/PM threshold sessions.
 export const workout = pgTable(
   'workout',
   {
@@ -230,7 +231,10 @@ export const workout = pgTable(
       .notNull()
       .references(() => trainingPlan.id, { onDelete: 'cascade' }),
     dayIndex: integer('day_index').notNull(),
+    slotIndex: integer('slot_index').notNull().default(1),
     date: date('date').notNull(),
+    sessionLabel: text('session_label'),
+    timeOfDay: text('time_of_day'),
     sport: text('sport').notNull(), // 'running' | 'cycling' | 'swimming' | 'rest' | 'strength' | 'mobility'
     templateId: text('template_id').notNull(),
     workoutType: text('workout_type'),
@@ -253,8 +257,13 @@ export const workout = pgTable(
     status: text('status').notNull().default('planned'), // 'planned' | 'completed' | 'skipped' | 'regenerating'
   },
   (t) => [
-    uniqueIndex('workout_plan_day_idx').on(t.planId, t.dayIndex),
+    uniqueIndex('workout_plan_day_slot_idx').on(t.planId, t.dayIndex, t.slotIndex),
     check('workout_day_index_chk', sql`${t.dayIndex} BETWEEN 1 AND 7`),
+    check('workout_slot_index_chk', sql`${t.slotIndex} BETWEEN 1 AND 3`),
+    check(
+      'workout_time_of_day_chk',
+      sql`${t.timeOfDay} IS NULL OR ${t.timeOfDay} IN ('morning','midday','afternoon','evening')`,
+    ),
     check(
       'workout_sport_chk',
       sql`${t.sport} IN ('running','cycling','swimming','rest','strength','mobility')`,
@@ -270,6 +279,105 @@ export const workout = pgTable(
     check(
       'workout_status_chk',
       sql`${t.status} IN ('planned','completed','skipped','regenerating')`,
+    ),
+  ],
+);
+
+// One lightweight calendar setting per user. The calendar always derives
+// planned workouts from this active plan, so importing a new plan replaces the
+// old one instead of duplicating events.
+export const userCalendar = pgTable(
+  'user_calendar',
+  {
+    userId: text('user_id')
+      .primaryKey()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    activePlanId: text('active_plan_id').references(() => trainingPlan.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (t) => [index('user_calendar_active_plan_idx').on(t.activePlanId)],
+);
+
+// Remote Garmin workout objects created by Garmin Trainer. This is the
+// deletion ledger: every pushed workout/schedule must be traceable here so a
+// user can remove one uploaded plan without touching unrelated Garmin data.
+export const garminPushedWorkout = pgTable(
+  'garmin_pushed_workout',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    planId: text('plan_id')
+      .notNull()
+      .references(() => trainingPlan.id, { onDelete: 'cascade' }),
+    localWorkoutId: text('local_workout_id')
+      .notNull()
+      .references(() => workout.id, { onDelete: 'cascade' }),
+    region: text('region').notNull().default('cn'), // 'cn' | 'global'
+    garminWorkoutId: text('garmin_workout_id'),
+    garminScheduleId: text('garmin_schedule_id'),
+    scheduledDate: date('scheduled_date').notNull(),
+    workoutName: text('workout_name').notNull(),
+    payloadHash: text('payload_hash').notNull(),
+    status: text('status').notNull().default('scheduled'), // 'scheduled' | 'deleting' | 'deleted' | 'failed'
+    lastError: text('last_error'),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('garmin_pushed_workout_local_region_idx').on(
+      t.localWorkoutId,
+      t.region,
+      t.scheduledDate,
+    ),
+    index('garmin_pushed_workout_plan_idx').on(t.planId),
+    index('garmin_pushed_workout_user_plan_idx').on(t.userId, t.planId),
+    check('garmin_pushed_workout_region_chk', sql`${t.region} IN ('cn','global')`),
+    check(
+      'garmin_pushed_workout_status_chk',
+      sql`${t.status} IN ('scheduled','deleting','deleted','failed')`,
+    ),
+  ],
+);
+
+// User-submitted mapping from real Garmin activities to one calendar day.
+// The evaluator can later compare these selected activities with the planned
+// workouts for that date and populate result.
+export const trainingEvaluation = pgTable(
+  'training_evaluation',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    planId: text('plan_id').references(() => trainingPlan.id, {
+      onDelete: 'set null',
+    }),
+    evaluationDate: date('evaluation_date').notNull(),
+    plannedWorkoutIds: jsonb('planned_workout_ids')
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    activityRefs: jsonb('activity_refs')
+      .$type<Array<{ region: 'cn' | 'global' | 'manual'; activityId: string }>>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    status: text('status').notNull().default('pending'), // 'pending' | 'ready' | 'failed'
+    result: jsonb('result'),
+    note: text('note'),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('training_evaluation_user_date_idx').on(t.userId, t.evaluationDate),
+    index('training_evaluation_plan_idx').on(t.planId),
+    check(
+      'training_evaluation_status_chk',
+      sql`${t.status} IN ('pending','ready','failed')`,
     ),
   ],
 );
@@ -356,6 +464,9 @@ export type GarminAccount = typeof garminAccount.$inferSelect;
 export type SyncJob = typeof syncJob.$inferSelect;
 export type TrainingPlan = typeof trainingPlan.$inferSelect;
 export type Workout = typeof workout.$inferSelect;
+export type UserCalendar = typeof userCalendar.$inferSelect;
+export type GarminPushedWorkout = typeof garminPushedWorkout.$inferSelect;
+export type TrainingEvaluation = typeof trainingEvaluation.$inferSelect;
 export type ChatMessage = typeof chatMessage.$inferSelect;
 export type AiUsage = typeof aiUsage.$inferSelect;
 export type LlmConfig = typeof llmConfig.$inferSelect;

@@ -29,6 +29,34 @@
       "when": 1778335629817,
       "tag": "0003_gigantic_silver_surfer",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1778659200000,
+      "tag": "0004_multi_session_workouts",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1778745600000,
+      "tag": "0005_user_calendar",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1778832000000,
+      "tag": "0006_garmin_pushed_workouts",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1778918400000,
+      "tag": "0007_training_evaluations",
+      "breakpoints": true
     }
   ]
 }

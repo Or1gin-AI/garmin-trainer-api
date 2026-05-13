@@ -41,6 +41,7 @@ export interface LlmParameterizeArgs {
   request: {
     targetMetricPreference: 'auto' | 'heart_rate' | 'pace';
     availableTime?: string;
+    dailyPreferredMinutes?: number | null;
   };
   scheduleEntry: ScheduleEntry;
   progression: 'conservative' | 'normal' | 'aggressive';
@@ -193,6 +194,7 @@ export async function llmParameterizeWorkout(
   const workout = validateAndBuild({
     parsed,
     template,
+    request,
     progression,
   });
 
@@ -209,17 +211,23 @@ export async function llmParameterizeWorkout(
 interface ValidateBuildArgs {
   parsed: LlmWorkoutPayload;
   template: WorkoutTemplate;
+  request: LlmParameterizeArgs['request'];
   progression: 'conservative' | 'normal' | 'aggressive';
 }
 
 function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
   const violations: string[] = [];
-  const { parsed, template, progression } = args;
+  const { parsed, template, request, progression } = args;
   const sport = template.fixed.sport;
 
-  const durationMinutes = Number.isFinite(parsed.durationMinutes)
+  const parsedDurationMinutes = Number.isFinite(parsed.durationMinutes)
     ? Math.max(0, Math.round(parsed.durationMinutes ?? 0))
     : 0;
+  const durationMinutes = applyPreferredDuration(
+    template,
+    parsedDurationMinutes,
+    request.dailyPreferredMinutes ?? null,
+  );
 
   // Distance.
   const distanceKm =
@@ -353,6 +361,26 @@ function pickValidTargetMetric(
   return template.fixed.primaryMetric;
 }
 
+function applyPreferredDuration(
+  template: WorkoutTemplate,
+  durationMinutes: number,
+  preferredMinutes: number | null,
+): number {
+  if (
+    preferredMinutes === null ||
+    !Number.isFinite(preferredMinutes) ||
+    preferredMinutes <= 0 ||
+    template.fixed.sport === 'rest' ||
+    template.fixed.sport === 'mobility' ||
+    durationMinutes <= 0
+  ) {
+    return durationMinutes;
+  }
+  const lower = Math.max(15, template.fixed.minDurationMinutes);
+  const upper = Math.max(lower, template.fixed.maxDurationMinutes);
+  return Math.min(upper, Math.max(lower, Math.round(preferredMinutes)));
+}
+
 // ---------------------------------------------------------------------------
 // Prompt assembly
 // ---------------------------------------------------------------------------
@@ -364,6 +392,7 @@ interface BuildMessagesArgs {
   request: {
     targetMetricPreference: 'auto' | 'heart_rate' | 'pace';
     availableTime?: string;
+    dailyPreferredMinutes?: number | null;
   };
   scheduleEntry: ScheduleEntry;
   progression: 'conservative' | 'normal' | 'aggressive';
@@ -394,6 +423,14 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   systemParts.push(
     `- 当前 progression=${args.progression}，对照模板的 progression 调整时长和重复次数。`,
   );
+  if (args.request.dailyPreferredMinutes && args.request.dailyPreferredMinutes > 0) {
+    systemParts.push(
+      `- 用户填写了每日偏好时长 ${args.request.dailyPreferredMinutes} 分钟；非休息/恢复课的总时长应尽量接近该值，同时不得超出模板 min/max。`,
+    );
+  }
+  if (args.request.availableTime) {
+    systemParts.push(`- 用户可用时间说明：${args.request.availableTime}`);
+  }
 
   const user = {
     template: {

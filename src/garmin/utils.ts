@@ -7,6 +7,7 @@ export interface RawActivity {
   duration?: number;
   averageSpeed?: number;
   averageHR?: number;
+  maxHR?: number;
   // Enriched fields below are not declared here because Garmin returns them
   // at varying paths depending on activity source / API version. We resolve
   // them via ACTIVITY_FIELD_ALIASES + pickFirst, treating the activity as
@@ -24,6 +25,7 @@ export interface MappedActivity {
   distanceKm: number;
   durationMin: number;
   averageHr: number | null;
+  maxHr: number | null;
   averagePaceMinPerKm: number | null;
   averagePaceText: string | null;
   // Enriched training metrics (Unit 2). All optional — Garmin doesn't always
@@ -40,7 +42,22 @@ export interface MappedActivity {
   elevationGain?: number;
   averagePower?: number;
   normalizedPower?: number;
+  maxPower?: number;
   averageCadence?: number;
+  maxCadence?: number;
+  groundContactTime?: number;
+  verticalOscillation?: number;
+  verticalRatio?: number;
+  strideLength?: number;
+  vo2Max?: number;
+  lactateThresholdHr?: number;
+  lactateThresholdPaceMinPerKm?: number;
+  trainingStatus?: string;
+  hrvStatus?: string;
+  sleepDurationHours?: number;
+  sleepScore?: number;
+  recoveryTimeHours?: number;
+  heartRateZones?: Array<[number, number]>;
   deviceName?: string;
   source?: string;
   rawTrainingSummary?: unknown;
@@ -112,6 +129,7 @@ export const ACTIVITY_FIELD_ALIASES = {
     'summaryDTO.trainingEffectMessage',
   ],
   averageSpeed: ['averageSpeed', 'summaryDTO.averageSpeed'],
+  maxHr: ['maxHR', 'maxHr', 'summaryDTO.maxHR', 'summaryDTO.maxHr'],
   maxSpeed: ['maxSpeed', 'summaryDTO.maxSpeed'],
   elevationGain: [
     'elevationGain',
@@ -120,10 +138,87 @@ export const ACTIVITY_FIELD_ALIASES = {
   ],
   averagePower: ['averagePower', 'avgPower', 'summaryDTO.averagePower'],
   normalizedPower: ['normalizedPower', 'summaryDTO.normalizedPower'],
+  maxPower: ['maxPower', 'summaryDTO.maxPower'],
   averageCadence: [
     'averageCadence',
     'avgCadence',
     'summaryDTO.averageCadence',
+  ],
+  maxCadence: ['maxCadence', 'summaryDTO.maxCadence'],
+  groundContactTime: [
+    'groundContactTime',
+    'avgGroundContactTime',
+    'averageGroundContactTime',
+    'summaryDTO.groundContactTime',
+    'summaryDTO.avgGroundContactTime',
+    'summaryDTO.averageGroundContactTime',
+  ],
+  verticalOscillation: [
+    'verticalOscillation',
+    'avgVerticalOscillation',
+    'averageVerticalOscillation',
+    'summaryDTO.verticalOscillation',
+    'summaryDTO.avgVerticalOscillation',
+    'summaryDTO.averageVerticalOscillation',
+  ],
+  verticalRatio: [
+    'verticalRatio',
+    'avgVerticalRatio',
+    'averageVerticalRatio',
+    'summaryDTO.verticalRatio',
+    'summaryDTO.avgVerticalRatio',
+    'summaryDTO.averageVerticalRatio',
+  ],
+  strideLength: [
+    'strideLength',
+    'avgStrideLength',
+    'averageStrideLength',
+    'summaryDTO.strideLength',
+    'summaryDTO.avgStrideLength',
+    'summaryDTO.averageStrideLength',
+  ],
+  vo2Max: [
+    'vo2Max',
+    'vO2MaxValue',
+    'summaryDTO.vo2Max',
+    'summaryDTO.vO2MaxValue',
+  ],
+  lactateThresholdHr: [
+    'lactateThresholdHr',
+    'lactateThresholdHeartRate',
+    'summaryDTO.lactateThresholdHr',
+    'summaryDTO.lactateThresholdHeartRate',
+  ],
+  lactateThresholdPace: [
+    'lactateThresholdPace',
+    'lactateThresholdPaceMinPerKm',
+    'summaryDTO.lactateThresholdPace',
+    'summaryDTO.lactateThresholdPaceMinPerKm',
+  ],
+  lactateThresholdSpeed: [
+    'lactateThresholdSpeed',
+    'summaryDTO.lactateThresholdSpeed',
+  ],
+  trainingStatus: [
+    'trainingStatus',
+    'summaryDTO.trainingStatus',
+  ],
+  hrvStatus: [
+    'hrvStatus',
+    'summaryDTO.hrvStatus',
+  ],
+  sleepDurationHours: [
+    'sleepDurationHours',
+    'sleepTimeSeconds',
+    'summaryDTO.sleepDurationHours',
+    'summaryDTO.sleepTimeSeconds',
+  ],
+  sleepScore: ['sleepScore', 'summaryDTO.sleepScore'],
+  recoveryTimeHours: [
+    'recoveryTimeHours',
+    'recoveryTime',
+    'summaryDTO.recoveryTimeHours',
+    'summaryDTO.recoveryTime',
   ],
   deviceName: ['deviceName', 'device.name', 'summaryDTO.deviceName'],
 } as const satisfies Record<string, readonly string[]>;
@@ -142,6 +237,94 @@ function toNonEmptyString(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
   const s = typeof value === 'string' ? value : String(value);
   return s.length > 0 ? s : undefined;
+}
+
+function normalizeHours(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  // Garmin sometimes reports seconds for sleep/recovery durations. Anything
+  // larger than a week is almost certainly seconds.
+  return value > 168 ? Number((value / 3600).toFixed(1)) : value;
+}
+
+function collectObjects(value: unknown, out: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    for (const item of value) collectObjects(item, out);
+    return out;
+  }
+  if (!value || typeof value !== 'object') return out;
+  const obj = value as Record<string, unknown>;
+  out.push(obj);
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === 'object') collectObjects(v, out);
+  }
+  return out;
+}
+
+function readZoneNumber(obj: Record<string, unknown>): number | null {
+  const n =
+    toFiniteNumber(obj.zoneNumber) ??
+    toFiniteNumber(obj.zone) ??
+    toFiniteNumber(obj.zoneIndex) ??
+    toFiniteNumber(obj.hrZone);
+  return n !== undefined && n >= 1 && n <= 7 ? Math.round(n) : null;
+}
+
+function readZoneBoundary(
+  obj: Record<string, unknown>,
+  keys: readonly string[],
+): number | null {
+  for (const key of keys) {
+    const n = toFiniteNumber(obj[key]);
+    if (n !== undefined && n >= 30 && n <= 240) return Math.round(n);
+  }
+  return null;
+}
+
+function extractHeartRateZones(raw: unknown): Array<[number, number]> | undefined {
+  const byZone = new Map<number, [number, number]>();
+  for (const obj of collectObjects(raw)) {
+    const zone = readZoneNumber(obj);
+    if (zone === null) continue;
+    const low = readZoneBoundary(obj, [
+      'lowBoundary',
+      'zoneLowBoundary',
+      'lowerBound',
+      'minHeartRate',
+      'minHr',
+      'startHeartRate',
+      'startValue',
+      'floor',
+    ]);
+    const high = readZoneBoundary(obj, [
+      'highBoundary',
+      'zoneHighBoundary',
+      'upperBound',
+      'maxHeartRate',
+      'maxHr',
+      'endHeartRate',
+      'endValue',
+      'ceiling',
+    ]);
+    if (low !== null && high !== null && high > low) {
+      byZone.set(zone, [low, high]);
+    }
+  }
+  if (byZone.size === 0) return undefined;
+  return Array.from(byZone.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([, range]) => range);
+}
+
+function lactateThresholdPaceMinPerKm(raw: unknown): number | undefined {
+  const pace = toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.lactateThresholdPace));
+  if (pace !== undefined && pace > 0) {
+    // Pace may arrive as min/km or seconds/km depending on endpoint.
+    return pace > 60 ? Number((pace / 60).toFixed(2)) : pace;
+  }
+  const speed = toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.lactateThresholdSpeed));
+  return paceFromSpeed(speed).value ?? undefined;
 }
 
 export function activitySignature(activity: RawActivity): string {
@@ -192,6 +375,7 @@ export function mapActivity(
     distanceKm: Number(((activity.distance || 0) / 1000).toFixed(2)),
     durationMin: Number(((activity.duration || 0) / 60).toFixed(1)),
     averageHr: activity.averageHR || null,
+    maxHr: activity.maxHR ?? toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.maxHr)) ?? null,
     averagePaceMinPerKm: pace.value,
     averagePaceText: pace.text,
     // Enriched fields. Each runs through pickFirst with the alias list,
@@ -227,9 +411,40 @@ export function mapActivity(
     normalizedPower: toFiniteNumber(
       pickFirst(raw, ACTIVITY_FIELD_ALIASES.normalizedPower),
     ),
+    maxPower: toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.maxPower)),
     averageCadence: toFiniteNumber(
       pickFirst(raw, ACTIVITY_FIELD_ALIASES.averageCadence),
     ),
+    maxCadence: toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.maxCadence)),
+    groundContactTime: toFiniteNumber(
+      pickFirst(raw, ACTIVITY_FIELD_ALIASES.groundContactTime),
+    ),
+    verticalOscillation: toFiniteNumber(
+      pickFirst(raw, ACTIVITY_FIELD_ALIASES.verticalOscillation),
+    ),
+    verticalRatio: toFiniteNumber(
+      pickFirst(raw, ACTIVITY_FIELD_ALIASES.verticalRatio),
+    ),
+    strideLength: toFiniteNumber(
+      pickFirst(raw, ACTIVITY_FIELD_ALIASES.strideLength),
+    ),
+    vo2Max: toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.vo2Max)),
+    lactateThresholdHr: toFiniteNumber(
+      pickFirst(raw, ACTIVITY_FIELD_ALIASES.lactateThresholdHr),
+    ),
+    lactateThresholdPaceMinPerKm: lactateThresholdPaceMinPerKm(raw),
+    trainingStatus: toNonEmptyString(
+      pickFirst(raw, ACTIVITY_FIELD_ALIASES.trainingStatus),
+    ),
+    hrvStatus: toNonEmptyString(pickFirst(raw, ACTIVITY_FIELD_ALIASES.hrvStatus)),
+    sleepDurationHours: normalizeHours(
+      toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.sleepDurationHours)),
+    ),
+    sleepScore: toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.sleepScore)),
+    recoveryTimeHours: normalizeHours(
+      toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.recoveryTimeHours)),
+    ),
+    heartRateZones: extractHeartRateZones(raw),
     deviceName: toNonEmptyString(pickFirst(raw, ACTIVITY_FIELD_ALIASES.deviceName)),
     source: 'garmin',
     rawTrainingSummary: summaryDTO,

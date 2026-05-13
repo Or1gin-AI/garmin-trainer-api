@@ -108,7 +108,8 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     signal,
     emit,
   });
-  const schedule = stageOne.schedule;
+  let schedule = stageOne.schedule;
+  schedule = expandMultiSessionSchedule(schedule, request, athleteProfile, recentState);
 
   let totalInputTokens = stageOne.meta?.inputTokens ?? 0;
   let totalOutputTokens = stageOne.meta?.outputTokens ?? 0;
@@ -145,6 +146,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
           request: {
             targetMetricPreference: request.targetMetricPreference,
             availableTime: request.availableTime,
+            dailyPreferredMinutes: request.dailyPreferredMinutes,
           },
           scheduleEntry: entry,
           progression,
@@ -172,6 +174,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
         request: {
           targetMetricPreference: request.targetMetricPreference,
           availableTime: request.availableTime,
+          dailyPreferredMinutes: request.dailyPreferredMinutes,
         },
         scheduleEntry: entry,
         progression,
@@ -219,6 +222,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
         request: {
           targetMetricPreference: request.targetMetricPreference,
           availableTime: request.availableTime,
+          dailyPreferredMinutes: request.dailyPreferredMinutes,
         },
         scheduleEntry: entry,
         progression,
@@ -265,7 +269,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     const dayIndexes = collectViolatingDays(violations);
     let mutated = false;
     for (const dayIndex of dayIndexes) {
-      const idx = dayIndex - 1;
+      const idx = schedule.days.findIndex((d) => d.dayIndex === dayIndex);
       const entry = schedule.days[idx];
       const current = workouts[idx];
       if (!entry || !current) continue;
@@ -289,6 +293,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
         request: {
           targetMetricPreference: request.targetMetricPreference,
           availableTime: request.availableTime,
+          dailyPreferredMinutes: request.dailyPreferredMinutes,
         },
         scheduleEntry: schedule.days[idx],
         progression: decideProgression(athleteProfile, recentState, schedule.days[idx]),
@@ -355,6 +360,71 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
       parameterizerFallbackCount: fallbackParamCount,
       summarySource: summaryStage.source,
     },
+  };
+}
+
+export function expandMultiSessionSchedule(
+  schedule: ScheduleResult,
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+  recentState: RecentState,
+): ScheduleResult {
+  const wantsDoubleThreshold =
+    request.allowAdvancedWorkouts === true &&
+    request.allowDoubleDays === true &&
+    /双阈值|double\s*threshold/i.test(`${request.goal ?? ''}\n${request.notes ?? ''}`);
+  if (!wantsDoubleThreshold) return schedule;
+  if (!request.sports.running) return schedule;
+  if (recentState.fatigue === 'tired' || recentState.fatigue === 'high_risk') {
+    return {
+      ...schedule,
+      notes: [...schedule.notes, '已请求双阈值，但近期疲劳偏高，未安排同日两练。'],
+    };
+  }
+  if (athleteProfile.experienceLevel !== 'advanced') {
+    return {
+      ...schedule,
+      notes: [...schedule.notes, '双阈值仅适合高水平且恢复正常的用户，本周保留单次阈值/节奏课。'],
+    };
+  }
+
+  const thresholdIdx = schedule.days.findIndex((d) => {
+    const tpl = getTemplate(d.templateId);
+    return d.sport === 'running' && (tpl?.fixed.workoutType === 'threshold' || tpl?.fixed.workoutType === 'tempo');
+  });
+  if (thresholdIdx < 0) {
+    return {
+      ...schedule,
+      notes: [...schedule.notes, '已开启同日多练，但本周没有合适的跑步阈值日可扩展为双阈值。'],
+    };
+  }
+
+  const base = schedule.days[thresholdIdx];
+  const am: ScheduleEntry = {
+    ...base,
+    templateId: 'run.double_threshold_am.v1',
+    slotIndex: 1,
+    sessionLabel: '上午',
+    timeOfDay: 'morning',
+    reason: `${base.reason ?? ''} 双阈值上午课：短时间阈值间歇，控制乳酸与配速稳定。`.trim(),
+  };
+  const pm: ScheduleEntry = {
+    ...base,
+    templateId: 'run.double_threshold_pm.v1',
+    slotIndex: 2,
+    sessionLabel: '下午',
+    timeOfDay: 'afternoon',
+    reason: '双阈值下午课：同日第二次阈值刺激，全天阈值总时间控制在 40-70 分钟。',
+  };
+  const days = [
+    ...schedule.days.slice(0, thresholdIdx),
+    am,
+    pm,
+    ...schedule.days.slice(thresholdIdx + 1),
+  ].sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
+  return {
+    days,
+    notes: [...schedule.notes, `第 ${base.dayIndex} 天已安排双阈值上午/下午两练。`],
   };
 }
 

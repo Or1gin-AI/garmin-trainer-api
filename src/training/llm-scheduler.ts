@@ -131,6 +131,7 @@ export async function llmBuildWeeklySchedule(
       request: {
         sports: request.sports as Partial<Record<Sport, boolean>>,
         maxHardSessionsPerWeek: request.maxHardSessionsPerWeek ?? undefined,
+        allowAdvancedWorkouts: request.allowAdvancedWorkouts,
       },
       hardSessionsAlreadyScheduledThisWeek: 0,
     });
@@ -376,6 +377,8 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
       dayLabel: DAY_LABELS[day.dayIndex - 1] ?? '',
       sport: tpl.fixed.sport,
       templateId: day.templateId,
+      slotIndex: 1,
+      timeOfDay: chooseTimeOfDay(request, day.dayIndex),
       reason: typeof day.reason === 'string' ? day.reason : undefined,
     });
   }
@@ -386,6 +389,15 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
 
   // Hard-rule: no two consecutive intensity=high.
   const sortedEntries = entries.slice().sort((a, b) => a.dayIndex - b.dayIndex);
+  const enabledSports = collectEnabledSports(request);
+  if (request.daysPerWeek >= enabledSports.length) {
+    for (const sport of enabledSports) {
+      if (!sortedEntries.some((e) => e.sport === sport)) {
+        violations.push(`${sport}: enabled but not scheduled this week`);
+      }
+    }
+  }
+
   for (let i = 1; i < sortedEntries.length; i += 1) {
     const prev = sortedEntries[i - 1];
     const curr = sortedEntries[i];
@@ -408,6 +420,30 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
   ).length;
   if (hardCount > hardCap) {
     violations.push(`hard count ${hardCount} > cap ${hardCap}`);
+  }
+
+  // Quality sessions should have distinct training purposes when the allowed
+  // catalog gives the model alternatives. The LLM still chooses the mix; this
+  // only rejects duplicated high-intensity templates when variety is possible.
+  for (const sport of ['running', 'cycling', 'swimming']) {
+    const pickedHigh = sortedEntries.filter((e) => {
+      const tpl = getTemplate(e.templateId);
+      return tpl?.fixed.sport === sport && tpl.fixed.intensity === 'high';
+    });
+    if (pickedHigh.length < 2) continue;
+    const pickedIds = new Set(pickedHigh.map((e) => e.templateId));
+    const allowedHighAlternatives = Array.from(allowedIds).filter((id) => {
+      const tpl = getTemplate(id);
+      return tpl?.fixed.sport === sport && tpl.fixed.intensity === 'high';
+    });
+    if (
+      pickedIds.size < pickedHigh.length &&
+      allowedHighAlternatives.length > pickedIds.size
+    ) {
+      violations.push(
+        `${sport}: repeated high-intensity template despite available alternatives`,
+      );
+    }
   }
 
   // Hard-rule: no high intensity within 36h of a recent threshold/vo2/anaerobic.
@@ -481,6 +517,37 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   systemParts.push(
     '- 休息日请使用 rest 类模板（rest.full.v1 / rest.mobility.v1）。',
   );
+  systemParts.push(
+    '- 同一运动一周内若安排多次 high 强度课，应优先覆盖不同训练目的，例如 threshold / interval / VO2max / race_pace，不要无理由重复同一个 high 模板；',
+  );
+  systemParts.push(
+    '- 跑步用户若一周有 2 次质量课，通常一节偏阈值/节奏，一节偏间歇/VO2max，除非近期疲劳或模板禁忌不允许；',
+  );
+  systemParts.push(
+    '- 如果用户同时启用游泳、骑行、跑步，并且训练天数足够，每周必须同时覆盖三项；不要只围绕跑步安排。',
+  );
+  systemParts.push(
+    '- 骑行有 FTP 时优先选择/输出功率目标；游泳优先使用 CSS/每 100m 配速；跑步低强度优先心率区间。',
+  );
+  if (args.request.dailyPreferredMinutes && args.request.dailyPreferredMinutes > 0) {
+    systemParts.push(
+      `- 用户偏好单次训练约 ${args.request.dailyPreferredMinutes} 分钟；选择模板时优先匹配该时长，不要安排明显超出可用时间的课程。`,
+    );
+  }
+  if (args.request.preferredTrainingWindows && args.request.preferredTrainingWindows.length > 0) {
+    systemParts.push(
+      `- 用户偏好训练时段：${args.request.preferredTrainingWindows.join('、')}；调度结果会按这些时段标注 timeOfDay。`,
+    );
+  }
+  if (args.request.allowAdvancedWorkouts !== true) {
+    systemParts.push(
+      '- 用户未开启高级训练：不得安排 VO2max、短间歇、无氧、冲刺、坡跑/爬坡、比赛专项、公开水域专项、双阈值或同日多练。',
+    );
+  } else {
+    systemParts.push(
+      '- 用户已开启高级训练：仍需根据训练基础、疲劳、禁忌和高强度上限谨慎选择高级模板。',
+    );
+  }
   systemParts.push('');
   systemParts.push('允许的模板列表（每行格式：id | sport | intensity | purpose | block:contraindications）：');
   systemParts.push(args.catalog || '(空)');
@@ -501,6 +568,8 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     daysPerWeek: args.request.daysPerWeek,
     preferredRestDay: args.request.preferredRestDay ?? null,
     availableTime: args.request.availableTime ?? null,
+    preferredTrainingWindows: args.request.preferredTrainingWindows ?? [],
+    dailyPreferredMinutes: args.request.dailyPreferredMinutes ?? null,
     injuries: args.request.injuries ?? null,
     notes: args.request.notes ?? null,
     sports: args.request.sports,
@@ -549,6 +618,25 @@ function collectEnabledSports(request: ScheduleRequest): ActiveSport[] {
   if (request.sports.cycling) out.push('cycling');
   if (request.sports.swimming) out.push('swimming');
   return out;
+}
+
+function chooseTimeOfDay(
+  request: ScheduleRequest,
+  dayIndex: number,
+): ScheduleEntry['timeOfDay'] | undefined {
+  const windows = request.preferredTrainingWindows ?? [];
+  if (windows.length === 0) return undefined;
+  return parseTrainingWindow(windows[(dayIndex - 1) % windows.length] ?? '');
+}
+
+function parseTrainingWindow(raw: string): ScheduleEntry['timeOfDay'] | undefined {
+  const value = raw.trim().toLowerCase();
+  if (!value) return undefined;
+  if (/早|晨|上午|morning|am|a\.m\./i.test(value)) return 'morning';
+  if (/中午|午间|midday|noon/i.test(value)) return 'midday';
+  if (/下午|afternoon|pm|p\.m\./i.test(value)) return 'afternoon';
+  if (/晚|夜|evening|night/i.test(value)) return 'evening';
+  return undefined;
 }
 
 function filterAthleteProfile(p: AthleteProfile) {

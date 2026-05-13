@@ -19,17 +19,27 @@ import { z } from 'zod';
 import { and, asc, desc, eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import {
+  activityCache,
   trainingPlan,
   workout,
+  userCalendar,
+  trainingEvaluation,
   chatMessage,
   type TrainingPlan,
   type Workout,
+  type TrainingEvaluation,
   type ChatMessage,
 } from '../db/schema.js';
 import {
+  fetchCalendarActivities,
   fetchRecentRawActivities,
   GarminUnavailableError,
 } from '../garmin/fetch-recent.js';
+import {
+  deletePlanFromGarmin,
+  getPlanGarminStatus,
+  pushPlanToGarmin,
+} from '../garmin/workout-publisher.js';
 import { requireUser, type AuthedRequest } from '../lib/session.js';
 import { requireProAndQuota, consumeQuota } from '../lib/quota.js';
 import { openSse, writeEvent, endSse, startHeartbeat, emitToolEvent, type ToolEventPayload } from '../lib/sse.js';
@@ -44,7 +54,7 @@ import { classifyActivityQuality } from '../training/activity-quality.js';
 import type { QualityResult } from '../training/activity-quality.js';
 import { deriveRecentTrainingState } from '../training/recent-state.js';
 import { buildAthleteProfile } from '../training/athlete-profile.js';
-import { generatePlan } from '../training/orchestrator.js';
+import { expandMultiSessionSchedule, generatePlan } from '../training/orchestrator.js';
 import { buildWeeklySchedule } from '../training/scheduler.js';
 import type { ScheduleRequest, ScheduleEntry } from '../training/scheduler.js';
 import { parameterizeWorkout } from '../training/parameterizer.js';
@@ -60,6 +70,7 @@ import {
   llmParameterizeWorkout,
   InvalidLlmWorkoutError,
 } from '../training/llm-parameterizer.js';
+import { renderIntervalsIcu } from '../training/intervals-icu.js';
 
 export const trainingRouter = Router();
 
@@ -81,6 +92,12 @@ const planRequestSchema = z.object({
   daysPerWeek: z.number().int().min(1).max(7),
   preferredRestDay: z.string().max(20).optional(),
   availableTime: z.string().max(200).optional(),
+  preferredTrainingWindows: z.array(z.string().max(50)).max(6).optional(),
+  dailyPreferredMinutes: z.number().int().min(15).max(600).nullable().optional(),
+  expectedLoad: z.number().min(0).max(5000).nullable().optional(),
+  allowAdvancedWorkouts: z.boolean().optional(),
+  allowDoubleDays: z.boolean().optional(),
+  exportFormats: z.array(z.enum(['intervals_icu', 'word', 'pdf', 'excel'])).max(4).optional(),
   injuries: z.string().max(500).optional(),
   notes: z.string().max(2000).optional(),
   sports: sportsSchema,
@@ -96,6 +113,7 @@ const planRequestSchema = z.object({
 
 const regenerateDaySchema = z.object({
   dayIndex: z.number().int().min(1).max(7),
+  slotIndex: z.number().int().min(1).max(3).optional(),
   reason: z.string().max(500).optional(),
 });
 
@@ -105,6 +123,27 @@ const workoutPatchSchema = z.object({
 
 const chatBodySchema = z.object({
   message: z.string().min(1).max(5000),
+});
+
+const calendarQuerySchema = z.object({
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+const garminRegionSchema = z.enum(['cn', 'global']).default('cn');
+
+const trainingEvaluationSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  activityRefs: z
+    .array(
+      z.object({
+        region: z.enum(['cn', 'global', 'manual']),
+        activityId: z.union([z.string(), z.number()]).transform((value) => String(value)),
+      }),
+    )
+    .min(1)
+    .max(12),
+  note: z.string().max(1000).optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -184,8 +223,31 @@ async function loadDerivedContext(
     ridingSpeeds.length > 0
       ? ridingSpeeds[Math.floor(ridingSpeeds.length / 2)]
       : null;
+  const runningPaces = activities
+    .filter((a) => a.sport === 'running' && a.averagePaceSecPerKm !== null)
+    .map((a) => a.averagePaceSecPerKm as number)
+    .sort((a, b) => a - b);
+  const runningMedianPaceSecPerKm =
+    runningPaces.length > 0
+      ? runningPaces[Math.floor(runningPaces.length / 2)]
+      : null;
+  const runningPowers = activities
+    .filter((a) => a.sport === 'running' && a.averagePower !== null)
+    .map((a) => a.averagePower as number)
+    .sort((a, b) => a - b);
+  const runningMedianPowerWatts =
+    runningPowers.length > 0
+      ? runningPowers[Math.floor(runningPowers.length / 2)]
+      : null;
   for (const a of activities) {
-    qualities.set(a.id, classifyActivityQuality(a, { cyclingMedianSpeedMps }));
+    qualities.set(
+      a.id,
+      classifyActivityQuality(a, {
+        cyclingMedianSpeedMps,
+        runningMedianPaceSecPerKm,
+        runningMedianPowerWatts,
+      }),
+    );
   }
 
   const recentState = deriveRecentTrainingState({
@@ -244,6 +306,12 @@ function toScheduleRequest(parsed: z.infer<typeof planRequestSchema>): ScheduleR
     daysPerWeek: parsed.daysPerWeek,
     preferredRestDay: parsed.preferredRestDay,
     availableTime: parsed.availableTime,
+    preferredTrainingWindows: parsed.preferredTrainingWindows,
+    dailyPreferredMinutes: parsed.dailyPreferredMinutes ?? null,
+    expectedLoad: parsed.expectedLoad ?? null,
+    allowAdvancedWorkouts: parsed.allowAdvancedWorkouts,
+    allowDoubleDays: parsed.allowDoubleDays,
+    exportFormats: parsed.exportFormats,
     injuries: parsed.injuries,
     notes: parsed.notes,
     sports: parsed.sports,
@@ -278,7 +346,10 @@ interface WorkoutInsertRow {
   id: string;
   planId: string;
   dayIndex: number;
+  slotIndex: number;
   date: string;
+  sessionLabel: string | null;
+  timeOfDay: 'morning' | 'midday' | 'afternoon' | 'evening' | null;
   sport: string;
   templateId: string;
   workoutType: string;
@@ -297,6 +368,56 @@ interface WorkoutInsertRow {
   status: 'planned' | 'completed' | 'skipped' | 'regenerating';
 }
 
+interface CalendarEvent {
+  id: string;
+  kind: 'planned_workout' | 'garmin_activity';
+  date: string;
+  startTimeLocal: string | null;
+  title: string;
+  sport: string;
+  source: 'training_plan' | 'garmin';
+  planId: string | null;
+  workoutId: string | null;
+  activityId: string | number | null;
+  region: 'cn' | 'global' | 'manual' | null;
+  status: string | null;
+  slotIndex: number | null;
+  sessionLabel: string | null;
+  durationMinutes: number | null;
+  distanceKm: number | null;
+  intensity: string | null;
+  targetMetric: string | null;
+  targetHeartRate: string | null;
+  targetPace: string | null;
+  targetPower: string | null;
+  workoutStructure: string | null;
+  targets: string[] | null;
+  metrics: Record<string, number | string | null>;
+}
+
+interface CalendarEvaluation {
+  id: string;
+  date: string;
+  planId: string | null;
+  plannedWorkoutIds: string[];
+  activityRefs: Array<{ region: 'cn' | 'global' | 'manual'; activityId: string }>;
+  status: string;
+  result: {
+    title: string;
+    summary: string;
+    plannedWorkoutCount: number;
+    activityCount: number;
+  } | null;
+  note: string | null;
+  createdAt: string;
+}
+
+interface CalendarActivitySourceStatus {
+  region: 'cn' | 'global';
+  count: number;
+  error: string | null;
+}
+
 function buildWorkoutRow(
   planId: string,
   entry: ScheduleEntry,
@@ -306,7 +427,10 @@ function buildWorkoutRow(
     id: crypto.randomUUID(),
     planId,
     dayIndex: entry.dayIndex,
+    slotIndex: entry.slotIndex ?? 1,
     date: entry.date,
+    sessionLabel: entry.sessionLabel ?? null,
+    timeOfDay: entry.timeOfDay ?? null,
     sport: entry.sport,
     templateId: w.templateId,
     workoutType: w.workoutType,
@@ -339,6 +463,284 @@ function chunkSummary(summary: string): string[] {
     out.push(parts.slice(i, i + groupSize).join(''));
   }
   return out;
+}
+
+function localDateString(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function addDays(date: Date, days: number): Date {
+  const out = new Date(date);
+  out.setDate(out.getDate() + days);
+  return out;
+}
+
+function parseDateOnly(value: string): Date {
+  const [y, m, d] = value.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function daysBetweenInclusive(from: string, to: string): number {
+  return Math.round((parseDateOnly(to).getTime() - parseDateOnly(from).getTime()) / DAY_MS) + 1;
+}
+
+function workoutToCalendarEvent(w: Workout, dateOverride?: string): CalendarEvent {
+  const date = dateOverride ?? String(w.date);
+  return {
+    id: dateOverride ? `workout:${date}:${w.id}` : `workout:${w.id}`,
+    kind: 'planned_workout',
+    date,
+    startTimeLocal: null,
+    title: w.title,
+    sport: w.sport,
+    source: 'training_plan',
+    planId: w.planId,
+    workoutId: w.id,
+    activityId: null,
+    region: null,
+    status: w.status,
+    slotIndex: w.slotIndex ?? 1,
+    sessionLabel: w.sessionLabel ?? null,
+    durationMinutes: w.durationMinutes ?? null,
+    distanceKm: w.distanceKm !== null ? Number(w.distanceKm) : null,
+    intensity: w.intensity ?? null,
+    targetMetric: w.targetMetric ?? null,
+    targetHeartRate: w.targetHeartRate ?? null,
+    targetPace: w.targetPace ?? null,
+    targetPower: w.targetPower ?? null,
+    workoutStructure: w.workoutStructure ?? null,
+    targets: w.targets ?? null,
+    metrics: {},
+  };
+}
+
+function dayOffset(from: Date, to: Date): number {
+  const a = new Date(from);
+  const b = new Date(to);
+  a.setHours(0, 0, 0, 0);
+  b.setHours(0, 0, 0, 0);
+  return Math.round((b.getTime() - a.getTime()) / DAY_MS);
+}
+
+function circularDayIndex(planWeekStartDate: string, date: string): number {
+  const offset = dayOffset(parseDateOnly(planWeekStartDate), parseDateOnly(date));
+  return ((offset % 7) + 7) % 7 + 1;
+}
+
+function expandPlanWorkoutsAcrossRange(
+  planRow: TrainingPlan,
+  rows: Workout[],
+  from: string,
+  to: string,
+): CalendarEvent[] {
+  const byDay = new Map<number, Workout[]>();
+  for (const row of rows) {
+    const list = byDay.get(row.dayIndex) ?? [];
+    list.push(row);
+    byDay.set(row.dayIndex, list);
+  }
+  for (const list of byDay.values()) {
+    list.sort((a, b) => (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
+  }
+
+  const events: CalendarEvent[] = [];
+  for (let cursor = parseDateOnly(from); cursor <= parseDateOnly(to); cursor = addDays(cursor, 1)) {
+    const date = localDateString(cursor);
+    const dayIndex = circularDayIndex(String(planRow.weekStartDate), date);
+    for (const row of byDay.get(dayIndex) ?? []) {
+      events.push(workoutToCalendarEvent(row, date));
+    }
+  }
+  return events;
+}
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+}
+
+function readRawActivityName(raw: unknown): string | null {
+  const obj = readObject(raw);
+  const name = obj?.name ?? obj?.activityName;
+  return typeof name === 'string' && name.trim() ? name.trim() : null;
+}
+
+function activityToCalendarEvent(
+  activity: NormalizedActivity,
+  raw: unknown,
+): CalendarEvent {
+  const date = activity.startTimeLocal
+    ? localDateString(activity.startTimeLocal)
+    : localDateString(new Date());
+  const title = readRawActivityName(raw) ?? activity.type;
+  return {
+    id: `activity:${activity.region}:${String(activity.activityId)}`,
+    kind: 'garmin_activity',
+    date,
+    startTimeLocal: activity.startTimeLocal ? activity.startTimeLocal.toISOString() : null,
+    title,
+    sport: activity.sport,
+    source: 'garmin',
+    planId: null,
+    workoutId: null,
+    activityId: activity.activityId,
+    region: activity.region,
+    status: null,
+    slotIndex: null,
+    sessionLabel: null,
+    durationMinutes: Math.round(activity.durationMin),
+    distanceKm: activity.distanceKm,
+    intensity: null,
+    targetMetric: null,
+    targetHeartRate: null,
+    targetPace: null,
+    targetPower: null,
+    workoutStructure: null,
+    targets: null,
+    metrics: {
+      averageHr: activity.averageHr,
+      maxHr: activity.maxHr,
+      trainingLoad: activity.trainingLoad,
+      aerobicTrainingEffect: activity.aerobicTrainingEffect,
+      anaerobicTrainingEffect: activity.anaerobicTrainingEffect,
+      averagePower: activity.averagePower,
+      averagePaceSecPerKm: activity.averagePaceSecPerKm,
+      averagePaceSecPer100m: activity.averagePaceSecPer100m,
+    },
+  };
+}
+
+async function loadActivityEvents(
+  userId: string,
+  from: string,
+  to: string,
+): Promise<{
+  events: CalendarEvent[];
+  sources: CalendarActivitySourceStatus[];
+}> {
+  const byActivity = new Map<string, { activity: NormalizedActivity; raw: unknown }>();
+  const rows = await db
+    .select()
+    .from(activityCache)
+    .where(eq(activityCache.userId, userId));
+
+  for (const row of rows) {
+    const raw = readObject(row.data)
+      ? { ...(row.data as Record<string, unknown>), region: row.region, activityId: row.activityId }
+      : row.data;
+    const activity = normalizeActivity(raw);
+    if (!activity?.startTimeLocal) continue;
+    const date = localDateString(activity.startTimeLocal);
+    if (date < from || date > to) continue;
+    byActivity.set(`${activity.region}:${String(activity.activityId)}`, { activity, raw });
+  }
+
+  const live = await fetchCalendarActivities(userId, {
+    days: Math.max(daysBetweenInclusive(from, to) + 2, 62),
+    limit: 160,
+  });
+  for (const raw of live.activities) {
+    const activity = normalizeActivity(raw);
+    if (!activity?.startTimeLocal) continue;
+    const date = localDateString(activity.startTimeLocal);
+    if (date < from || date > to) continue;
+    byActivity.set(`${activity.region}:${String(activity.activityId)}`, { activity, raw });
+  }
+
+  return {
+    events: Array.from(byActivity.values()).map(({ activity, raw }) =>
+      activityToCalendarEvent(activity, raw),
+    ),
+    sources: [
+      { region: 'cn', count: live.cn.count, error: live.cn.error },
+      { region: 'global', count: live.global.count, error: live.global.error },
+    ],
+  };
+}
+
+function buildEvaluationPlaceholder(
+  plannedWorkoutIds: string[],
+  activityRefs: Array<{ region: 'cn' | 'global' | 'manual'; activityId: string }>,
+) {
+  return {
+    title: '训练评价已生成',
+    summary: '已记录这一天的实际运动，并与当天训练计划建立对比关系。详细评价模型稍后接入。',
+    plannedWorkoutCount: plannedWorkoutIds.length,
+    activityCount: activityRefs.length,
+  };
+}
+
+function evaluationToSummary(row: TrainingEvaluation): CalendarEvaluation {
+  const plannedWorkoutIds = row.plannedWorkoutIds ?? [];
+  const activityRefs = row.activityRefs ?? [];
+  const result =
+    row.result && typeof row.result === 'object'
+      ? (row.result as CalendarEvaluation['result'])
+      : buildEvaluationPlaceholder(plannedWorkoutIds, activityRefs);
+  return {
+    id: row.id,
+    date: String(row.evaluationDate),
+    planId: row.planId,
+    plannedWorkoutIds,
+    activityRefs,
+    status: row.status === 'pending' ? 'ready' : row.status,
+    result,
+    note: row.note,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+async function loadCalendarEvaluations(
+  userId: string,
+  from: string,
+  to: string,
+): Promise<CalendarEvaluation[]> {
+  const rows = await db
+    .select()
+    .from(trainingEvaluation)
+    .where(eq(trainingEvaluation.userId, userId))
+    .orderBy(desc(trainingEvaluation.createdAt));
+  return rows
+    .filter((row) => {
+      const date = String(row.evaluationDate);
+      return date >= from && date <= to;
+    })
+    .map(evaluationToSummary);
+}
+
+function planWorkoutsForDate(
+  planRow: TrainingPlan,
+  rows: Workout[],
+  date: string,
+): Workout[] {
+  const dayIndex = circularDayIndex(String(planRow.weekStartDate), date);
+  return rows
+    .filter((row) => row.dayIndex === dayIndex)
+    .sort((a, b) => (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
+}
+
+async function loadActiveCalendarPlan(
+  userId: string,
+): Promise<{ plan: TrainingPlan; workouts: Workout[] } | null> {
+  const cal = (
+    await db
+      .select()
+      .from(userCalendar)
+      .where(eq(userCalendar.userId, userId))
+      .limit(1)
+  )[0] ?? null;
+  if (!cal?.activePlanId) return null;
+
+  const planRow = await loadOwnedPlan(userId, cal.activePlanId);
+  if (!planRow) return null;
+  const rows: Workout[] = await db
+    .select()
+    .from(workout)
+    .where(eq(workout.planId, planRow.id))
+    .orderBy(asc(workout.dayIndex), asc(workout.slotIndex));
+  return { plan: planRow, workouts: rows };
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +965,244 @@ trainingRouter.get('/plans', requireUser, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/training/calendar
+// ---------------------------------------------------------------------------
+
+trainingRouter.get('/calendar', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const parsed = calendarQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    res.status(400).json({
+      error: 'invalid_input',
+      field: first?.path.join('.') ?? null,
+      reason: first?.message ?? 'invalid input',
+    });
+    return;
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const from = parsed.data.from ?? localDateString(addDays(today, -30));
+  const to = parsed.data.to ?? localDateString(addDays(today, 30));
+  if (from > to || daysBetweenInclusive(from, to) > 120) {
+    res.status(400).json({ error: 'invalid_date_range' });
+    return;
+  }
+
+  const events: CalendarEvent[] = [];
+  let activePlan: TrainingPlanSummary | null = null;
+
+  const active = await loadActiveCalendarPlan(userId);
+  if (active) {
+    activePlan = toPlanSummary(active.plan);
+    events.push(...expandPlanWorkoutsAcrossRange(active.plan, active.workouts, from, to));
+  }
+  const activityLoad = await loadActivityEvents(userId, from, to);
+  events.push(...activityLoad.events);
+
+  events.sort((a, b) => {
+    const dateCmp = a.date.localeCompare(b.date);
+    if (dateCmp !== 0) return dateCmp;
+    const sourceCmp = a.kind.localeCompare(b.kind);
+    if (sourceCmp !== 0) return sourceCmp;
+    return (a.slotIndex ?? 99) - (b.slotIndex ?? 99);
+  });
+  const evaluations = await loadCalendarEvaluations(userId, from, to);
+
+  res.json({
+    calendar: {
+      activePlan,
+      activePlanId: activePlan?.id ?? null,
+      from,
+      to,
+      activitySources: activityLoad.sources,
+    },
+    events,
+    evaluations,
+  });
+});
+
+trainingRouter.post('/calendar/evaluations', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const parsed = trainingEvaluationSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    res.status(400).json({
+      error: 'invalid_input',
+      field: first?.path.join('.') ?? null,
+      reason: first?.message ?? 'invalid input',
+    });
+    return;
+  }
+
+  const active = await loadActiveCalendarPlan(userId);
+  if (!active) {
+    res.status(409).json({ error: 'no_active_training_plan' });
+    return;
+  }
+
+  const activityLoad = await loadActivityEvents(userId, parsed.data.date, parsed.data.date);
+  const available = new Set(
+    activityLoad.events.map((event) => `${event.region}:${String(event.activityId)}`),
+  );
+  const requested = parsed.data.activityRefs.map((ref) => ({
+    region: ref.region,
+    activityId: ref.activityId,
+  }));
+  const invalid = requested.filter(
+    (ref) => !available.has(`${ref.region}:${ref.activityId}`),
+  );
+  if (invalid.length > 0) {
+    res.status(400).json({ error: 'invalid_activity_selection' });
+    return;
+  }
+
+  const plannedWorkoutIds = planWorkoutsForDate(
+    active.plan,
+    active.workouts,
+    parsed.data.date,
+  ).map((row) => row.id);
+  const result = buildEvaluationPlaceholder(plannedWorkoutIds, requested);
+  const now = new Date();
+  const row = (
+    await db
+      .insert(trainingEvaluation)
+      .values({
+        id: crypto.randomUUID(),
+        userId,
+        planId: active.plan.id,
+        evaluationDate: parsed.data.date,
+        plannedWorkoutIds,
+        activityRefs: requested,
+        status: 'ready',
+        result,
+        note: parsed.data.note ?? null,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning()
+  )[0];
+
+  res.json({ evaluation: evaluationToSummary(row) });
+});
+
+trainingRouter.delete('/calendar/active-plan', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  await db
+    .insert(userCalendar)
+    .values({
+      userId,
+      activePlanId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: userCalendar.userId,
+      set: { activePlanId: null, updatedAt: new Date() },
+    });
+  res.json({ activePlanId: null });
+});
+
+trainingRouter.post('/plans/:id/import-calendar', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const planId = String(req.params.id);
+  const planRow = await loadOwnedPlan(userId, planId);
+  if (!planRow) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  if (planRow.status !== 'ready') {
+    res.status(409).json({ error: 'plan_not_ready' });
+    return;
+  }
+
+  await db
+    .insert(userCalendar)
+    .values({
+      userId,
+      activePlanId: planId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: userCalendar.userId,
+      set: { activePlanId: planId, updatedAt: new Date() },
+    });
+
+  res.json({ activePlanId: planId, activePlan: toPlanSummary(planRow) });
+});
+
+trainingRouter.get('/plans/:id/garmin', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const planId = String(req.params.id);
+  const region = garminRegionSchema.safeParse(req.query.region ?? 'cn');
+  if (!region.success) {
+    res.status(400).json({ error: 'invalid_region' });
+    return;
+  }
+  try {
+    const status = await getPlanGarminStatus(userId, planId, region.data);
+    res.json({ status });
+  } catch (error) {
+    if ((error as Error).message === 'training_plan_not_found') {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    console.error('[training] garmin status failed:', (error as Error).message);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+trainingRouter.post('/plans/:id/garmin', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const planId = String(req.params.id);
+  const region = garminRegionSchema.safeParse(req.body?.region ?? req.query.region ?? 'cn');
+  if (!region.success) {
+    res.status(400).json({ error: 'invalid_region' });
+    return;
+  }
+  try {
+    const result = await pushPlanToGarmin(userId, planId, { region: region.data });
+    res.json(result);
+  } catch (error) {
+    const message = (error as Error).message;
+    if (message === 'training_plan_not_found') {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (message === 'training_plan_not_ready') {
+      res.status(409).json({ error: 'plan_not_ready' });
+      return;
+    }
+    console.error('[training] garmin push failed:', message);
+    res.status(500).json({ error: message });
+  }
+});
+
+trainingRouter.delete('/plans/:id/garmin', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const planId = String(req.params.id);
+  const region = garminRegionSchema.safeParse(req.query.region ?? 'cn');
+  if (!region.success) {
+    res.status(400).json({ error: 'invalid_region' });
+    return;
+  }
+  try {
+    const result = await deletePlanFromGarmin(userId, planId, { region: region.data });
+    res.json(result);
+  } catch (error) {
+    const message = (error as Error).message;
+    if (message === 'training_plan_not_found') {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    console.error('[training] garmin delete failed:', message);
+    res.status(500).json({ error: message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /api/training/plans/:id
 // ---------------------------------------------------------------------------
 
@@ -578,7 +1218,7 @@ trainingRouter.get('/plans/:id', requireUser, async (req, res) => {
     .select()
     .from(workout)
     .where(eq(workout.planId, planId))
-    .orderBy(asc(workout.dayIndex));
+    .orderBy(asc(workout.dayIndex), asc(workout.slotIndex));
   const messages: ChatMessage[] = await db
     .select()
     .from(chatMessage)
@@ -586,6 +1226,50 @@ trainingRouter.get('/plans/:id', requireUser, async (req, res) => {
     .orderBy(asc(chatMessage.createdAt))
     .limit(50);
   res.json({ plan: planRow, workouts, messages });
+});
+
+trainingRouter.get('/plans/:id/export/:format', requireUser, async (req, res) => {
+  const userId = (req as AuthedRequest).user.id;
+  const planId = String(req.params.id);
+  const format = String(req.params.format);
+  if (!['intervals_icu', 'word', 'pdf', 'excel'].includes(format)) {
+    res.status(400).json({ error: 'unsupported_format' });
+    return;
+  }
+  const planRow = await loadOwnedPlan(userId, planId);
+  if (!planRow) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  const workouts: Workout[] = await db
+    .select()
+    .from(workout)
+    .where(eq(workout.planId, planId))
+    .orderBy(asc(workout.dayIndex), asc(workout.slotIndex));
+
+  const stem = `training-plan-${String(planRow.weekStartDate)}`;
+  if (format === 'intervals_icu') {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${stem}-intervals-icu.txt"`);
+    res.send(renderIntervalsIcu(workouts));
+    return;
+  }
+  if (format === 'excel') {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${stem}.csv"`);
+    res.send(renderCsv(workouts));
+    return;
+  }
+  if (format === 'word') {
+    res.setHeader('Content-Type', 'application/msword; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${stem}.doc"`);
+    res.send(renderWordHtml(planRow, workouts));
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${stem}.pdf"`);
+  res.send(renderSimplePdf(renderPlainTextPlan(planRow, workouts)));
 });
 
 async function loadOwnedPlan(
@@ -598,6 +1282,122 @@ async function loadOwnedPlan(
     .where(and(eq(trainingPlan.id, planId), eq(trainingPlan.userId, userId)))
     .limit(1);
   return rows[0] ?? null;
+}
+
+function renderPlainTextPlan(planRow: TrainingPlan, workouts: Workout[]): string {
+  const lines = [`Garmin Trainer Plan ${String(planRow.weekStartDate)}`, ''];
+  for (const w of workouts) {
+    const session = w.sessionLabel ? ` ${w.sessionLabel}` : '';
+    lines.push(`D${w.dayIndex}${session} ${w.title}`);
+    lines.push(`Sport: ${w.sport}  Duration: ${w.durationMinutes ?? ''}min  Distance: ${w.distanceKm ?? ''}km`);
+    if (w.targetHeartRate && w.targetHeartRate !== '不适用') lines.push(`HR: ${w.targetHeartRate}`);
+    if (w.targetPace && w.targetPace !== '不适用') lines.push(`Pace: ${w.targetPace}`);
+    if (w.targetPower && w.targetPower !== '不适用') lines.push(`Power: ${w.targetPower}`);
+    if (w.workoutStructure) lines.push(w.workoutStructure);
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+function renderCsv(workouts: Workout[]): string {
+  const header = [
+    'date',
+    'dayIndex',
+    'slotIndex',
+    'session',
+    'sport',
+    'title',
+    'durationMinutes',
+    'distanceKm',
+    'targetMetric',
+    'targetHeartRate',
+    'targetPace',
+    'targetPower',
+    'structure',
+  ];
+  const rows = workouts.map((w) => [
+    String(w.date),
+    String(w.dayIndex),
+    String(w.slotIndex ?? 1),
+    w.sessionLabel ?? '',
+    w.sport,
+    w.title,
+    String(w.durationMinutes ?? ''),
+    String(w.distanceKm ?? ''),
+    w.targetMetric,
+    w.targetHeartRate ?? '',
+    w.targetPace ?? '',
+    w.targetPower ?? '',
+    w.workoutStructure ?? '',
+  ]);
+  return [header, ...rows].map((row) => row.map(csvCell).join(',')).join('\n');
+}
+
+function csvCell(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function renderWordHtml(planRow: TrainingPlan, workouts: Workout[]): string {
+  const rows = workouts
+    .map(
+      (w) => `<tr><td>${escapeHtml(String(w.date))}</td><td>${w.dayIndex}.${w.slotIndex ?? 1}</td><td>${escapeHtml(w.sessionLabel ?? '')}</td><td>${escapeHtml(w.sport)}</td><td>${escapeHtml(w.title)}</td><td>${escapeHtml(w.targetHeartRate ?? '')}</td><td>${escapeHtml(w.targetPace ?? '')}</td><td>${escapeHtml(w.targetPower ?? '')}</td><td>${escapeHtml(w.workoutStructure ?? '')}</td></tr>`,
+    )
+    .join('');
+  return `<!doctype html><html><head><meta charset="utf-8"><style>body{font-family:Arial,"Microsoft YaHei",sans-serif}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px;font-size:12px}th{background:#eee}</style></head><body><h1>训练计划 ${escapeHtml(String(planRow.weekStartDate))}</h1><table><thead><tr><th>日期</th><th>课次</th><th>时段</th><th>项目</th><th>训练</th><th>心率</th><th>配速</th><th>功率</th><th>结构</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderSimplePdf(text: string): Buffer {
+  const safeLines = text
+    .split('\n')
+    .slice(0, 80)
+    .map((line) => line.slice(0, 95));
+  const content = ['BT', '/F1 10 Tf', '50 780 Td'];
+  safeLines.forEach((line, i) => {
+    if (i > 0) content.push('0 -14 Td');
+    content.push(`<${toUtf16BeHex(line)}> Tj`);
+  });
+  content.push('ET');
+  const stream = content.join('\n');
+  const objects = [
+    '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj',
+    '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj',
+    '3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj',
+    '4 0 obj << /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [6 0 R] >> endobj',
+    `5 0 obj << /Length ${Buffer.byteLength(stream, 'ascii')} >> stream\n${stream}\nendstream endobj`,
+    '6 0 obj << /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> /FontDescriptor 7 0 R >> endobj',
+    '7 0 obj << /Type /FontDescriptor /FontName /STSong-Light /Flags 4 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 >> endobj',
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  for (const obj of objects) {
+    offsets.push(Buffer.byteLength(pdf, 'ascii'));
+    pdf += obj + '\n';
+  }
+  const xref = Buffer.byteLength(pdf, 'ascii');
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= objects.length; i += 1) {
+    pdf += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(pdf, 'ascii');
+}
+
+function toUtf16BeHex(value: string): string {
+  const le = Buffer.from(value, 'utf16le');
+  const be = Buffer.alloc(le.length);
+  for (let i = 0; i < le.length; i += 2) {
+    be[i] = le[i + 1];
+    be[i + 1] = le[i];
+  }
+  return be.toString('hex').toUpperCase();
 }
 
 // ---------------------------------------------------------------------------
@@ -644,14 +1444,30 @@ trainingRouter.post(
 
     try {
       const ctx = await loadDerivedContext(userId, request, emitToolEv);
-      const schedule = buildWeeklySchedule({
+      let schedule = buildWeeklySchedule({
         request,
         athleteProfile: ctx.athleteProfile,
         recentState: ctx.recentState,
       });
+      schedule = expandMultiSessionSchedule(schedule, request, ctx.athleteProfile, ctx.recentState);
 
       const dayIndex = parsed.data.dayIndex;
-      const entry = schedule.days[dayIndex - 1];
+      const slotIndex = parsed.data.slotIndex ?? 1;
+      const existing: Workout[] = await db
+        .select()
+        .from(workout)
+        .where(eq(workout.planId, planId))
+        .orderBy(asc(workout.dayIndex), asc(workout.slotIndex));
+      const before = existing.find(
+        (row) => row.dayIndex === dayIndex && (row.slotIndex ?? 1) === slotIndex,
+      );
+      if (!before) {
+        clearInterval(heartbeat);
+        endSse(res, 'error', { error: 'workout_slot_not_found' });
+        return;
+      }
+      const entry = schedule.days.find((d) => d.dayIndex === dayIndex && (d.slotIndex ?? 1) === slotIndex) ??
+        workoutRowToScheduleEntry(before);
       if (!entry) {
         clearInterval(heartbeat);
         endSse(res, 'error', { error: 'day_not_found' });
@@ -680,6 +1496,7 @@ trainingRouter.post(
         request: {
           targetMetricPreference: request.targetMetricPreference,
           availableTime: request.availableTime,
+          dailyPreferredMinutes: request.dailyPreferredMinutes,
         },
         scheduleEntry: entry,
         progression,
@@ -694,14 +1511,9 @@ trainingRouter.post(
       });
 
       // Build the existing workouts array for whole-week validation.
-      const existing: Workout[] = await db
-        .select()
-        .from(workout)
-        .where(eq(workout.planId, planId))
-        .orderBy(asc(workout.dayIndex));
-
       const workoutsForValidation: ParameterizedWorkout[] = existing.map((row) =>
         row.dayIndex === dayIndex
+          && (row.slotIndex ?? 1) === slotIndex
           ? w
           : workoutRowToParameterized(row),
       );
@@ -717,6 +1529,7 @@ trainingRouter.post(
       const violations = validatePlan({
         schedule: existing.map((row, i) =>
           row.dayIndex === dayIndex
+            && (row.slotIndex ?? 1) === slotIndex
             ? entry
             : {
                 dayIndex: row.dayIndex,
@@ -724,6 +1537,9 @@ trainingRouter.post(
                 dayLabel: '周' + '一二三四五六日'[row.dayIndex - 1],
                 sport: row.sport as ScheduleEntry['sport'],
                 templateId: row.templateId,
+                slotIndex: row.slotIndex ?? 1,
+                sessionLabel: row.sessionLabel ?? undefined,
+                timeOfDay: (row.timeOfDay as ScheduleEntry['timeOfDay']) ?? undefined,
               },
         ),
         workouts: workoutsForValidation,
@@ -754,6 +1570,8 @@ trainingRouter.post(
         .update(workout)
         .set({
           sport: row.sport,
+          sessionLabel: row.sessionLabel,
+          timeOfDay: row.timeOfDay,
           templateId: row.templateId,
           workoutType: row.workoutType,
           title: row.title,
@@ -769,9 +1587,9 @@ trainingRouter.post(
           parameterSource: row.parameterSource,
           adaptation: row.adaptation,
         })
-        .where(and(eq(workout.planId, planId), eq(workout.dayIndex, dayIndex)));
+        .where(and(eq(workout.id, before.id), eq(workout.planId, planId)));
 
-      writeEvent(res, 'workout', { workout: w, dayIndex });
+      writeEvent(res, 'workout', { workout: w, dayIndex, slotIndex });
       if (violations.length > 0) {
         writeEvent(res, 'violations', { violations });
       }
@@ -792,7 +1610,7 @@ trainingRouter.post(
       }
 
       clearInterval(heartbeat);
-      endSse(res, 'done', { planId, dayIndex });
+      endSse(res, 'done', { planId, dayIndex, slotIndex });
     } catch (err) {
       console.error('[training] regenerate-day failed:', (err as Error).message);
       clearInterval(heartbeat);
@@ -826,6 +1644,19 @@ function workoutRowToParameterized(row: Workout): ParameterizedWorkout {
       replacedVariables: {},
     },
     adaptation: row.adaptation ?? '',
+  };
+}
+
+function workoutRowToScheduleEntry(row: Workout): ScheduleEntry {
+  return {
+    dayIndex: row.dayIndex,
+    date: String(row.date),
+    dayLabel: '周' + '一二三四五六日'[row.dayIndex - 1],
+    sport: row.sport as ScheduleEntry['sport'],
+    templateId: row.templateId,
+    slotIndex: row.slotIndex ?? 1,
+    sessionLabel: row.sessionLabel ?? undefined,
+    timeOfDay: (row.timeOfDay as ScheduleEntry['timeOfDay']) ?? undefined,
   };
 }
 
@@ -987,7 +1818,7 @@ trainingRouter.post(
         .select()
         .from(workout)
         .where(eq(workout.planId, planId))
-        .orderBy(asc(workout.dayIndex));
+        .orderBy(asc(workout.dayIndex), asc(workout.slotIndex));
 
       // History, oldest first, capped at 50 (NOT counting the just-inserted
       // user message — runChatTurn appends the user message itself).
@@ -1187,24 +2018,42 @@ async function dispatchChatToolCall(
 
   if (call.name === 'regenerate_day') {
     const dayIndex = call.arguments.dayIndex;
-    const before = workoutsSnapshot.find((w) => w.dayIndex === dayIndex);
+    const explicitWorkoutId = call.arguments.workoutId;
+    const explicitSlotIndex = call.arguments.slotIndex;
+    const candidates = workoutsSnapshot.filter((w) => w.dayIndex === dayIndex);
+    const before = explicitWorkoutId
+      ? candidates.find((w) => w.id === explicitWorkoutId)
+      : explicitSlotIndex !== undefined
+        ? candidates.find((w) => (w.slotIndex ?? 1) === explicitSlotIndex)
+        : candidates.length === 1
+          ? candidates[0]
+          : undefined;
     if (!before) {
+      if (candidates.length > 1 && explicitWorkoutId === undefined && explicitSlotIndex === undefined) {
+        return {
+          toolResult: JSON.stringify({
+            error: `day ${dayIndex} has multiple workouts; specify slotIndex or workoutId`,
+            candidates: candidates.map((w) => ({
+              workoutId: w.id,
+              slotIndex: w.slotIndex ?? 1,
+              sessionLabel: w.sessionLabel,
+              title: w.title,
+            })),
+          }),
+        };
+      }
       return {
         toolResult: JSON.stringify({
-          error: `day ${dayIndex} not found in current plan`,
+          error: explicitWorkoutId
+            ? `workout ${explicitWorkoutId} not found on day ${dayIndex}`
+            : `day ${dayIndex} slot ${explicitSlotIndex ?? 1} not found in current plan`,
         }),
       };
     }
 
     // Build a ScheduleEntry from the existing workout row so we can re-run
     // the parameterizer in place (without re-running the weekly scheduler).
-    const entry: ScheduleEntry = {
-      dayIndex: before.dayIndex,
-      date: String(before.date),
-      dayLabel: '周' + '一二三四五六日'[before.dayIndex - 1],
-      sport: before.sport as ScheduleEntry['sport'],
-      templateId: before.templateId,
-    };
+    const entry = workoutRowToScheduleEntry(before);
 
     const tpl = getTemplate(before.templateId) ?? getTemplate('rest.full.v1');
     if (!tpl) {
@@ -1231,6 +2080,7 @@ async function dispatchChatToolCall(
         request: {
           targetMetricPreference: request.targetMetricPreference,
           availableTime: request.availableTime,
+          dailyPreferredMinutes: request.dailyPreferredMinutes,
         },
         scheduleEntry: entry,
         progression,
@@ -1244,6 +2094,7 @@ async function dispatchChatToolCall(
           request: {
             targetMetricPreference: request.targetMetricPreference,
             availableTime: request.availableTime,
+            dailyPreferredMinutes: request.dailyPreferredMinutes,
           },
           scheduleEntry: entry,
           progression,
@@ -1276,6 +2127,7 @@ async function dispatchChatToolCall(
           request: {
             targetMetricPreference: request.targetMetricPreference,
             availableTime: request.availableTime,
+            dailyPreferredMinutes: request.dailyPreferredMinutes,
           },
           scheduleEntry: entry,
           progression,
@@ -1289,6 +2141,8 @@ async function dispatchChatToolCall(
         .update(workout)
         .set({
           sport: row.sport,
+          sessionLabel: row.sessionLabel,
+          timeOfDay: row.timeOfDay,
           templateId: row.templateId,
           workoutType: row.workoutType,
           title: row.title,
@@ -1304,7 +2158,7 @@ async function dispatchChatToolCall(
           parameterSource: row.parameterSource,
           adaptation: row.adaptation,
         })
-        .where(and(eq(workout.planId, planId), eq(workout.dayIndex, dayIndex)))
+        .where(and(eq(workout.id, before.id), eq(workout.planId, planId)))
         .returning()
     )[0];
 
@@ -1320,6 +2174,7 @@ async function dispatchChatToolCall(
       toolResult: JSON.stringify({
         ok: true,
         dayIndex,
+        slotIndex: before.slotIndex ?? 1,
         workout: parameterized,
       }),
       updatedWorkout: updated,

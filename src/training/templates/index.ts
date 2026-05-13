@@ -100,6 +100,7 @@ export interface FilterRecentState {
 export interface FilterRequest {
   sports?: Partial<Record<Sport, boolean>>;
   maxHardSessionsPerWeek?: number;
+  allowAdvancedWorkouts?: boolean;
 }
 
 export interface FilterArgs {
@@ -126,6 +127,7 @@ export function filterAllowedTemplates(args: FilterArgs): WorkoutTemplate[] {
 
   const maxHard = request.maxHardSessionsPerWeek ?? DEFAULT_MAX_HARD_SESSIONS_PER_WEEK;
   const hardCapReached = hardSessionsAlreadyScheduledThisWeek >= maxHard;
+  const allowAdvancedWorkouts = request.allowAdvancedWorkouts === true;
 
   const sportConfidence = getSportConfidence(athleteProfile, sport);
   const injuries = (athleteProfile.injuries ?? []).map((i) => i.toLowerCase());
@@ -140,6 +142,7 @@ export function filterAllowedTemplates(args: FilterArgs): WorkoutTemplate[] {
       injuries,
       ftpAvailable:
         athleteProfile.cycling?.ftpWatts != null && athleteProfile.cycling.ftpWatts > 0,
+      allowAdvancedWorkouts,
     }),
   );
 }
@@ -161,9 +164,14 @@ interface AllowContext {
   sportConfidence: 'low' | 'medium' | 'high' | undefined;
   injuries: string[];
   ftpAvailable: boolean;
+  allowAdvancedWorkouts: boolean;
 }
 
 function isAllowed(tpl: WorkoutTemplate, ctx: AllowContext): boolean {
+  if (!ctx.allowAdvancedWorkouts && isAdvancedTemplate(tpl)) {
+    return false;
+  }
+
   // FTP-required template gate: bike.sweet_spot / bike.over_under demand FTP
   // unless data confidence is high. We block them when FTP is missing AND
   // confidence is anything but 'high' — the spec's "无 FTP 且没有稳定骑行训练历史"
@@ -180,6 +188,22 @@ function isAllowed(tpl: WorkoutTemplate, ctx: AllowContext): boolean {
     if (matchContraindication(c, ctx)) return false;
   }
   return true;
+}
+
+function isAdvancedTemplate(tpl: WorkoutTemplate): boolean {
+  const type = tpl.fixed.workoutType;
+  return (
+    type === 'vo2max' ||
+    type === 'interval' ||
+    type === 'anaerobic' ||
+    type === 'sprint' ||
+    type === 'hill' ||
+    type === 'race_pace' ||
+    type === 'climb' ||
+    type === 'over_under' ||
+    type === 'open_water' ||
+    type === 'double_threshold'
+  );
 }
 
 function matchContraindication(c: Contraindication, ctx: AllowContext): boolean {

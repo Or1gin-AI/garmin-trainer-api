@@ -56,6 +56,12 @@ export interface ScheduleRequest {
   sports: Record<ActiveSport, boolean>; // {running, cycling, swimming}
   sportPriorities?: Sport[]; // optional ordering
   preferredKeyWorkoutDays?: string[];
+  preferredTrainingWindows?: string[];
+  dailyPreferredMinutes?: number | null;
+  expectedLoad?: number | null;
+  allowAdvancedWorkouts?: boolean;
+  allowDoubleDays?: boolean;
+  exportFormats?: Array<'intervals_icu' | 'word' | 'pdf' | 'excel'>;
   maxHardSessionsPerWeek: number | null;
   targetMetricPreference: 'auto' | 'heart_rate' | 'pace';
 }
@@ -66,11 +72,14 @@ export interface ScheduleEntry {
   dayLabel: string; // '周一' to '周日'
   sport: Sport;
   templateId: string;
+  slotIndex?: number; // 1 = first session, 2 = second session on same date.
+  sessionLabel?: string;
+  timeOfDay?: 'morning' | 'midday' | 'afternoon' | 'evening';
   reason?: string;
 }
 
 export interface ScheduleResult {
-  days: ScheduleEntry[]; // length === 7
+  days: ScheduleEntry[]; // normally 7 entries; can exceed 7 for double days.
   notes: string[];
 }
 
@@ -168,6 +177,12 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
   } else if (recentState.fatigue === 'tired') {
     notes.push('已有疲劳，本周第一次训练以轻松课开局。');
   }
+  if (request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0) {
+    notes.push(`单次训练尽量靠近 ${request.dailyPreferredMinutes} 分钟。`);
+  }
+  if (request.preferredTrainingWindows && request.preferredTrainingWindows.length > 0) {
+    notes.push(`优先使用偏好时段：${request.preferredTrainingWindows.join('、')}。`);
+  }
 
   // First pass: pick templates per training day.
   const days = new Array<ScheduleEntry | null>(7).fill(null);
@@ -216,6 +231,8 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
       dayLabel: DAY_LABELS[dayIndex - 1],
       sport,
       templateId: pick.templateId,
+      slotIndex: 1,
+      timeOfDay: chooseTimeOfDay(request, dayIndex),
       reason: pick.reason,
     };
 
@@ -393,6 +410,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
     request: {
       sports: input.request.sports as Partial<Record<Sport, boolean>>,
       maxHardSessionsPerWeek: input.hardCap,
+      allowAdvancedWorkouts: input.request.allowAdvancedWorkouts,
     },
     hardSessionsAlreadyScheduledThisWeek: input.hardScheduled,
   });
@@ -610,6 +628,26 @@ function buildRestEntry(
         ? '完全休息日。'
         : '低强度活动恢复。',
   };
+}
+
+function chooseTimeOfDay(
+  request: ScheduleRequest,
+  dayIndex: number,
+): ScheduleEntry['timeOfDay'] | undefined {
+  const windows = request.preferredTrainingWindows ?? [];
+  if (windows.length === 0) return undefined;
+  const raw = windows[(dayIndex - 1) % windows.length] ?? '';
+  return parseTrainingWindow(raw);
+}
+
+function parseTrainingWindow(raw: string): ScheduleEntry['timeOfDay'] | undefined {
+  const value = raw.trim().toLowerCase();
+  if (!value) return undefined;
+  if (/早|晨|上午|morning|am|a\.m\./i.test(value)) return 'morning';
+  if (/中午|午间|midday|noon/i.test(value)) return 'midday';
+  if (/下午|afternoon|pm|p\.m\./i.test(value)) return 'afternoon';
+  if (/晚|夜|evening|night/i.test(value)) return 'evening';
+  return undefined;
 }
 
 function buildAllRestWeek(

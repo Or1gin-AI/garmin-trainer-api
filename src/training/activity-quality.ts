@@ -13,9 +13,14 @@ export type Confidence = 'high' | 'medium' | 'low';
 export type QualityFlag =
   | 'no_heart_rate'
   | 'cycling_high_speed_low_hr'
+  | 'running_fast_low_hr'
+  | 'running_far_above_baseline_low_hr'
+  | 'running_power_pace_mismatch'
+  | 'running_economy_mismatch'
   | 'distance_without_physiology'
   | 'long_distance_no_training_load'
   | 'speed_inconsistent_with_hr'
+  | 'implausible_distance_duration'
   | 'type_benefit_mismatch';
 
 export interface QualityResult {
@@ -29,6 +34,11 @@ export interface QualityContext {
   // to disable the personal-baseline check (we still apply the absolute
   // 12 m/s ≈ 43 km/h floor).
   cyclingMedianSpeedMps?: number | null;
+  // User's typical recent running pace (s/km). Used to catch transportation
+  // or GPS errors that are fast relative to the athlete but do not carry a
+  // corresponding cardiovascular / biomechanical signature.
+  runningMedianPaceSecPerKm?: number | null;
+  runningMedianPowerWatts?: number | null;
 }
 
 // Substring patterns hinting that Garmin labelled the activity "no training
@@ -51,7 +61,72 @@ export function classifyActivityQuality(
 ): QualityResult {
   const flags: QualityFlag[] = [];
 
-  // ---- 1) cycling: implausibly high speed paired with very low HR ---------
+  // ---- 0) physically implausible distance / duration ---------------------
+  if (activity.durationMin > 0 && activity.distanceKm > 0) {
+    const speedMps = (activity.distanceKm * 1000) / (activity.durationMin * 60);
+    if (activity.sport === 'running' && speedMps > 8.5) {
+      flags.push('implausible_distance_duration');
+    }
+    if (activity.sport === 'cycling' && speedMps > 25) {
+      flags.push('implausible_distance_duration');
+    }
+  }
+
+  // ---- 1) running: fast pace without matching HR / mechanics -------------
+  if (activity.sport === 'running' && activity.averagePaceSecPerKm !== null) {
+    const pace = activity.averagePaceSecPerKm;
+    const hr = activity.averageHr;
+    const personalMedian = historicalContext?.runningMedianPaceSecPerKm;
+    const personalPower = historicalContext?.runningMedianPowerWatts;
+
+    if (pace < 210 && (hr === null || hr < 130) && activity.durationMin >= 10) {
+      flags.push('running_fast_low_hr');
+    }
+
+    if (
+      personalMedian != null &&
+      personalMedian > 0 &&
+      pace < personalMedian * 0.78 &&
+      (hr === null || hr < 145) &&
+      activity.durationMin >= 10
+    ) {
+      flags.push('running_far_above_baseline_low_hr');
+    }
+
+    if (
+      personalMedian != null &&
+      personalMedian > 0 &&
+      personalPower != null &&
+      personalPower > 0 &&
+      activity.averagePower !== null &&
+      pace < personalMedian * 0.85 &&
+      activity.averagePower < personalPower * 0.75
+    ) {
+      flags.push('running_power_pace_mismatch');
+    }
+
+    // Running dynamics are optional, but when present they should not
+    // contradict a very fast performance. High ground contact time / vertical
+    // oscillation paired with unusually fast pace suggests bad GPS / treadmill
+    // calibration or a non-representative activity.
+    const gct = activity.groundContactTime;
+    const vo = normalizeVerticalOscillationCm(activity.verticalOscillation);
+    const verticalRatio = activity.verticalRatio;
+    const economyLooksPoor =
+      (gct !== null && gct > 330) ||
+      (vo !== null && vo > 12.5) ||
+      (verticalRatio !== null && verticalRatio > 11.5);
+    if (
+      economyLooksPoor &&
+      personalMedian != null &&
+      personalMedian > 0 &&
+      pace < personalMedian * 0.88
+    ) {
+      flags.push('running_economy_mismatch');
+    }
+  }
+
+  // ---- 2) cycling: implausibly high speed paired with very low HR ---------
   // The cofounder spec calls out this case explicitly: "骑行平均速度远高于
   // 用户历史水平，且心率很低" — typical false positive is the user forgot
   // to stop the watch on a train / car ride.
@@ -74,7 +149,7 @@ export function classifyActivityQuality(
     }
   }
 
-  // ---- 2) cycling: long ride but no/low training load --------------------
+  // ---- 3) cycling: long ride but no/low training load --------------------
   if (
     activity.sport === 'cycling' &&
     activity.distanceKm > 50 &&
@@ -83,7 +158,7 @@ export function classifyActivityQuality(
     flags.push('long_distance_no_training_load');
   }
 
-  // ---- 3) distance recorded but no physiological signal at all -----------
+  // ---- 4) distance recorded but no physiological signal at all -----------
   // Pure GPS trace with no HR / power / cadence is almost always a transit
   // log or a forgotten timer. Discount it from fitness derivation.
   if (
@@ -95,7 +170,7 @@ export function classifyActivityQuality(
     flags.push('distance_without_physiology');
   }
 
-  // ---- 4) no HR + no Garmin training metrics at all ----------------------
+  // ---- 5) no HR + no Garmin training metrics at all ----------------------
   // Soft flag: the activity might still be usable (e.g., a treadmill run
   // logged manually) but we can't trust it for HR-zone derivation.
   if (
@@ -109,7 +184,7 @@ export function classifyActivityQuality(
     }
   }
 
-  // ---- 5) type / benefit mismatch ----------------------------------------
+  // ---- 6) type / benefit mismatch ----------------------------------------
   // Garmin saying "no training effect" while the user logged it as cycling /
   // running suggests the device didn't actually see meaningful effort.
   const benefitText = `${lower(activity.primaryBenefit)} ${lower(
@@ -122,7 +197,7 @@ export function classifyActivityQuality(
     flags.push('type_benefit_mismatch');
   }
 
-  // ---- 6) speed inconsistent with HR (cycling broad case) ----------------
+  // ---- 7) speed inconsistent with HR (cycling broad case) ----------------
   // Looser version of (1): cycling with elevated speed but resting-level HR
   // even when below the absolute threshold — only triggers when Garmin
   // didn't already give us a load.
@@ -144,15 +219,27 @@ export function classifyActivityQuality(
 function deriveConfidence(flags: QualityFlag[]): Confidence {
   const hard = new Set<QualityFlag>([
     'cycling_high_speed_low_hr',
+    'running_fast_low_hr',
+    'running_far_above_baseline_low_hr',
     'distance_without_physiology',
     'long_distance_no_training_load',
+    'implausible_distance_duration',
   ]);
   if (flags.some((f) => hard.has(f))) return 'low';
   const soft = new Set<QualityFlag>([
     'no_heart_rate',
+    'running_power_pace_mismatch',
+    'running_economy_mismatch',
     'speed_inconsistent_with_hr',
     'type_benefit_mismatch',
   ]);
   if (flags.some((f) => soft.has(f))) return 'medium';
   return 'high';
+}
+
+function normalizeVerticalOscillationCm(value: number | null): number | null {
+  if (value === null || !Number.isFinite(value) || value <= 0) return null;
+  // Garmin endpoints may expose vertical oscillation in mm or cm. Treat
+  // values above 30 as millimeters and normalize to centimeters.
+  return value > 30 ? value / 10 : value;
 }

@@ -19,6 +19,7 @@ export interface NormalizedActivity {
   distanceKm: number;
   durationMin: number;
   averageHr: number | null;
+  maxHr: number | null;
   averagePaceSecPerKm: number | null;
   averagePaceSecPer100m: number | null;
   trainingLoad: number | null;
@@ -29,7 +30,22 @@ export interface NormalizedActivity {
   averageSpeed: number | null; // m/s
   averagePower: number | null;
   normalizedPower: number | null;
+  maxPower: number | null;
   averageCadence: number | null;
+  maxCadence: number | null;
+  groundContactTime: number | null; // ms
+  verticalOscillation: number | null; // cm, Garmin commonly reports mm/cm depending on endpoint
+  verticalRatio: number | null; // %
+  strideLength: number | null; // m
+  vo2Max: number | null;
+  lactateThresholdHr: number | null;
+  lactateThresholdPaceSecPerKm: number | null;
+  trainingStatus: string | null;
+  hrvStatus: string | null;
+  sleepDurationHours: number | null;
+  sleepScore: number | null;
+  recoveryTimeHours: number | null;
+  heartRateZones: Array<[number, number]>;
   elevationGain: number | null;
   deviceName: string | null;
 }
@@ -102,6 +118,20 @@ function readString(value: unknown): string | null {
   return s.length > 0 ? s : null;
 }
 
+function readHeartRateZones(value: unknown): Array<[number, number]> {
+  if (!Array.isArray(value)) return [];
+  const zones: Array<[number, number]> = [];
+  for (const item of value) {
+    if (!Array.isArray(item) || item.length < 2) continue;
+    const low = readNumber(item[0]);
+    const high = readNumber(item[1]);
+    if (low !== null && high !== null && high > low) {
+      zones.push([Math.round(low), Math.round(high)]);
+    }
+  }
+  return zones;
+}
+
 function readDate(value: unknown): Date | null {
   if (value === null || value === undefined || value === '') return null;
   if (value instanceof Date) {
@@ -161,6 +191,12 @@ export function normalizeActivity(raw: unknown): NormalizedActivity | null {
     averagePaceSecPerKm = Math.round(minPerKm * 60);
   }
 
+  const lactateThresholdPaceMinPerKm = readNumber(obj.lactateThresholdPaceMinPerKm);
+  const lactateThresholdPaceSecPerKm =
+    lactateThresholdPaceMinPerKm !== null && lactateThresholdPaceMinPerKm > 0
+      ? Math.round(lactateThresholdPaceMinPerKm * 60)
+      : null;
+
   // Swimming pace per 100m: only derive if it's a swim with both distance and
   // duration. Garmin's averagePaceMinPerKm is meaningless for pool swims.
   let averagePaceSecPer100m: number | null = null;
@@ -181,6 +217,7 @@ export function normalizeActivity(raw: unknown): NormalizedActivity | null {
     distanceKm,
     durationMin,
     averageHr: readNumber(obj.averageHr),
+    maxHr: readNumber(obj.maxHr),
     averagePaceSecPerKm,
     averagePaceSecPer100m,
     trainingLoad: readNumber(obj.trainingLoad),
@@ -191,7 +228,22 @@ export function normalizeActivity(raw: unknown): NormalizedActivity | null {
     averageSpeed: readNumber(obj.averageSpeed),
     averagePower: readNumber(obj.averagePower),
     normalizedPower: readNumber(obj.normalizedPower),
+    maxPower: readNumber(obj.maxPower),
     averageCadence: readNumber(obj.averageCadence),
+    maxCadence: readNumber(obj.maxCadence),
+    groundContactTime: readNumber(obj.groundContactTime),
+    verticalOscillation: readNumber(obj.verticalOscillation),
+    verticalRatio: readNumber(obj.verticalRatio),
+    strideLength: readNumber(obj.strideLength),
+    vo2Max: readNumber(obj.vo2Max),
+    lactateThresholdHr: readNumber(obj.lactateThresholdHr),
+    lactateThresholdPaceSecPerKm,
+    trainingStatus: readString(obj.trainingStatus),
+    hrvStatus: readString(obj.hrvStatus),
+    sleepDurationHours: readNumber(obj.sleepDurationHours),
+    sleepScore: readNumber(obj.sleepScore),
+    recoveryTimeHours: readNumber(obj.recoveryTimeHours),
+    heartRateZones: readHeartRateZones(obj.heartRateZones),
     elevationGain: readNumber(obj.elevationGain),
     deviceName: readString(obj.deviceName),
   };

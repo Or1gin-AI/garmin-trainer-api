@@ -45,7 +45,7 @@ export class ChatLlmNotConfiguredError extends Error {
 export type ToolCall =
   | {
       name: 'regenerate_day';
-      arguments: { dayIndex: number; reason: string };
+      arguments: { dayIndex: number; reason: string; slotIndex?: number; workoutId?: string };
     }
   | {
       name: 'update_workout_field';
@@ -272,7 +272,7 @@ function buildToolDefs(): ChatCompletionTool[] {
       function: {
         name: TOOL_REGEN,
         description:
-          '为本周第 dayIndex 天（1=周一，7=周日）重新生成训练课。reason 用中文一句说明用户的诉求或调整原因。',
+          '为本周第 dayIndex 天（1=周一，7=周日）重新生成训练课。同一天有多课时必须带 slotIndex 或 workoutId。reason 用中文一句说明用户的诉求或调整原因。',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -283,6 +283,16 @@ function buildToolDefs(): ChatCompletionTool[] {
               minimum: 1,
               maximum: 7,
               description: '需要重新生成的本周天数 (1..7)',
+            },
+            slotIndex: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 3,
+              description: '同一天多课时的课次编号；默认 1',
+            },
+            workoutId: {
+              type: 'string',
+              description: '若上下文中有 workoutId，优先用它精确指定要重生成的训练课',
             },
             reason: {
               type: 'string',
@@ -345,6 +355,8 @@ function parseToolCall(name: string, argsBuffer: string): ParseResult {
   if (name === TOOL_REGEN) {
     const dayIndex = obj.dayIndex;
     const reason = obj.reason;
+    const slotIndex = obj.slotIndex;
+    const workoutId = obj.workoutId;
     if (
       typeof dayIndex !== 'number' ||
       !Number.isInteger(dayIndex) ||
@@ -359,9 +371,29 @@ function parseToolCall(name: string, argsBuffer: string): ParseResult {
     if (typeof reason !== 'string' || reason.length === 0) {
       return { kind: 'error', message: `${name}: reason must be a non-empty string` };
     }
+    if (
+      slotIndex !== undefined &&
+      (typeof slotIndex !== 'number' ||
+        !Number.isInteger(slotIndex) ||
+        slotIndex < 1 ||
+        slotIndex > 3)
+    ) {
+      return { kind: 'error', message: `${name}: slotIndex must be integer 1..3` };
+    }
+    if (workoutId !== undefined && typeof workoutId !== 'string') {
+      return { kind: 'error', message: `${name}: workoutId must be a string` };
+    }
     return {
       kind: 'ok',
-      call: { name: 'regenerate_day', arguments: { dayIndex, reason } },
+      call: {
+        name: 'regenerate_day',
+        arguments: {
+          dayIndex,
+          reason,
+          ...(slotIndex !== undefined ? { slotIndex } : {}),
+          ...(workoutId ? { workoutId } : {}),
+        },
+      },
     };
   }
 
@@ -410,7 +442,7 @@ function buildSystemPrompt(input: ChatTurnInput): string {
   parts.push('- 与训练无关的问题礼貌拒绝并把话题拉回训练。');
   parts.push('');
   parts.push('修改训练计划的唯一方式是调用下列工具，禁止直接声称已修改课表：');
-  parts.push('- regenerate_day(dayIndex, reason) — 重新生成本周第 dayIndex 天 (1..7) 的训练；');
+  parts.push('- regenerate_day(dayIndex, reason, slotIndex?, workoutId?) — 重新生成指定训练课；同一天有多课时必须传 slotIndex 或 workoutId；');
   parts.push('- update_workout_field(workoutId, field="status", value) — 修改某个训练日的状态。');
   parts.push('调用工具前请先用一句话告诉用户你打算做什么，然后再触发工具调用。');
   parts.push('');
@@ -431,10 +463,13 @@ function buildPlanContextBlock(input: ChatTurnInput): string {
 
   const sortedWorkouts = input.workouts
     .slice()
-    .sort((a, b) => a.dayIndex - b.dayIndex)
+    .sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1))
     .map((w) => ({
       workoutId: w.id,
       dayIndex: w.dayIndex,
+      slotIndex: w.slotIndex ?? 1,
+      sessionLabel: w.sessionLabel ?? null,
+      timeOfDay: w.timeOfDay ?? null,
       date: String(w.date),
       sport: w.sport,
       templateId: w.templateId,

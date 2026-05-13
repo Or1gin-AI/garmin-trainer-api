@@ -53,6 +53,7 @@ export interface ParameterizeArgs {
   request: {
     targetMetricPreference: 'auto' | 'heart_rate' | 'pace';
     availableTime?: string;
+    dailyPreferredMinutes?: number | null;
   };
   scheduleEntry: ScheduleEntry;
   progression: 'conservative' | 'normal' | 'aggressive';
@@ -88,7 +89,12 @@ export function parameterizeWorkout(args: ParameterizeArgs): ParameterizedWorkou
 
   // Compute durationMinutes by summing minute-quantified phases (and minute-
   // valued variables they reference) using the resolved values.
-  const durationMinutes = computeDurationMinutes(template, resolved, tuning);
+  const computedDurationMinutes = computeDurationMinutes(template, resolved, tuning);
+  const durationMinutes = applyPreferredDuration(
+    template,
+    computedDurationMinutes,
+    request.dailyPreferredMinutes ?? null,
+  );
 
   // Build target strings.
   const sport = template.fixed.sport;
@@ -114,6 +120,7 @@ export function parameterizeWorkout(args: ParameterizeArgs): ParameterizedWorkou
     targetPace,
     targetPower,
     durationMinutes,
+    preferredDurationMinutes: request.dailyPreferredMinutes ?? null,
     distanceKm,
     resolved,
   });
@@ -516,6 +523,7 @@ function buildPaceString(
     'longPaceCap',
     'cssPaceRange',
     'cssPace',
+    'easyPaceCap',
     'easyPace',
     'tempoPace',
     'sprintPace',
@@ -532,7 +540,10 @@ function buildPaceString(
     }
     if (v.kind === 'number') {
       if (v.unit === 'W' || v.unit === 'W_upper') continue;
-      const isUpperCap = key === 'longPaceCap' || key === 'targetPaceCap';
+      const isUpperCap =
+        key === 'longPaceCap' ||
+        key === 'targetPaceCap' ||
+        key === 'easyPaceCap';
       if (v.unit === 's/km_upper' || isUpperCap) {
         return `不快于 ${formatSeconds(v.value)}${unit}`;
       }
@@ -630,6 +641,28 @@ function computeDurationMinutes(
     total = mid > 0 ? mid * tuning.durationMultiplier : 0;
   }
   return Math.max(0, Math.round(total));
+}
+
+function applyPreferredDuration(
+  template: WorkoutTemplate,
+  durationMinutes: number,
+  preferredMinutes: number | null,
+): number {
+  if (
+    preferredMinutes === null ||
+    !Number.isFinite(preferredMinutes) ||
+    preferredMinutes <= 0 ||
+    template.fixed.sport === 'rest' ||
+    template.fixed.sport === 'mobility' ||
+    durationMinutes <= 0
+  ) {
+    return durationMinutes;
+  }
+
+  const preferred = Math.round(preferredMinutes);
+  const lower = Math.max(15, template.fixed.minDurationMinutes);
+  const upper = Math.max(lower, template.fixed.maxDurationMinutes);
+  return clamp(preferred, lower, upper);
 }
 
 function resolvePhaseMinutes(
@@ -769,14 +802,23 @@ function buildTargetsArray(args: {
   targetPace: string;
   targetPower: string;
   durationMinutes: number;
+  preferredDurationMinutes: number | null;
   distanceKm: number | null;
   resolved: Map<string, ResolvedValue>;
 }): string[] {
-  const { template, targetHeartRate, targetPace, targetPower, durationMinutes, distanceKm } = args;
+  const { template, targetHeartRate, targetPace, targetPower, durationMinutes, distanceKm, preferredDurationMinutes } = args;
   const out: string[] = [];
 
   if (durationMinutes > 0) out.push(`总时长 ${durationMinutes} 分钟`);
   else out.push('总时长 不适用');
+  if (
+    preferredDurationMinutes !== null &&
+    Number.isFinite(preferredDurationMinutes) &&
+    durationMinutes > 0 &&
+    Math.round(preferredDurationMinutes) === durationMinutes
+  ) {
+    out.push(`已按每日偏好时长 ${durationMinutes} 分钟安排`);
+  }
 
   if (distanceKm !== null && distanceKm > 0) {
     out.push(`参考距离 ${distanceKm.toFixed(1)} 公里`);

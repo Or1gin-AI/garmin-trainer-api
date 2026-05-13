@@ -1,7 +1,7 @@
 // On-demand activity fetcher for the AI Training Companion.
 //
-// Pulls the most recent N days of raw activities from Garmin (CN + Global,
-// deduped by signature) and returns them in memory. Nothing is persisted —
+// Pulls the most recent N days of raw activities from Garmin CN and returns
+// them in memory. Nothing is persisted —
 // the request handler hands the activities to the normalizer and they go
 // out of scope when the SSE response ends.
 //
@@ -39,6 +39,12 @@ export interface FetchRecentResult {
   global: RegionFetchInfo;
 }
 
+export interface FetchCalendarActivitiesResult {
+  activities: MappedActivity[];
+  cn: RegionFetchInfo;
+  global: RegionFetchInfo;
+}
+
 export class GarminUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -57,10 +63,49 @@ async function fetchRegion(
   try {
     const { client } = await authenticate(userId, region);
     const list = (await client.getActivities(0, limit)) as RawActivity[];
-    return { list: Array.isArray(list) ? list : [], error: null };
+    if (!Array.isArray(list)) return { list: [], error: null };
+    return { list: await enrichActivitiesWithDetails(client, list), error: null };
   } catch (err) {
     return { list: [], error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+function hasHrZoneDetailHint(activity: RawActivity): boolean {
+  const raw = activity as unknown as Record<string, unknown>;
+  const metadata = raw.metadataDTO as Record<string, unknown> | undefined;
+  return (
+    metadata?.hasHrTimeInZones === true ||
+    raw.hasHrTimeInZones === true ||
+    raw.hrTimeInZones !== undefined ||
+    raw.heartRateZones !== undefined
+  );
+}
+
+async function enrichActivitiesWithDetails(
+  client: any,
+  activities: RawActivity[],
+): Promise<RawActivity[]> {
+  const enriched = activities.slice();
+  const candidates = activities
+    .map((activity, index) => ({ activity, index }))
+    .filter(({ activity }) => hasHrZoneDetailHint(activity))
+    .slice(0, 25);
+
+  await Promise.all(
+    candidates.map(async ({ activity, index }) => {
+      try {
+        const detail = await client.getActivity(activity);
+        enriched[index] = {
+          ...activity,
+          detail,
+        } as RawActivity;
+      } catch {
+        // Detail fetch is best-effort; summary activities are still usable.
+      }
+    }),
+  );
+
+  return enriched;
 }
 
 export async function fetchRecentRawActivities(
@@ -71,28 +116,51 @@ export async function fetchRecentRawActivities(
   const limit = options.limit ?? DEFAULT_LIMIT;
   const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
 
+  const cnRes = await fetchRegion(userId, 'cn', limit);
+  const globalRes = { list: [] as RawActivity[], error: null as string | null };
+
+  if (cnRes.error) {
+    throw new GarminUnavailableError(
+      `无法读取 Garmin 中国区数据：${cnRes.error}`,
+    );
+  }
+
+  // Training-plan capability estimation is intentionally CN-only. The sync
+  // worker may still copy activities across regions, but planning must not
+  // mix China and International accounts.
+  const seen = new Map<string, MappedActivity>();
+  for (const a of cnRes.list) seen.set(activitySignature(a), mapActivity(a, 'cn'));
+
+  const filtered: MappedActivity[] = [];
+  for (const a of seen.values()) {
+    const ts = a.startTimeLocal ? Date.parse(a.startTimeLocal) : NaN;
+    if (Number.isFinite(ts) && ts < cutoffMs) continue;
+    filtered.push(a);
+  }
+
+  return {
+    activities: filtered,
+    cn: { count: cnRes.list.length, error: cnRes.error },
+    global: { count: globalRes.list.length, error: globalRes.error },
+  };
+}
+
+export async function fetchCalendarActivities(
+  userId: string,
+  options: FetchRecentOptions = {},
+): Promise<FetchCalendarActivitiesResult> {
+  const days = options.days ?? DEFAULT_DAYS;
+  const limit = options.limit ?? DEFAULT_LIMIT;
+  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+
   const [cnRes, globalRes] = await Promise.all([
     fetchRegion(userId, 'cn', limit),
     fetchRegion(userId, 'global', limit),
   ]);
 
-  if (cnRes.error && globalRes.error) {
-    throw new GarminUnavailableError(
-      `无法读取 Garmin 数据：国服 (${cnRes.error})；国际服 (${globalRes.error})`,
-    );
-  }
-
-  // Dedupe by activity signature. Prefer the CN copy when both regions have
-  // it (CN is the more common source for our China users). For users with
-  // only one region, the empty list from the other side is a no-op.
-  // Map each raw activity to MappedActivity at the same time, tagging the
-  // sourceRegion so downstream knows where it came from.
   const seen = new Map<string, MappedActivity>();
   for (const a of cnRes.list) seen.set(activitySignature(a), mapActivity(a, 'cn'));
-  for (const a of globalRes.list) {
-    const sig = activitySignature(a);
-    if (!seen.has(sig)) seen.set(sig, mapActivity(a, 'global'));
-  }
+  for (const a of globalRes.list) seen.set(activitySignature(a), mapActivity(a, 'global'));
 
   const filtered: MappedActivity[] = [];
   for (const a of seen.values()) {

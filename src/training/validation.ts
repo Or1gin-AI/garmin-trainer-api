@@ -31,11 +31,12 @@ const HARD_STIMULI: ReadonlySet<string> = new Set(['threshold', 'vo2max', 'anaer
 export function validatePlan(plan: PlanForValidation): Violation[] {
   const violations: Violation[] = [];
 
-  // length_7
-  if (plan.schedule.length !== 7 || plan.workouts.length !== 7) {
+  // week_coverage
+  const coveredDays = new Set(plan.schedule.map((s) => s.dayIndex));
+  if (coveredDays.size !== 7 || plan.workouts.length !== plan.schedule.length) {
     violations.push({
-      rule: 'length_7',
-      details: `schedule.length=${plan.schedule.length}, workouts.length=${plan.workouts.length}, 期望均为 7。`,
+      rule: 'week_coverage',
+      details: `coveredDays=${coveredDays.size}, schedule.length=${plan.schedule.length}, workouts.length=${plan.workouts.length}；期望覆盖 7 天且 workout 与 schedule 一一对应。`,
     });
     // Don't bail — still try to validate what we have.
   }
@@ -134,22 +135,30 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
     }
   }
 
-  // no_consecutive_hard_days
-  for (let i = 1; i < plan.workouts.length; i += 1) {
+  // no_consecutive_hard_days. Multiple sessions on the same day are allowed
+  // only when explicitly scheduled as separate slots, so they count as one
+  // hard day for spacing/budget checks.
+  const hardDayIndexes = new Set<number>();
+  for (let i = 0; i < plan.workouts.length; i += 1) {
+    if (plan.workouts[i].intensity === 'high') {
+      hardDayIndexes.add(plan.schedule[i]?.dayIndex ?? i + 1);
+    }
+  }
+  const hardDays = Array.from(hardDayIndexes).sort((a, b) => a - b);
+  for (let i = 1; i < hardDays.length; i += 1) {
     if (
-      plan.workouts[i].intensity === 'high' &&
-      plan.workouts[i - 1].intensity === 'high'
+      hardDays[i] === hardDays[i - 1] + 1
     ) {
       violations.push({
         rule: 'no_consecutive_hard_days',
-        dayIndex: i + 1,
-        details: `第 ${i} 天和第 ${i + 1} 天连续为高强度课。`,
+        dayIndex: hardDays[i],
+        details: `第 ${hardDays[i - 1]} 天和第 ${hardDays[i]} 天连续为高强度课。`,
       });
     }
   }
 
   // hard_cap_per_week
-  const hardCount = plan.workouts.filter((w) => w.intensity === 'high').length;
+  const hardCount = hardDays.length;
   const hardBudget =
     plan.context.maxHardSessionsPerWeek -
     plan.context.hardSessionsAlreadyDoneThisWeek;

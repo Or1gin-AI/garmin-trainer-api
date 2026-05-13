@@ -5,14 +5,9 @@
 //
 // Cycling-specific rules (per spec):
 //   - targetPace 永远是 不适用 → templates do NOT expose a targetPace variable.
-//   - targetHeartRate 必须明确 → every template exposes targetHeartRate.
-//   - 有 FTP 时增加 targetPower → exposed as optional variable.
-//   - bike.sweet_spot.v1 / bike.over_under.v1 优先 power → primaryMetric = 'power'
-//     with allowedMetrics ['power','heart_rate'] so parameterizer can downgrade
-//     when ftpWatts is missing.
-//   - All other templates have primaryMetric = 'heart_rate' (or 'power' as
-//     fallback when FTP available, but the metric type stays heart_rate so the
-//     downstream code doesn't have to special-case).
+//   - targetPace 永远是 不适用 → templates do NOT expose a targetPace variable.
+//   - 有 FTP 时，除恢复/踏频技术课外优先使用 targetPower；心率作为保护上限。
+//   - 缺 FTP 时 parameterizer 会自动降级到 heart_rate。
 
 import type { WorkoutTemplate } from './types.js';
 
@@ -87,8 +82,8 @@ const bikeEndurance: WorkoutTemplate = {
     purpose: '有氧基础和骑行经济性。',
     intensity: 'low',
     stress: 'medium',
-    primaryMetric: 'heart_rate',
-    allowedMetrics: ['heart_rate', 'power'],
+    primaryMetric: 'power',
+    allowedMetrics: ['power', 'heart_rate'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration' },
       { name: 'main', label: '主训练', duration: '$mainDuration', description: '心率保持 BIKE.enduranceHr，踏频 85-95 rpm。' },
@@ -127,8 +122,8 @@ const bikeLongRide: WorkoutTemplate = {
     purpose: '发展长时间耐力和补给执行能力。',
     intensity: 'low',
     stress: 'high',
-    primaryMetric: 'heart_rate',
-    allowedMetrics: ['heart_rate', 'power'],
+    primaryMetric: 'power',
+    allowedMetrics: ['power', 'heart_rate'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration' },
       { name: 'main', label: '主训练', duration: '$mainDuration', description: '稳定耐力骑，每 $fuelingIntervalMinutes 分钟检查补水和主观疲劳。' },
@@ -168,7 +163,7 @@ const bikeTempo: WorkoutTemplate = {
     purpose: '提高中等强度持续输出。',
     intensity: 'medium',
     stress: 'medium',
-    primaryMetric: 'heart_rate',
+    primaryMetric: 'power',
     allowedMetrics: ['heart_rate', 'power'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration' },
@@ -258,7 +253,7 @@ const bikeThreshold: WorkoutTemplate = {
     purpose: '提高 FTP 和阈值附近持续能力。',
     intensity: 'high',
     stress: 'high',
-    primaryMetric: 'heart_rate',
+    primaryMetric: 'power',
     allowedMetrics: ['power', 'heart_rate'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration', description: '含 3 x 1 分钟接近阈值。' },
@@ -277,7 +272,7 @@ const bikeThreshold: WorkoutTemplate = {
     requiredRecoveryHoursAfter: 48,
     minDurationMinutes: 75,
     maxDurationMinutes: 95,
-    notes: '降级为 3 x 10 分钟或 bike.sweet_spot.v1。',
+    notes: '有 FTP 时以 95-100% FTP 为主，心率作为阈值保护上限；缺 FTP 时降级为心率阈值骑。',
   },
   variables: {
     warmupDuration: { source: { kind: 'template_default', default: 20, unit: 'minutes' } },
@@ -309,7 +304,7 @@ const bikeVo2max: WorkoutTemplate = {
     purpose: '提升高强度摄氧能力。',
     intensity: 'high',
     stress: 'high',
-    primaryMetric: 'heart_rate',
+    primaryMetric: 'power',
     allowedMetrics: ['power', 'heart_rate'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration' },
@@ -328,7 +323,7 @@ const bikeVo2max: WorkoutTemplate = {
     requiredRecoveryHoursAfter: 72,
     minDurationMinutes: 60,
     maxDurationMinutes: 80,
-    notes: '无功率且用户不是稳定训练者时禁用。降级为 4 x 3 分钟或 bike.threshold.v1。',
+    notes: '有 FTP 时以 110-120% FTP 为主，心率只作保护上限；缺功率时降级为 bike.threshold.v1。',
   },
   variables: {
     warmupDuration: { source: { kind: 'template_default', default: 20, unit: 'minutes' } },
@@ -361,7 +356,7 @@ const bikeAnaerobic: WorkoutTemplate = {
     purpose: '提高短时间高功率重复能力。',
     intensity: 'high',
     stress: 'high',
-    primaryMetric: 'heart_rate',
+    primaryMetric: 'power',
     allowedMetrics: ['power', 'heart_rate'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration' },
@@ -380,7 +375,7 @@ const bikeAnaerobic: WorkoutTemplate = {
     requiredRecoveryHoursAfter: 72,
     minDurationMinutes: 50,
     maxDurationMinutes: 70,
-    notes: '初级用户禁用。降级为 bike.vo2max.v1 低组数版或取消。',
+    notes: '有 FTP 时以 120-140% FTP 为主，心率不适合作为 1 分钟间歇主目标。初级用户禁用。',
   },
   variables: {
     warmupDuration: { source: { kind: 'template_default', default: 20, unit: 'minutes' } },
@@ -417,8 +412,8 @@ const bikeSprint: WorkoutTemplate = {
     purpose: '神经肌肉冲刺能力，不追求心肺负荷。',
     intensity: 'high',
     stress: 'medium',
-    primaryMetric: 'heart_rate',
-    allowedMetrics: ['heart_rate', 'power'],
+    primaryMetric: 'power',
+    allowedMetrics: ['power', 'heart_rate'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration' },
       { name: 'main', label: '主训练', duration: '$mainDurationTotal', description: '$sprintRepeats x $sprintDurationSeconds 秒全力冲刺，组间轻松骑 $sprintRecoveryMinutes 分钟。' },
@@ -435,7 +430,7 @@ const bikeSprint: WorkoutTemplate = {
     requiredRecoveryHoursAfter: 48,
     minDurationMinutes: 45,
     maxDurationMinutes: 60,
-    notes: '初级用户禁用。降级为 6 x 10 秒或 bike.cadence_drill.v1。',
+    notes: '冲刺以短时功率/全力输出为主，心率只约束非冲刺恢复段。初级用户禁用。',
   },
   variables: {
     warmupDuration: { source: { kind: 'template_default', default: 20, unit: 'minutes' } },
@@ -473,7 +468,7 @@ const bikeCadenceDrill: WorkoutTemplate = {
     intensity: 'low',
     stress: 'low',
     primaryMetric: 'heart_rate',
-    allowedMetrics: ['heart_rate'],
+    allowedMetrics: ['heart_rate', 'power'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration' },
       { name: 'main', label: '主训练', duration: '$mainDurationTotal', description: '$drillRepeats x $drillDuration 分钟高踏频 $cadenceHighRange，组间 $drillRecovery 分钟 $cadenceNormalRange。' },
@@ -522,7 +517,7 @@ const bikeClimb: WorkoutTemplate = {
     purpose: '提高低踏频稳定输出和爬坡耐受。',
     intensity: 'high',
     stress: 'medium',
-    primaryMetric: 'heart_rate',
+    primaryMetric: 'power',
     allowedMetrics: ['power', 'heart_rate'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration' },

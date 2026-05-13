@@ -92,8 +92,8 @@ const runAerobic: WorkoutTemplate = {
     primaryMetric: 'heart_rate',
     allowedMetrics: ['heart_rate', 'pace'],
     phases: [
-      { name: 'warmup', label: '热身', duration: '$warmupDuration', description: 'HR.recovery 到 HR.aerobicLow。' },
-      { name: 'main', label: '主训练', duration: '$mainDuration', description: '保持 HR.aerobic 或 RUN.easyPace。' },
+      { name: 'warmup', label: '热身', duration: '$warmupDuration', description: 'HR.recovery 到 HR.zone2。' },
+      { name: 'main', label: '主训练', duration: '$mainDuration', description: '保持 HR.zone2。' },
       { name: 'cooldown', label: '放松', duration: '$cooldownDuration', description: '心率回到 HR.recovery。' },
     ],
     contraindications: ['fatigue.high_risk'],
@@ -101,7 +101,7 @@ const runAerobic: WorkoutTemplate = {
     requiredRecoveryHoursAfter: 0,
     minDurationMinutes: 40,
     maxDurationMinutes: 65,
-    notes: '最新可靠活动为 vo2max/anaerobic 且疲劳偏高时不安排超过 45 分钟；7 天负荷快速上升时主训练缩短 20%。',
+    notes: '以 Garmin Zone 2 / HR.aerobic 为主，不使用配速上限。最新可靠活动为 vo2max/anaerobic 且疲劳偏高时不安排超过 45 分钟；7 天负荷快速上升时主训练缩短 20%。',
   },
   variables: {
     warmupDuration: { source: { kind: 'template_default', default: 10, unit: 'minutes' } },
@@ -109,8 +109,7 @@ const runAerobic: WorkoutTemplate = {
       source: { kind: 'athlete_profile', path: 'athleteProfile.running.aerobicMainDurationMinutes', min: 25, max: 45, unit: 'minutes' },
     },
     cooldownDuration: { source: { kind: 'template_default', default: 8, unit: 'minutes' } },
-    targetHeartRate: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.aerobicRange', unit: 'bpm' } },
-    targetPace: { source: { kind: 'athlete_profile', path: 'athleteProfile.running.easyPaceSecPerKm', optional: true, unit: 's/km' } },
+    targetHeartRate: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.zone2Range', unit: 'bpm' } },
     metricMode: {
       source: { kind: 'template_default', default: 'auto' },
       description: 'auto = 优先心率，配速稳定时可切到 pace；由 parameterizer 决定。',
@@ -135,8 +134,8 @@ const runLsd: WorkoutTemplate = {
     primaryMetric: 'heart_rate',
     allowedMetrics: ['heart_rate'],
     phases: [
-      { name: 'warmup', label: '热身', duration: '$warmupDuration', description: '心率逐步进入 HR.aerobicLow。' },
-      { name: 'main', label: '主训练', duration: '$mainDuration', description: '心率保持 HR.aerobicLow-HR.aerobic，中途不做提速。' },
+      { name: 'warmup', label: '热身', duration: '$warmupDuration', description: '心率逐步进入 HR.zone2。' },
+      { name: 'main', label: '主训练', duration: '$mainDuration', description: '心率保持 HR.zone2，中途不做提速。' },
       { name: 'cooldown', label: '放松', duration: '$cooldownDuration', description: '心率降至 HR.recovery。' },
     ],
     contraindications: ['latestStimulus.threshold', 'latestStimulus.vo2max', 'latestStimulus.anaerobic', 'fatigue.high_risk'],
@@ -152,14 +151,9 @@ const runLsd: WorkoutTemplate = {
       source: { kind: 'athlete_profile', path: 'athleteProfile.running.lsdMainDurationMinutes', min: 50, max: 90, unit: 'minutes' },
     },
     cooldownDuration: { source: { kind: 'template_default', default: 10, unit: 'minutes' } },
-    targetHeartRateLow: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.aerobicLowRange', unit: 'bpm' } },
-    targetHeartRateHigh: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.aerobicRange', unit: 'bpm' } },
-    longPaceCap: {
-      source: { kind: 'athlete_profile', path: 'athleteProfile.running.longPaceSecPerKm', optional: true, unit: 's/km' },
-      description: '配速不适用；仅作上限 "不要快于 RUN.longPace"。',
-    },
+    targetHeartRate: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.zone2Range', unit: 'bpm' } },
     distanceKm: {
-      source: { kind: 'derived', from: 'mainDuration + targetHeartRateLow', rule: '由 parameterizer 用 mainDuration 和 longPace 估算', optional: true, unit: 'km' },
+      source: { kind: 'derived', from: 'mainDuration + targetHeartRate', rule: 'LSD 以心率为主，不用配速反推距离', optional: true, unit: 'km' },
     },
   },
   progression: PROGRESSION_AEROBIC,
@@ -215,7 +209,7 @@ const runTempo: WorkoutTemplate = {
 
 // ---------------------------------------------------------------------------
 // run.threshold.v1 — 阈值跑
-// 默认时长 55-75 分钟。3 x 8 分钟 RUN.thresholdPace，组间慢跑 3 分钟。
+// 默认时长 55-75 分钟。3 x 8 分钟 HR.threshold / Zone 4，组间慢跑 3 分钟。
 // ---------------------------------------------------------------------------
 const runThreshold: WorkoutTemplate = {
   id: 'run.threshold.v1',
@@ -226,11 +220,11 @@ const runThreshold: WorkoutTemplate = {
     purpose: '提高乳酸阈值和可持续高强度能力。',
     intensity: 'high',
     stress: 'high',
-    primaryMetric: 'pace',
-    allowedMetrics: ['pace', 'heart_rate'],
+    primaryMetric: 'heart_rate',
+    allowedMetrics: ['heart_rate', 'pace'],
     phases: [
       { name: 'warmup', label: '热身', duration: '$warmupDuration', description: '含 4 x 20 秒加速。' },
-      { name: 'main', label: '主训练', duration: '$mainDurationTotal', description: '$thresholdRepeats x $thresholdDuration 分钟 RUN.thresholdPace，组间慢跑 $recoveryDuration 分钟。' },
+      { name: 'main', label: '主训练', duration: '$mainDurationTotal', description: '$thresholdRepeats x $thresholdDuration 分钟 HR.threshold / Zone 4，组间慢跑 $recoveryDuration 分钟。' },
       { name: 'cooldown', label: '放松', duration: '$cooldownDuration' },
     ],
     contraindications: [
@@ -245,7 +239,7 @@ const runThreshold: WorkoutTemplate = {
     requiredRecoveryHoursAfter: 48,
     minDurationMinutes: 55,
     maxDurationMinutes: 75,
-    notes: '中低水平用户用 2 x 10 分钟；心率异常偏高时立即改为有氧跑。',
+    notes: '以 Garmin Zone 4 / HR.threshold 为主；配速仅作参考。中低水平用户用 2 x 10 分钟；心率异常偏高时立即改为有氧跑。',
   },
   variables: {
     warmupDuration: { source: { kind: 'template_default', default: 15, unit: 'minutes' } },
@@ -256,7 +250,6 @@ const runThreshold: WorkoutTemplate = {
     mainDurationTotal: {
       source: { kind: 'derived', from: 'thresholdRepeats,thresholdDuration,recoveryDuration', rule: 'thresholdRepeats * thresholdDuration + (thresholdRepeats - 1) * recoveryDuration', unit: 'minutes' },
     },
-    targetPace: { source: { kind: 'athlete_profile', path: 'athleteProfile.running.thresholdPaceSecPerKm', unit: 's/km' } },
     targetHeartRate: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.thresholdRange', unit: 'bpm' } },
     protectiveHrCap: { source: { kind: 'derived', from: 'athleteProfile.heartRate.thresholdRange', rule: 'high bound only', unit: 'bpm' } },
   },
@@ -561,6 +554,86 @@ const runRacePace: WorkoutTemplate = {
   },
 };
 
+const runDoubleThresholdAm: WorkoutTemplate = {
+  id: 'run.double_threshold_am.v1',
+  fixed: {
+    sport: 'running',
+    workoutType: 'double_threshold',
+    title: '双阈值 AM',
+    purpose: '在可控乳酸水平下累积阈值时间，上午使用较短时间间歇。',
+    intensity: 'high',
+    stress: 'high',
+    primaryMetric: 'pace',
+    allowedMetrics: ['pace', 'heart_rate'],
+    phases: [
+      { name: 'warmup', label: '热身', duration: '$warmupDuration', description: 'Z2 慢跑后加入 3 x 20 秒加速。' },
+      { name: 'main', label: '主训练', duration: '$mainDurationTotal', description: '$thresholdRepeats x $thresholdDuration 分钟 @ threshold，组间 $recoveryDuration 分钟慢跑。' },
+      { name: 'cooldown', label: '放松', duration: '$cooldownDuration' },
+    ],
+    contraindications: ['fatigue.tired', 'fatigue.high_risk', 'confidence.low'],
+    downgradeTo: 'run.threshold.v1',
+    requiredRecoveryHoursAfter: 0,
+    minDurationMinutes: 50,
+    maxDurationMinutes: 70,
+    notes: '双阈值只给高水平且恢复正常的用户；全天阈值总时间控制在 40-70 分钟，上午不能跑成 VO2max。',
+  },
+  variables: {
+    warmupDuration: { source: { kind: 'template_default', default: 15, unit: 'minutes' } },
+    thresholdRepeats: { source: { kind: 'template_default', default: 5, unit: 'reps' } },
+    thresholdDuration: { source: { kind: 'template_default', default: 6, unit: 'minutes' } },
+    recoveryDuration: { source: { kind: 'template_default', default: 1, unit: 'minutes' } },
+    cooldownDuration: { source: { kind: 'template_default', default: 10, unit: 'minutes' } },
+    mainDurationTotal: { source: { kind: 'derived', from: 'thresholdRepeats,thresholdDuration,recoveryDuration', rule: 'thresholdRepeats * thresholdDuration + (thresholdRepeats - 1) * recoveryDuration', unit: 'minutes' } },
+    targetPace: { source: { kind: 'athlete_profile', path: 'athleteProfile.running.thresholdPaceSecPerKm', unit: 's/km' } },
+    targetHeartRate: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.thresholdRange', unit: 'bpm' } },
+  },
+  progression: {
+    conservative: { durationMultiplier: 0.85, repeatDelta: -1 },
+    normal: { durationMultiplier: 1.0, repeatDelta: 0 },
+    aggressive: { durationMultiplier: 1.05, repeatDelta: 0 },
+  },
+};
+
+const runDoubleThresholdPm: WorkoutTemplate = {
+  id: 'run.double_threshold_pm.v1',
+  fixed: {
+    sport: 'running',
+    workoutType: 'double_threshold',
+    title: '双阈值 PM',
+    purpose: '下午用 1km 阈值重复跑继续累积阈值时间，保持配速绝对稳定。',
+    intensity: 'high',
+    stress: 'high',
+    primaryMetric: 'pace',
+    allowedMetrics: ['pace', 'heart_rate'],
+    phases: [
+      { name: 'warmup', label: '热身', duration: '$warmupDuration', description: '轻松跑到 Z2，确认疲劳可控。' },
+      { name: 'main', label: '主训练', duration: '$mainDurationTotal', description: '$thresholdRepeats x $thresholdDistance 公里 @ threshold，组间 $recoveryDuration 分钟慢跑。' },
+      { name: 'cooldown', label: '放松', duration: '$cooldownDuration' },
+    ],
+    contraindications: ['fatigue.tired', 'fatigue.high_risk', 'confidence.low'],
+    downgradeTo: 'run.aerobic.v1',
+    requiredRecoveryHoursAfter: 72,
+    minDurationMinutes: 60,
+    maxDurationMinutes: 85,
+    notes: '如果上午主项漂移明显或 RPE 超预期，下午必须降级为 Z2 有氧。',
+  },
+  variables: {
+    warmupDuration: { source: { kind: 'template_default', default: 15, unit: 'minutes' } },
+    thresholdRepeats: { source: { kind: 'template_default', default: 8, unit: 'reps' } },
+    thresholdDistance: { source: { kind: 'template_default', default: 1, unit: 'km' } },
+    recoveryDuration: { source: { kind: 'template_default', default: 1, unit: 'minutes' } },
+    cooldownDuration: { source: { kind: 'template_default', default: 10, unit: 'minutes' } },
+    mainDurationTotal: { source: { kind: 'derived', from: 'thresholdRepeats,thresholdDistance,thresholdPace,recoveryDuration', rule: 'thresholdRepeats * thresholdDistance / thresholdPace + (n-1) * recoveryDuration', unit: 'minutes' } },
+    targetPace: { source: { kind: 'athlete_profile', path: 'athleteProfile.running.thresholdPaceSecPerKm', unit: 's/km' } },
+    targetHeartRate: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.thresholdRange', unit: 'bpm' } },
+  },
+  progression: {
+    conservative: { durationMultiplier: 0.85, repeatDelta: -2 },
+    normal: { durationMultiplier: 1.0, repeatDelta: 0 },
+    aggressive: { durationMultiplier: 1.05, repeatDelta: 0 },
+  },
+};
+
 export const RUNNING_TEMPLATES: Record<string, WorkoutTemplate> = {
   [runRecovery.id]: runRecovery,
   [runAerobic.id]: runAerobic,
@@ -573,4 +646,6 @@ export const RUNNING_TEMPLATES: Record<string, WorkoutTemplate> = {
   [runStrides.id]: runStrides,
   [runProgression.id]: runProgression,
   [runRacePace.id]: runRacePace,
+  [runDoubleThresholdAm.id]: runDoubleThresholdAm,
+  [runDoubleThresholdPm.id]: runDoubleThresholdPm,
 };
