@@ -1180,10 +1180,22 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
 
   let evaluations = await loadCalendarEvaluations(userId, from, to);
 
-  // Auto-evaluate past days that have planned workouts + activities but no evaluation
+  // Auto-evaluate past days that have planned workouts + activities but no evaluation,
+  // and re-evaluate stale placeholder evaluations (ones without a score field).
   if (active) {
     const todayStr = localDateString(today);
-    const evaluatedDates = new Set(evaluations.map((e) => e.date));
+
+    // Find dates with stale placeholder evaluations that need re-evaluation
+    const staleByDate = new Map<string, CalendarEvaluation>();
+    for (const e of evaluations) {
+      const r = e.result as Record<string, unknown> | null;
+      if (r && r.score === undefined) {
+        staleByDate.set(e.date, e);
+      }
+    }
+    const evaluatedDates = new Set(
+      evaluations.filter((e) => !staleByDate.has(e.date)).map((e) => e.date),
+    );
 
     // Group activities by date
     const activitiesByDate = new Map<string, NormalizedActivity[]>();
@@ -1228,30 +1240,48 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
         activityQualities: qualities,
       });
 
-      const now = new Date();
-      const row = (
-        await db
-          .insert(trainingEvaluation)
-          .values({
-            id: crypto.randomUUID(),
-            userId,
-            planId: active.plan.id,
-            evaluationDate: date,
-            plannedWorkoutIds: workoutsForDay.map((w) => w.id),
-            activityRefs,
-            status: 'ready',
-            result,
-            note: null,
-            createdAt: now,
-            updatedAt: now,
-          })
-          .returning()
-      )[0];
-      newEvaluations.push(evaluationToSummary(row));
+      const stale = staleByDate.get(date);
+      if (stale) {
+        // Update existing stale evaluation with real result
+        const updated = (
+          await db
+            .update(trainingEvaluation)
+            .set({ result, activityRefs, updatedAt: new Date() })
+            .where(eq(trainingEvaluation.id, stale.id))
+            .returning()
+        )[0];
+        newEvaluations.push(evaluationToSummary(updated));
+      } else {
+        const now = new Date();
+        const row = (
+          await db
+            .insert(trainingEvaluation)
+            .values({
+              id: crypto.randomUUID(),
+              userId,
+              planId: active.plan.id,
+              evaluationDate: date,
+              plannedWorkoutIds: workoutsForDay.map((w) => w.id),
+              activityRefs,
+              status: 'ready',
+              result,
+              note: null,
+              createdAt: now,
+              updatedAt: now,
+            })
+            .returning()
+        )[0];
+        newEvaluations.push(evaluationToSummary(row));
+      }
     }
 
     if (newEvaluations.length > 0) {
-      evaluations = [...evaluations, ...newEvaluations].sort(
+      // Replace stale evaluations in the list and add new ones
+      const updatedIds = new Set(newEvaluations.map((e) => e.id));
+      evaluations = [
+        ...evaluations.filter((e) => !updatedIds.has(e.id) && !staleByDate.has(e.date)),
+        ...newEvaluations,
+      ].sort(
         (a, b) => b.date.localeCompare(a.date),
       );
     }
