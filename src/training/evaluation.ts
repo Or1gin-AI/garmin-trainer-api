@@ -587,9 +587,21 @@ function buildIntensitySummary(
 export function evaluateTrainingDay(input: EvaluateInput): TrainingEvaluationResult {
   const { plannedWorkouts, activities, activityQualities } = input;
 
-  // Determine maxHR for physiology calculations
-  const derivedMax = Math.max(...activities.map((a) => a.maxHr ?? 0).filter((v) => v > 0), 0);
-  const maxHr = input.athleteMaxHr ?? (derivedMax > 0 ? derivedMax : 190);
+  // Determine HRmax for physiology calculations.
+  // IMPORTANT: a single activity's maxHr is NOT the athlete's true HRmax —
+  // it's just the peak HR reached in that session (typically 80-95% of true max).
+  // Use input.athleteMaxHr if provided; otherwise apply a correction factor.
+  let maxHr = 190;
+  if (input.athleteMaxHr && input.athleteMaxHr > 0) {
+    maxHr = input.athleteMaxHr;
+  } else {
+    const observedMax = Math.max(...activities.map((a) => a.maxHr ?? 0).filter((v) => v > 0), 0);
+    if (observedMax > 0) {
+      // Observed peak in a single session is ~90-95% of true HRmax on average.
+      // Use 95th percentile estimate: true HRmax ≈ observed / 0.93
+      maxHr = Math.round(observedMax / 0.93);
+    }
+  }
 
   const isRestDay = plannedWorkouts.length > 0 &&
     plannedWorkouts.every((w) => REST_SPORTS.has(w.sport));
