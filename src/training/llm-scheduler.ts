@@ -38,6 +38,11 @@ import {
   requestedTrainingDayIndexes,
 } from './scheduler.js';
 import type { TrainingCapacity } from './training-capacity.js';
+import {
+  extractTrainingRequestIntent,
+  formatTrainingIntentForPrompt,
+  isTemplateEnabledByRequest,
+} from './request-intent.js';
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -130,6 +135,7 @@ export async function llmBuildWeeklySchedule(
   }
 
   const { request, athleteProfile, recentState, trainingCapacity } = args;
+  const requestIntent = extractTrainingRequestIntent(request);
   const effectiveHardCap = computeHardCap(
     request,
     athleteProfile,
@@ -157,7 +163,8 @@ export async function llmBuildWeeklySchedule(
       request: {
         sports: request.sports as Partial<Record<Sport, boolean>>,
         maxHardSessionsPerWeek: effectiveHardCap,
-        allowAdvancedWorkouts: request.allowAdvancedWorkouts,
+        allowAdvancedWorkouts:
+          request.allowAdvancedWorkouts === true || request.forceRequestedSchedule === true,
       },
       hardSessionsAlreadyScheduledThisWeek: 0,
     });
@@ -191,11 +198,20 @@ export async function llmBuildWeeklySchedule(
     if (restCatalog) catalogLines.push(restCatalog);
   }
 
+  for (const required of requestIntent.requiredWorkouts) {
+    const tpl = getTemplate(required.templateId);
+    if (!tpl || !isTemplateEnabledByRequest(required.templateId, request)) continue;
+    allowedIds.add(required.templateId);
+    const line = catalogLineForTemplate(required.templateId);
+    if (line) catalogLines.push(line);
+  }
+
   const messages = buildMessages({
     request,
     athleteProfile,
     recentState,
     trainingCapacity,
+    requestIntent,
     catalog: catalogLines.join('\n'),
     retryViolations: args.retryViolations,
   });
@@ -432,7 +448,10 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
     // Re-check filter for the template's actual sport. This catches any
     // template the LLM picked outside the catalog or that contraindications
     // would block now.
-    if (!allowedIds.has(day.templateId)) {
+    if (
+      !allowedIds.has(day.templateId) &&
+      !(request.forceRequestedSchedule === true && isTemplateEnabledByRequest(day.templateId, request))
+    ) {
       violations.push(
         `day ${day.dayIndex}: template ${day.templateId} not in allowed catalog`,
       );
@@ -524,31 +543,33 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
   const hardCount = sortedEntries.filter(
     (e) => getTemplate(e.templateId)?.fixed.intensity === 'high',
   ).length;
-  if (hardCount > hardCap) {
+  if (request.forceRequestedSchedule !== true && hardCount > hardCap) {
     violations.push(`hard count ${hardCount} > cap ${hardCap}`);
   }
 
   // Quality sessions should have distinct training purposes when the allowed
   // catalog gives the model alternatives. The LLM still chooses the mix; this
   // only rejects duplicated high-intensity templates when variety is possible.
-  for (const sport of ['running', 'cycling', 'swimming']) {
-    const pickedHigh = sortedEntries.filter((e) => {
-      const tpl = getTemplate(e.templateId);
-      return tpl?.fixed.sport === sport && tpl.fixed.intensity === 'high';
-    });
-    if (pickedHigh.length < 2) continue;
-    const pickedIds = new Set(pickedHigh.map((e) => e.templateId));
-    const allowedHighAlternatives = Array.from(allowedIds).filter((id) => {
-      const tpl = getTemplate(id);
-      return tpl?.fixed.sport === sport && tpl.fixed.intensity === 'high';
-    });
-    if (
-      pickedIds.size < pickedHigh.length &&
-      allowedHighAlternatives.length > pickedIds.size
-    ) {
-      violations.push(
-        `${sport}: repeated high-intensity template despite available alternatives`,
-      );
+  if (request.forceRequestedSchedule !== true) {
+    for (const sport of ['running', 'cycling', 'swimming']) {
+      const pickedHigh = sortedEntries.filter((e) => {
+        const tpl = getTemplate(e.templateId);
+        return tpl?.fixed.sport === sport && tpl.fixed.intensity === 'high';
+      });
+      if (pickedHigh.length < 2) continue;
+      const pickedIds = new Set(pickedHigh.map((e) => e.templateId));
+      const allowedHighAlternatives = Array.from(allowedIds).filter((id) => {
+        const tpl = getTemplate(id);
+        return tpl?.fixed.sport === sport && tpl.fixed.intensity === 'high';
+      });
+      if (
+        pickedIds.size < pickedHigh.length &&
+        allowedHighAlternatives.length > pickedIds.size
+      ) {
+        violations.push(
+          `${sport}: repeated high-intensity template despite available alternatives`,
+        );
+      }
     }
   }
 
@@ -594,6 +615,7 @@ interface BuildMessagesArgs {
   athleteProfile: AthleteProfile;
   recentState: RecentState;
   trainingCapacity?: TrainingCapacity;
+  requestIntent: ReturnType<typeof extractTrainingRequestIntent>;
   catalog: string;
   retryViolations?: string[];
 }
@@ -603,6 +625,11 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   systemParts.push(
     '你是一位专业的运动教练，正在为用户安排 7 天训练计划。所有训练动作只能从下列允许的模板中选择 templateId，不允许编造模板 id 或参数。',
   );
+  systemParts.push(
+    '最高优先级：用户明确写出的训练类型、训练天数、同日多练和周目标时长优先于健康保护规则；如果存在风险，只能在 notes 中提醒，不要擅自删除或替换用户明确要求的训练。',
+  );
+  systemParts.push('用户显式意图：');
+  systemParts.push(formatTrainingIntentForPrompt(args.requestIntent));
   systemParts.push(
     '硬性规则：',
   );
@@ -639,12 +666,12 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     );
   }
   systemParts.push(
-    `- 本周高强度课不得超过 ${computeHardCap(
+    `- 专业建议：本周高强度课建议不超过 ${computeHardCap(
       args.request,
       args.athleteProfile,
       args.recentState,
       args.trainingCapacity,
-    )} 次；`,
+    )} 次；如果用户显式要求超过，只能提示风险，不能删除用户要求。`,
   );
   if (args.request.forceRequestedSchedule !== true) {
     systemParts.push(
@@ -654,6 +681,11 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   systemParts.push(
     `- 本周总训练时长不得超过 ${args.request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES} 分钟；`,
   );
+  if (args.requestIntent.weeklyTargetMinutes !== null) {
+    systemParts.push(
+      `- 用户写明本周训练目标约 ${args.requestIntent.weeklyTargetMinutes} 分钟：在不超过周上限的前提下，应尽量接近该目标；优先增加 Z2、长距离、恢复和技术训练时长，质量课只增加热身/放松或恢复段。`,
+    );
+  }
   systemParts.push(
     '- sport 字段必须与所选 templateId 对应模板的 sport 一致；',
   );
@@ -702,12 +734,18 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     );
   }
   if (args.request.allowAdvancedWorkouts !== true) {
-    systemParts.push(
-      '- 用户未开启高级训练：不得安排 VO2max、短间歇、无氧、冲刺、坡跑/爬坡、比赛专项、公开水域专项、双阈值或同日多练。',
-    );
+    if (args.request.forceRequestedSchedule === true && args.requestIntent.requiredWorkouts.length > 0) {
+      systemParts.push(
+        '- 用户未开启高级训练开关，但文字里显式要求了高级训练；本次以文字要求为准，安排对应模板并在 notes 中提示风险。',
+      );
+    } else {
+      systemParts.push(
+        '- 用户未开启高级训练：不得安排 VO2max、短间歇、无氧、冲刺、坡跑/爬坡、比赛专项、公开水域专项、双阈值或同日多练。',
+      );
+    }
   } else {
     systemParts.push(
-      '- 用户已开启高级训练：仍需根据训练基础、疲劳、禁忌和高强度上限谨慎选择高级模板。',
+      '- 用户已开启高级训练：如果用户点名高级模板必须安排；未点名的高级模板仍需根据训练基础、疲劳、禁忌和高强度上限谨慎选择。',
     );
   }
   systemParts.push('');
@@ -782,6 +820,17 @@ function collectEnabledSports(request: ScheduleRequest): ActiveSport[] {
   if (request.sports.cycling) out.push('cycling');
   if (request.sports.swimming) out.push('swimming');
   return out;
+}
+
+function catalogLineForTemplate(templateId: string): string | null {
+  const tpl = getTemplate(templateId);
+  if (!tpl) return null;
+  const purpose =
+    tpl.fixed.purpose.length <= 40 ? tpl.fixed.purpose : `${tpl.fixed.purpose.slice(0, 39)}…`;
+  const block = tpl.fixed.contraindications.length
+    ? tpl.fixed.contraindications.slice(0, 3).join(',')
+    : 'none';
+  return `${tpl.id} | ${tpl.fixed.sport} | ${tpl.fixed.intensity} | ${purpose} | block:${block}`;
 }
 
 function firstAvailableSlot(usedSlots: Set<number>): number {

@@ -31,7 +31,7 @@ import type { Violation } from './validation.js';
 import type { AthleteProfile } from './athlete-profile.js';
 import type { RecentState } from './recent-state.js';
 import type { TrainingCapacity } from './training-capacity.js';
-import { getTemplate, type WorkoutTemplate } from './templates/index.js';
+import { getTemplate, type Sport, type WorkoutTemplate } from './templates/index.js';
 import {
   llmBuildWeeklySchedule,
   LlmNotConfiguredError,
@@ -43,6 +43,12 @@ import {
   InvalidLlmWorkoutError,
 } from './llm-parameterizer.js';
 import { llmStreamSummary, type SummaryDeltaKind } from './llm-summary.js';
+import {
+  extractTrainingRequestIntent,
+  isTemplateEnabledByRequest,
+  missingRequiredWorkoutMessages,
+  type TrainingRequestIntent,
+} from './request-intent.js';
 import {
   TOOL_DISPLAY,
   dayDisplay,
@@ -106,6 +112,7 @@ const DETERMINISTIC_MODEL = 'v1';
 export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedPlan> {
   const { request, athleteProfile, recentState, trainingCapacity, signal, onToolEvent } = input;
   const emit = onToolEvent ?? (() => {});
+  const requestIntent = extractTrainingRequestIntent(request);
 
   // Stage 1: schedule.
   const stageOne = await runScheduleStage({
@@ -118,6 +125,14 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
   });
   let schedule = stageOne.schedule;
   const progressionCapacity = request.forceRequestedSchedule ? undefined : trainingCapacity;
+  schedule = applyAdvancedWorkoutPreferences(
+    schedule,
+    request,
+    athleteProfile,
+    recentState,
+    trainingCapacity,
+    requestIntent,
+  );
   schedule = expandMultiSessionSchedule(
     schedule,
     request,
@@ -125,6 +140,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     recentState,
     trainingCapacity,
   );
+  schedule = applyExplicitWorkoutRequirements(schedule, request, requestIntent, trainingCapacity);
 
   let totalInputTokens = stageOne.meta?.inputTokens ?? 0;
   let totalOutputTokens = stageOne.meta?.outputTokens ?? 0;
@@ -256,6 +272,15 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
   }
 
   enforceWeeklyDurationLimit(schedule, workouts, request);
+  enforceWeeklyDurationTarget(
+    schedule,
+    workouts,
+    request,
+    requestIntent,
+    athleteProfile,
+    recentState,
+  );
+  enforceWeeklyDurationLimit(schedule, workouts, request);
 
   // Stage 3: validate + retry-with-downgrade.
   const baseCap = computeBaseCap(request, athleteProfile, recentState, trainingCapacity);
@@ -286,7 +311,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     },
   });
 
-  if (violations.length > 0) {
+  if (violations.length > 0 && request.forceRequestedSchedule !== true) {
     const dayIndexes = collectViolatingDays(violations);
     let mutated = false;
     for (const dayIndex of dayIndexes) {
@@ -338,7 +363,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
           latestStimulus: recentState.latestStimulus,
           hoursSinceLatest,
           fatigue: recentState.fatigue,
-          forceRequestedSchedule: request.forceRequestedSchedule === true,
+          forceRequestedSchedule: false,
           weeklyMaxMinutes: request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES,
           trainingCapacity: validationCapacity,
         },
@@ -411,7 +436,14 @@ export function expandMultiSessionSchedule(
   const wantsDoubleThreshold =
     request.allowAdvancedWorkouts === true &&
     request.allowDoubleDays === true &&
-    /双阈值|double\s*threshold/i.test(`${request.goal ?? ''}\n${request.notes ?? ''}`);
+    (hasExplicitDoubleThresholdRequest(request) ||
+      shouldAutoScheduleDoubleThreshold({
+        request,
+        athleteProfile,
+        recentState,
+        trainingCapacity,
+        forceRequestedSchedule,
+      }));
   if (!wantsDoubleThreshold) return expanded;
   if (!request.sports.running) return expanded;
   let notes = expanded.notes;
@@ -495,6 +527,381 @@ export function expandMultiSessionSchedule(
     days,
     notes: [...notes, `第 ${base.dayIndex} 天已安排双阈值上午/下午两练。`],
   };
+}
+
+function hasExplicitDoubleThresholdRequest(request: ScheduleRequest): boolean {
+  return /双阈值|double\s*threshold/i.test(`${request.goal ?? ''}\n${request.notes ?? ''}`);
+}
+
+function shouldAutoScheduleDoubleThreshold(args: {
+  request: ScheduleRequest;
+  athleteProfile: AthleteProfile;
+  recentState: RecentState;
+  trainingCapacity?: TrainingCapacity;
+  forceRequestedSchedule: boolean;
+}): boolean {
+  const { request, athleteProfile, recentState, trainingCapacity, forceRequestedSchedule } = args;
+  if (!request.sports.running) return false;
+  if (request.allowAdvancedWorkouts !== true || request.allowDoubleDays !== true) return false;
+  if (request.maxHardSessionsPerWeek === 0) return false;
+  if (!hasLongSameDayTrainingWindow(request)) return false;
+  if (forceRequestedSchedule) return true;
+  if (athleteProfile.experienceLevel !== 'advanced') return false;
+  if (recentState.fatigue !== 'fresh' && recentState.fatigue !== 'normal') return false;
+  if (trainingCapacity) {
+    return (
+      trainingCapacity.guardrails.allowDoubleDays &&
+      trainingCapacity.overall.readiness === 'green' &&
+      trainingCapacity.overall.readinessConfidence !== 'low'
+    );
+  }
+  return true;
+}
+
+function hasLongSameDayTrainingWindow(request: ScheduleRequest): boolean {
+  if (request.dailyPreferredMinutes !== null && request.dailyPreferredMinutes !== undefined) {
+    return request.dailyPreferredMinutes >= 90;
+  }
+  const text = [
+    request.availableTime,
+    request.notes,
+    request.goal,
+    ...(request.preferredTrainingWindows ?? []),
+  ]
+    .filter(Boolean)
+    .join('\n');
+  if (!text) return false;
+  if (/(一天两练|一日两练|同日两练|双练|双课|上午.*下午|早.*晚|morning.*afternoon|morning.*evening)/i.test(text)) {
+    return true;
+  }
+  for (const match of text.matchAll(/(\d{2,3})\s*(分钟|min|mins|minutes)/gi)) {
+    const minutes = Number(match[1]);
+    if (Number.isFinite(minutes) && minutes >= 90) return true;
+  }
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*(小时|h|hours?)/gi)) {
+    const hours = Number(match[1]);
+    if (Number.isFinite(hours) && hours >= 1.5) return true;
+  }
+  return false;
+}
+
+function applyExplicitWorkoutRequirements(
+  schedule: ScheduleResult,
+  request: ScheduleRequest,
+  intent: TrainingRequestIntent,
+  trainingCapacity?: TrainingCapacity,
+): ScheduleResult {
+  if (intent.requiredWorkouts.length === 0 && intent.notes.length === 0) return schedule;
+
+  let days = sortScheduleEntries(schedule.days.slice());
+  const notes = [...schedule.notes, ...intent.notes];
+  const requiredIds = new Set(intent.requiredWorkouts.map((r) => r.templateId));
+
+  if (
+    requiredIds.has('run.double_threshold_am.v1') ||
+    requiredIds.has('run.double_threshold_pm.v1')
+  ) {
+    const res = ensureDoubleThresholdPair(days, request, trainingCapacity);
+    days = res.days;
+    if (res.note) notes.push(res.note);
+  }
+
+  for (const required of intent.requiredWorkouts) {
+    if (isDoubleThresholdTemplate(required.templateId)) continue;
+    const tpl = getTemplate(required.templateId);
+    if (!tpl) continue;
+    if (!isTemplateEnabledByRequest(required.templateId, request)) {
+      notes.push(
+        `用户要求 ${required.raw}，但对应项目 ${tpl.fixed.sport} 未在本次计划中启用，未强行加入。`,
+      );
+      continue;
+    }
+    while (days.filter((d) => d.templateId === required.templateId).length < required.count) {
+      const idx = chooseReplacementIndex(days, tpl.fixed.sport, requiredIds);
+      if (idx < 0) {
+        notes.push(`用户要求 ${required.raw}，但当前课表没有可替换课位。`);
+        break;
+      }
+      const previous = days[idx];
+      const next = replaceEntryTemplate(
+        previous,
+        required.templateId,
+        `用户明确要求 ${required.raw}；系统用模板库自动匹配为 ${required.templateId}。`,
+        request,
+        trainingCapacity,
+      );
+      days[idx] = next;
+      notes.push(
+        `${previous.dayLabel} 已按用户要求由 ${previous.templateId} 调整为 ${required.templateId}。`,
+      );
+    }
+  }
+
+  const missing = missingRequiredWorkoutMessages(days, intent);
+  if (missing.length > 0) {
+    notes.push(`仍未完全满足用户显式训练要求：${missing.join('；')}。`);
+  }
+
+  return {
+    days: sortScheduleEntries(days),
+    notes,
+  };
+}
+
+function ensureDoubleThresholdPair(
+  days: ScheduleEntry[],
+  request: ScheduleRequest,
+  trainingCapacity?: TrainingCapacity,
+): { days: ScheduleEntry[]; note?: string } {
+  if (!request.sports.running) {
+    return { days, note: '用户要求双阈值，但本次计划未启用跑步项目，未强行加入。' };
+  }
+  const hasAm = days.some((d) => d.templateId === 'run.double_threshold_am.v1');
+  const hasPm = days.some((d) => d.templateId === 'run.double_threshold_pm.v1');
+  if (hasAm && hasPm) return { days };
+
+  const existingDouble = days.find((d) => isDoubleThresholdTemplate(d.templateId));
+  const thresholdLike = days.find((d) => {
+    const tpl = getTemplate(d.templateId);
+    return (
+      d.sport === 'running' &&
+      (tpl?.fixed.workoutType === 'threshold' || tpl?.fixed.workoutType === 'tempo')
+    );
+  });
+  const base =
+    existingDouble ??
+    thresholdLike ??
+    days[chooseReplacementIndex(days, 'running', new Set(['run.double_threshold_am.v1', 'run.double_threshold_pm.v1']))];
+  if (!base) return { days, note: '用户要求双阈值，但当前课表没有可替换的跑步课位。' };
+
+  const am = replaceEntryTemplate(
+    {
+      ...base,
+      slotIndex: 1,
+      sessionLabel: '上午',
+      timeOfDay: 'morning',
+    },
+    'run.double_threshold_am.v1',
+    '用户明确要求双阈值：上午安排短时间阈值间歇。',
+    request,
+    trainingCapacity,
+  );
+  const pm = replaceEntryTemplate(
+    {
+      ...base,
+      slotIndex: 2,
+      sessionLabel: '下午',
+      timeOfDay: 'afternoon',
+    },
+    'run.double_threshold_pm.v1',
+    '用户明确要求双阈值：下午安排 1km 阈值重复跑。',
+    request,
+    trainingCapacity,
+  );
+  const nextDays = days.filter(
+    (d) =>
+      d.dayIndex !== base.dayIndex ||
+      ((d.slotIndex ?? 1) > 2 && !isDoubleThresholdTemplate(d.templateId)),
+  );
+  return {
+    days: sortScheduleEntries([...nextDays, am, pm]),
+    note: `${base.dayLabel} 已按用户要求安排双阈值上午/下午两练；恢复风险只作为提示，不自动删除。`,
+  };
+}
+
+function replaceEntryTemplate(
+  entry: ScheduleEntry,
+  templateId: string,
+  reason: string,
+  request: ScheduleRequest,
+  trainingCapacity?: TrainingCapacity,
+): ScheduleEntry {
+  const tpl = getTemplate(templateId)!;
+  const next: ScheduleEntry = {
+    ...entry,
+    sport: tpl.fixed.sport,
+    templateId,
+    reason,
+  };
+  applyDurationCap(next, request.forceRequestedSchedule === true ? undefined : trainingCapacity);
+  return next;
+}
+
+function chooseReplacementIndex(
+  days: ScheduleEntry[],
+  preferredSport: Sport,
+  requiredIds: Set<string>,
+): number {
+  let best: { index: number; score: number } | null = null;
+  for (let index = 0; index < days.length; index += 1) {
+    const entry = days[index];
+    if (!entry) continue;
+    const tpl = getTemplate(entry.templateId);
+    if (!tpl) continue;
+    let score = 0;
+    if (requiredIds.has(entry.templateId)) score += 1000;
+    if (isDoubleThresholdTemplate(entry.templateId)) score += 900;
+    if (entry.sport !== preferredSport) score += 120;
+    if (entry.sport === 'rest' || entry.sport === 'mobility') score += 90;
+    if (tpl.fixed.intensity === 'high') score += 70;
+    if (tpl.fixed.intensity === 'medium') score += 35;
+    if (tpl.fixed.workoutType === 'lsd' || tpl.fixed.workoutType === 'long_ride') score += 30;
+    score += entry.dayIndex / 10;
+    if (!best || score < best.score) best = { index, score };
+  }
+  return best?.index ?? -1;
+}
+
+function isDoubleThresholdTemplate(templateId: string): boolean {
+  return templateId === 'run.double_threshold_am.v1' || templateId === 'run.double_threshold_pm.v1';
+}
+
+function sortScheduleEntries(days: ScheduleEntry[]): ScheduleEntry[] {
+  return days.slice().sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
+}
+
+function applyAdvancedWorkoutPreferences(
+  schedule: ScheduleResult,
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+  recentState: RecentState,
+  trainingCapacity: TrainingCapacity | undefined,
+  intent: TrainingRequestIntent,
+): ScheduleResult {
+  if (!shouldAutoIncludeAdvancedWorkout(request, athleteProfile, recentState, trainingCapacity)) {
+    return schedule;
+  }
+  if (schedule.days.some((d) => isNonDoubleAdvancedTemplate(d.templateId))) {
+    return schedule;
+  }
+
+  const templateId = chooseAutoAdvancedTemplate(request, athleteProfile);
+  if (!templateId) return schedule;
+
+  const requiredIds = new Set(intent.requiredWorkouts.map((r) => r.templateId));
+  const idx = chooseAdvancedPreferenceReplacementIndex(schedule.days, templateId, requiredIds);
+  if (idx < 0) return schedule;
+
+  const previous = schedule.days[idx];
+  if (!previous) return schedule;
+  const next = replaceEntryTemplate(
+    previous,
+    templateId,
+    `用户开启高级训练且训练时间充足；系统主动加入 ${templateId}，避免只生成基础模板。`,
+    request,
+    trainingCapacity,
+  );
+
+  const days = schedule.days.slice();
+  days[idx] = next;
+  return {
+    days: sortScheduleEntries(days),
+    notes: [
+      ...schedule.notes,
+      `${previous.dayLabel} 已根据高级训练偏好由 ${previous.templateId} 调整为 ${templateId}。`,
+    ],
+  };
+}
+
+function shouldAutoIncludeAdvancedWorkout(
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+  recentState: RecentState,
+  trainingCapacity?: TrainingCapacity,
+): boolean {
+  if (request.allowAdvancedWorkouts !== true) return false;
+  if (request.maxHardSessionsPerWeek === 0) return false;
+  if (!hasAdvancedTrainingWindow(request)) return false;
+  if (request.forceRequestedSchedule === true) return true;
+  if (recentState.fatigue === 'tired' || recentState.fatigue === 'high_risk') return false;
+  if (athleteProfile.experienceLevel !== 'advanced') return false;
+  if (trainingCapacity) {
+    return (
+      trainingCapacity.guardrails.allowHighIntensity &&
+      trainingCapacity.overall.readiness === 'green' &&
+      trainingCapacity.overall.readinessConfidence !== 'low'
+    );
+  }
+  return true;
+}
+
+function hasAdvancedTrainingWindow(request: ScheduleRequest): boolean {
+  if (request.dailyPreferredMinutes !== null && request.dailyPreferredMinutes !== undefined) {
+    return request.dailyPreferredMinutes >= 75;
+  }
+  const hardCap = request.maxHardSessionsPerWeek;
+  if (hardCap !== null && hardCap !== undefined && hardCap >= 3) return true;
+  const text = [request.availableTime, request.notes, request.goal].filter(Boolean).join('\n');
+  for (const match of text.matchAll(/(\d{2,3})\s*(分钟|min|mins|minutes)/gi)) {
+    const minutes = Number(match[1]);
+    if (Number.isFinite(minutes) && minutes >= 75) return true;
+  }
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*(小时|h|hours?)/gi)) {
+    const hours = Number(match[1]);
+    if (Number.isFinite(hours) && hours >= 1.25) return true;
+  }
+  return false;
+}
+
+function chooseAutoAdvancedTemplate(
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+): string | null {
+  if (request.sports.running) return 'run.reverse_pyramid.v1';
+  if (request.sports.cycling) {
+    return athleteProfile.cycling.ftpWatts ? 'bike.over_under.v1' : 'bike.vo2max.v1';
+  }
+  if (request.sports.swimming) return 'swim.vo2max.v1';
+  return null;
+}
+
+function chooseAdvancedPreferenceReplacementIndex(
+  days: readonly ScheduleEntry[],
+  templateId: string,
+  requiredIds: Set<string>,
+): number {
+  const tpl = getTemplate(templateId);
+  if (!tpl) return -1;
+  const sameSportIndexes = days
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) =>
+      entry.sport === tpl.fixed.sport &&
+      entry.sport !== 'rest' &&
+      entry.sport !== 'mobility' &&
+      !requiredIds.has(entry.templateId) &&
+      !isDoubleThresholdTemplate(entry.templateId),
+    );
+  if (sameSportIndexes.length === 0) return -1;
+
+  const thresholdLike = sameSportIndexes.filter(({ entry }) => {
+    const current = getTemplate(entry.templateId);
+    return current?.fixed.workoutType === 'threshold' || current?.fixed.workoutType === 'tempo';
+  });
+  if (thresholdLike.length > 1) return thresholdLike[0].index;
+
+  const high = sameSportIndexes.find(({ entry }) => getTemplate(entry.templateId)?.fixed.intensity === 'high');
+  if (high) return high.index;
+
+  const medium = sameSportIndexes.find(({ entry }) => getTemplate(entry.templateId)?.fixed.intensity === 'medium');
+  if (medium) return medium.index;
+
+  return sameSportIndexes[0].index;
+}
+
+function isNonDoubleAdvancedTemplate(templateId: string): boolean {
+  const type = getTemplate(templateId)?.fixed.workoutType;
+  return (
+    type === 'vo2max' ||
+    type === 'interval' ||
+    type === 'reverse_pyramid' ||
+    type === 'anaerobic' ||
+    type === 'sprint' ||
+    type === 'hill' ||
+    type === 'race_pace' ||
+    type === 'climb' ||
+    type === 'over_under' ||
+    type === 'open_water'
+  );
 }
 
 function expandRequestedDoubleDay(
@@ -933,6 +1340,7 @@ function enforceWeeklyDurationLimit(
       item.w,
       Math.max(minSessionMinutes, roundToFive(target)),
       limit,
+      'limit',
     );
   }
 
@@ -951,6 +1359,7 @@ function enforceWeeklyDurationLimit(
       workouts[candidate.index],
       nextMinutes,
       limit,
+      'limit',
     );
     adjustedTotal = activeWeeklyMinutes(schedule, workouts);
   }
@@ -967,10 +1376,166 @@ function enforceWeeklyDurationLimit(
   }
 }
 
+function enforceWeeklyDurationTarget(
+  schedule: ScheduleResult,
+  workouts: ParameterizedWorkout[],
+  request: ScheduleRequest,
+  intent: TrainingRequestIntent,
+  athleteProfile: AthleteProfile,
+  recentState: RecentState,
+): void {
+  const requestedTarget = intent.weeklyTargetMinutes;
+  if (requestedTarget === null || requestedTarget <= 0) return;
+
+  const limit = normalizeWeeklyMaxMinutes(request.weeklyMaxMinutes);
+  const target = Math.min(requestedTarget, limit);
+  let total = activeWeeklyMinutes(schedule, workouts);
+  if (total >= Math.round(target * 0.97)) return;
+
+  if (activeSessionCount(schedule, workouts) === 0) return;
+
+  let changed = false;
+  const preferDoubleDays = shouldPreferDoubleDays(schedule, workouts, target, request);
+  const balanced = growExistingSessionsTowardsTarget({
+    schedule,
+    workouts,
+    request,
+    target,
+    capMode: preferDoubleDays ? 'balanced' : 'max',
+  });
+  total = balanced.total;
+  changed ||= balanced.changed;
+
+  if (preferDoubleDays && total < target && request.allowDoubleDays === true) {
+    total = addLowIntensityVolumeSessions({
+      schedule,
+      workouts,
+      request,
+      athleteProfile,
+      recentState,
+      target,
+      currentTotal: total,
+    });
+    changed = true;
+  }
+
+  if (total < target) {
+    const maxGrowth = growExistingSessionsTowardsTarget({
+      schedule,
+      workouts,
+      request,
+      target,
+      capMode: 'max',
+    });
+    total = maxGrowth.total;
+    changed ||= maxGrowth.changed;
+  }
+
+  if (!preferDoubleDays && total < target && request.allowDoubleDays === true) {
+    total = addLowIntensityVolumeSessions({
+      schedule,
+      workouts,
+      request,
+      athleteProfile,
+      recentState,
+      target,
+      currentTotal: total,
+    });
+    changed = true;
+  }
+
+  if (!changed) {
+    schedule.notes.push(
+      `用户本周目标约 ${requestedTarget} 分钟，但当前模板和单日上限下无法继续专业地拉长训练课。`,
+    );
+    return;
+  }
+
+  pruneStaleDurationEstimateNotes(schedule);
+
+  if (total >= Math.round(target * 0.97)) {
+    schedule.notes.push(
+      `已按用户周目标把本周训练时长调整到约 ${total}/${target} 分钟；高时长优先用低强度双练分摊，避免单次训练过长。`,
+    );
+  } else {
+    schedule.notes.push(
+      `用户本周目标约 ${requestedTarget} 分钟，当前已尽量提高到 ${total}/${target} 分钟；剩余差距不再用高强度主项硬凑。`,
+    );
+  }
+}
+
+function pruneStaleDurationEstimateNotes(schedule: ScheduleResult): void {
+  const stale =
+    /(总时长估算|训练时长估算|当前方案约|距离\s*\d+\s*分钟目标|距离.*目标|建议.*延长.*达到|可达到约)/;
+  schedule.notes.splice(
+    0,
+    schedule.notes.length,
+    ...schedule.notes.filter((note) => !stale.test(note)),
+  );
+}
+
+function growExistingSessionsTowardsTarget(args: {
+  schedule: ScheduleResult;
+  workouts: ParameterizedWorkout[];
+  request: ScheduleRequest;
+  target: number;
+  capMode: 'balanced' | 'max';
+}): { total: number; changed: boolean } {
+  const { schedule, workouts, request, target, capMode } = args;
+  let total = activeWeeklyMinutes(schedule, workouts);
+  let changed = false;
+  const activeIndexes = workouts
+    .map((w, index) => ({ w, s: schedule.days[index], index }))
+    .filter(({ w, s }) =>
+      s &&
+      s.sport !== 'rest' &&
+      s.sport !== 'mobility' &&
+      Number.isFinite(w.durationMinutes) &&
+      w.durationMinutes > 0,
+    );
+  const tiers = [
+    activeIndexes.filter(({ w }) => durationGrowthTier(w) === 'low'),
+    activeIndexes.filter(({ w }) => durationGrowthTier(w) === 'medium'),
+    activeIndexes.filter(({ w }) => durationGrowthTier(w) === 'high'),
+  ];
+
+  for (const tier of tiers) {
+    if (total >= target) break;
+    const sorted = tier
+      .slice()
+      .sort((a, b) => durationGrowthPriority(a.w) - durationGrowthPriority(b.w));
+    let progressed = true;
+    while (total < target && progressed) {
+      progressed = false;
+      for (const item of sorted) {
+        if (total >= target) break;
+        const current = workouts[item.index].durationMinutes;
+        const cap = durationTargetCap(workouts[item.index], request, capMode);
+        if (current >= cap) continue;
+        const next = Math.min(cap, current + Math.min(10, target - total));
+        const rounded = Math.max(current + 1, roundToFive(next));
+        const nextMinutes = Math.min(cap, rounded, current + Math.max(5, target - total));
+        if (nextMinutes <= current) continue;
+        workouts[item.index] = adjustWorkoutDuration(
+          workouts[item.index],
+          nextMinutes,
+          target,
+          'target',
+        );
+        total = activeWeeklyMinutes(schedule, workouts);
+        progressed = true;
+        changed = true;
+      }
+    }
+  }
+  return { total, changed };
+}
+
 function adjustWorkoutDuration(
   workout: ParameterizedWorkout,
   nextMinutes: number,
   weeklyLimit: number,
+  mode: 'limit' | 'target' = 'limit',
 ): ParameterizedWorkout {
   const current = workout.durationMinutes;
   const durationMinutes = Math.max(0, Math.round(nextMinutes));
@@ -984,7 +1549,9 @@ function adjustWorkoutDuration(
       ? Math.round(workout.distanceKm! * scale * 100) / 100
       : workout.distanceKm;
   const targets = [
-    `总时长 ${durationMinutes} 分钟（已按周上限 ${weeklyLimit} 分钟控制）`,
+    mode === 'target'
+      ? `总时长 ${durationMinutes} 分钟（已按周目标 ${weeklyLimit} 分钟分配）`
+      : `总时长 ${durationMinutes} 分钟（已按周上限 ${weeklyLimit} 分钟控制）`,
     ...(workout.targets ?? []).filter((t) => !/^总时长\s*\d+\s*分钟/.test(t)),
   ];
   return {
@@ -996,11 +1563,202 @@ function adjustWorkoutDuration(
       ...workout.parameterSource,
       replacedVariables: {
         ...workout.parameterSource.replacedVariables,
-        __weekly_duration_limit: weeklyLimit,
+        ...(mode === 'target'
+          ? { __weekly_duration_target: weeklyLimit }
+          : { __weekly_duration_limit: weeklyLimit }),
         __original_duration_minutes: current,
       },
     },
   };
+}
+
+function durationGrowthTier(workout: ParameterizedWorkout): 'low' | 'medium' | 'high' {
+  if (workout.intensity === 'high') return 'high';
+  if (workout.intensity === 'medium') return 'medium';
+  return 'low';
+}
+
+function durationGrowthPriority(workout: ParameterizedWorkout): number {
+  if (workout.workoutType === 'long_ride') return 0;
+  if (workout.workoutType === 'lsd') return 1;
+  if (workout.workoutType === 'endurance') return 2;
+  if (workout.workoutType === 'aerobic') return 3;
+  if (workout.workoutType === 'recovery' || workout.workoutType === 'recovery_spin') return 4;
+  if (workout.intensity === 'medium') return 10;
+  return 20;
+}
+
+function durationTargetCap(
+  workout: ParameterizedWorkout,
+  request: ScheduleRequest,
+  mode: 'balanced' | 'max',
+): number {
+  const tpl = getTemplate(workout.templateId);
+  const templateMax = tpl?.fixed.maxDurationMinutes ?? workout.durationMinutes;
+  if (workout.intensity === 'high') {
+    return Math.max(workout.durationMinutes, templateMax);
+  }
+  if (mode === 'balanced') {
+    if (workout.workoutType === 'long_ride') return Math.max(workout.durationMinutes, Math.min(105, templateMax));
+    if (workout.workoutType === 'lsd') return Math.max(workout.durationMinutes, Math.min(100, templateMax));
+    if (workout.intensity === 'low') return Math.max(workout.durationMinutes, Math.min(90, templateMax));
+    if (workout.intensity === 'medium') return Math.max(workout.durationMinutes, Math.min(90, templateMax));
+    return Math.max(workout.durationMinutes, templateMax);
+  }
+  const dailyCap =
+    request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0
+      ? request.dailyPreferredMinutes
+      : null;
+  if (dailyCap !== null) {
+    return Math.max(workout.durationMinutes, Math.min(MAX_WEEKLY_TRAINING_MINUTES, dailyCap));
+  }
+  if (workout.workoutType === 'long_ride') return Math.max(templateMax, 180);
+  if (workout.workoutType === 'lsd') return Math.max(templateMax, 150);
+  if (workout.intensity === 'low') return Math.max(templateMax, 120);
+  if (workout.intensity === 'medium') return Math.max(templateMax, 105);
+  return Math.max(templateMax, Math.min(110, templateMax + 20));
+}
+
+function shouldPreferDoubleDays(
+  schedule: ScheduleResult,
+  workouts: ParameterizedWorkout[],
+  target: number,
+  request: ScheduleRequest,
+): boolean {
+  if (request.allowDoubleDays !== true) return false;
+  const sessions = activeSessionCount(schedule, workouts);
+  if (sessions <= 0) return false;
+  const preferred = request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0
+    ? request.dailyPreferredMinutes
+    : 90;
+  return target / sessions > Math.min(95, preferred * 0.85);
+}
+
+function activeSessionCount(
+  schedule: ScheduleResult,
+  workouts: ParameterizedWorkout[],
+): number {
+  let count = 0;
+  for (let i = 0; i < Math.min(schedule.days.length, workouts.length); i += 1) {
+    const s = schedule.days[i];
+    const w = workouts[i];
+    if (!s || !w) continue;
+    if (s.sport === 'rest' || s.sport === 'mobility') continue;
+    if (Number.isFinite(w.durationMinutes) && w.durationMinutes > 0) count += 1;
+  }
+  return count;
+}
+
+function addLowIntensityVolumeSessions(args: {
+  schedule: ScheduleResult;
+  workouts: ParameterizedWorkout[];
+  request: ScheduleRequest;
+  athleteProfile: AthleteProfile;
+  recentState: RecentState;
+  target: number;
+  currentTotal: number;
+}): number {
+  const { schedule, workouts, request, athleteProfile, recentState, target } = args;
+  let total = args.currentTotal;
+  let guard = 0;
+  while (total < target && guard < 7) {
+    guard += 1;
+    const day = chooseExtraVolumeDay(schedule, workouts);
+    if (!day) break;
+    const templateId = chooseExtraVolumeTemplate(request, day.sport);
+    const tpl = getTemplate(templateId);
+    if (!tpl) break;
+    const remaining = target - total;
+    const minutes = Math.max(30, Math.min(extraSessionCap(request), roundToFive(remaining)));
+    const usedSlots = schedule.days
+      .filter((d) => d.dayIndex === day.dayIndex)
+      .map((d) => d.slotIndex ?? 1);
+    const slotIndex = 2;
+    if (usedSlots.includes(slotIndex)) break;
+
+    const entry: ScheduleEntry = {
+      dayIndex: day.dayIndex,
+      date: day.date,
+      dayLabel: day.dayLabel,
+      sport: tpl.fixed.sport,
+      templateId,
+      slotIndex,
+      sessionLabel: slotIndex === 2 ? '加练' : `加练 ${slotIndex}`,
+      timeOfDay: slotIndex === 2 ? 'evening' : 'afternoon',
+      reason: '用户明确给出周训练目标；用低强度加练补足总量，避免拉长质量课主项。',
+    };
+    const baseWorkout = parameterizeWorkout({
+      template: tpl,
+      athleteProfile,
+      recentState,
+      request: {
+        targetMetricPreference: request.targetMetricPreference,
+        availableTime: request.availableTime,
+        dailyPreferredMinutes: null,
+      },
+      scheduleEntry: entry,
+      progression: 'normal',
+    });
+    const workout = adjustWorkoutDuration(baseWorkout, minutes, target, 'target');
+    insertScheduleWorkout(schedule, workouts, entry, workout);
+    total = activeWeeklyMinutes(schedule, workouts);
+  }
+  return total;
+}
+
+function extraSessionCap(request: ScheduleRequest): number {
+  const daily = request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0
+    ? request.dailyPreferredMinutes
+    : 75;
+  return Math.max(30, Math.min(75, daily));
+}
+
+function chooseExtraVolumeDay(
+  schedule: ScheduleResult,
+  workouts: ParameterizedWorkout[],
+): ScheduleEntry | null {
+  const candidates = schedule.days
+    .map((entry, index) => {
+      const dayWorkouts = schedule.days
+        .map((d, i) => ({ d, w: workouts[i] }))
+        .filter(({ d }) => d.dayIndex === entry.dayIndex);
+      const hasHigh = dayWorkouts.some(({ w }) => w?.intensity === 'high');
+      const slots = dayWorkouts.length;
+      const minutes = dayWorkouts.reduce((sum, { w }) => sum + (w?.durationMinutes ?? 0), 0);
+      return { entry, index, hasHigh, slots, minutes };
+    })
+    .filter(({ entry, slots }) => entry.sport !== 'rest' && entry.sport !== 'mobility' && slots < 2)
+    .sort((a, b) => {
+      if (a.hasHigh !== b.hasHigh) return a.hasHigh ? 1 : -1;
+      if (a.slots !== b.slots) return a.slots - b.slots;
+      if (a.minutes !== b.minutes) return a.minutes - b.minutes;
+      return a.index - b.index;
+    });
+  return candidates[0]?.entry ?? null;
+}
+
+function chooseExtraVolumeTemplate(request: ScheduleRequest, anchorSport: Sport): string {
+  if (anchorSport === 'cycling' && request.sports.cycling) return 'bike.endurance.v1';
+  if (anchorSport === 'running' && request.sports.running) return 'run.aerobic.v1';
+  if (anchorSport === 'swimming' && request.sports.swimming) return 'swim.aerobic.v1';
+  if (request.sports.cycling) return 'bike.endurance.v1';
+  if (request.sports.running) return 'run.aerobic.v1';
+  if (request.sports.swimming) return 'swim.aerobic.v1';
+  return 'rest.mobility.v1';
+}
+
+function insertScheduleWorkout(
+  schedule: ScheduleResult,
+  workouts: ParameterizedWorkout[],
+  entry: ScheduleEntry,
+  workout: ParameterizedWorkout,
+): void {
+  const pairs = schedule.days
+    .map((day, index) => ({ day, workout: workouts[index] }))
+    .concat({ day: entry, workout })
+    .sort((a, b) => a.day.dayIndex - b.day.dayIndex || (a.day.slotIndex ?? 1) - (b.day.slotIndex ?? 1));
+  schedule.days.splice(0, schedule.days.length, ...pairs.map((p) => p.day));
+  workouts.splice(0, workouts.length, ...pairs.map((p) => p.workout));
 }
 
 function activeWeeklyMinutes(

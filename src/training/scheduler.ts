@@ -630,7 +630,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
 
   // Default rotation by day position (deterministic).
   // Try high-intensity first only if cap allows AND prev day not high.
-  const rotation = pickRotationCandidates(input.sport, input.dayIndex);
+  const rotation = pickRotationCandidates(input);
   for (const candidateId of rotation) {
     if (!allowedIds.has(candidateId)) continue;
     const intensity = templateIntensity(candidateId);
@@ -653,10 +653,27 @@ function pickTemplateForDay(input: PickInput): PickOutput {
 
 // Rotation order tries a balanced mix; harder templates are surfaced on
 // odd-indexed days and aerobic on the others.
-function pickRotationCandidates(sport: ActiveSport, dayIndex: number): string[] {
+function pickRotationCandidates(input: PickInput): string[] {
+  const { sport, dayIndex } = input;
   const isHardSlot = dayIndex % 2 === 0; // Tue/Thu/Sat-ish
+  const preferAdvanced = shouldPreferAdvancedTemplates(input);
   if (sport === 'running') {
     if (isHardSlot) {
+      if (preferAdvanced) {
+        return rotateByHardSessionCount(
+          [
+            'run.reverse_pyramid.v1',
+            'run.threshold.v1',
+            'run.vo2max.v1',
+            'run.interval.v1',
+            'run.hill.v1',
+            'run.tempo.v1',
+            'run.aerobic.v1',
+            'run.recovery.v1',
+          ],
+          input.hardScheduled,
+        );
+      }
       return [
         'run.threshold.v1',
         'run.tempo.v1',
@@ -670,6 +687,22 @@ function pickRotationCandidates(sport: ActiveSport, dayIndex: number): string[] 
   }
   if (sport === 'cycling') {
     if (isHardSlot) {
+      if (preferAdvanced) {
+        return rotateByHardSessionCount(
+          [
+            'bike.over_under.v1',
+            'bike.vo2max.v1',
+            'bike.anaerobic.v1',
+            'bike.climb.v1',
+            'bike.threshold.v1',
+            'bike.sweet_spot.v1',
+            'bike.tempo.v1',
+            'bike.endurance.v1',
+            'bike.recovery_spin.v1',
+          ],
+          input.hardScheduled,
+        );
+      }
       return [
         'bike.threshold.v1',
         'bike.sweet_spot.v1',
@@ -683,6 +716,20 @@ function pickRotationCandidates(sport: ActiveSport, dayIndex: number): string[] 
   }
   // swimming
   if (isHardSlot) {
+    if (preferAdvanced) {
+      return rotateByHardSessionCount(
+        [
+          'swim.vo2max.v1',
+          'swim.sprint.v1',
+          'swim.css_threshold.v1',
+          'swim.aerobic.v1',
+          'swim.endurance.v1',
+          'swim.technique.v1',
+          'swim.recovery.v1',
+        ],
+        input.hardScheduled,
+      );
+    }
     return [
       'swim.css_threshold.v1',
       'swim.aerobic.v1',
@@ -693,6 +740,22 @@ function pickRotationCandidates(sport: ActiveSport, dayIndex: number): string[] 
     ];
   }
   return ['swim.aerobic.v1', 'swim.technique.v1', 'swim.recovery.v1'];
+}
+
+function shouldPreferAdvancedTemplates(input: PickInput): boolean {
+  if (input.request.allowAdvancedWorkouts !== true) return false;
+  if (input.hardCap <= 0 || input.recentState.fatigue === 'high_risk') return false;
+  const daily = input.request.dailyPreferredMinutes ?? 0;
+  const hardCap = input.request.maxHardSessionsPerWeek ?? input.hardCap;
+  return daily >= 75 || hardCap >= 3 || input.athleteProfile.experienceLevel === 'advanced';
+}
+
+function rotateByHardSessionCount(ids: string[], hardScheduled: number): string[] {
+  const highIds = ids.filter((id) => templateIntensity(id) === 'high');
+  const rest = ids.filter((id) => templateIntensity(id) !== 'high');
+  if (highIds.length === 0) return ids;
+  const offset = hardScheduled % highIds.length;
+  return [...highIds.slice(offset), ...highIds.slice(0, offset), ...rest];
 }
 
 function rotationReason(templateId: string, intensity: 'low' | 'medium' | 'high'): string {

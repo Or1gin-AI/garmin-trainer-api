@@ -72,6 +72,17 @@ function renderRun(w: Workout): string[] {
       `- ${recovery}mtr Z1 HR`,
     ]);
   }
+  if (type === 'reverse_pyramid') {
+    const rest = minutes(w, ['recoveryDuration'], 3);
+    return withWarmCool(w, [
+      'Main Set',
+      `- 1200mtr ${paceTarget(w, '100% Pace', true)}`,
+      `- ${rest}m Z1 HR`,
+      `- 800mtr 105% Pace`,
+      `- ${rest}m Z1 HR`,
+      `- 400mtr 110% Pace`,
+    ]);
+  }
   if (type === 'vo2max') {
     const reps = repsValue(w, ['vo2Repeats'], 5);
     const work = minutes(w, ['vo2Duration'], 4);

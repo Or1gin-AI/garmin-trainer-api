@@ -2167,6 +2167,7 @@ trainingRouter.post(
               request,
               ctx,
               workoutsSnapshot,
+              userMessage: userMessageContent,
               signal: abort.signal,
             });
           } catch (err) {
@@ -2309,6 +2310,7 @@ interface DispatchChatToolArgs {
   request: ScheduleRequest;
   ctx: DerivedContext;
   workoutsSnapshot: Workout[];
+  userMessage: string;
   signal?: AbortSignal;
 }
 
@@ -2322,6 +2324,7 @@ async function dispatchChatToolCall(
   args: DispatchChatToolArgs,
 ): Promise<DispatchChatToolResult> {
   const { call, planId, request, ctx, workoutsSnapshot, signal } = args;
+  const intentText = `${args.userMessage}\n${'reason' in call.arguments ? call.arguments.reason : ''}`;
 
   if (call.name === 'regenerate_day') {
     const dayIndex = call.arguments.dayIndex;
@@ -2358,18 +2361,29 @@ async function dispatchChatToolCall(
       };
     }
 
-    // Build a ScheduleEntry from the existing workout row so we can re-run
-    // the parameterizer in place (without re-running the weekly scheduler).
-    const entry = workoutRowToScheduleEntry(before);
-
-    const tpl = getTemplate(before.templateId) ?? getTemplate('rest.full.v1');
+    const requestedTemplateId =
+      normalizeChatTemplateId(call.arguments.templateId) ??
+      inferChatTemplateId(intentText, { forSecondWorkout: false });
+    const targetTemplateId = requestedTemplateId ?? before.templateId;
+    const tpl = getTemplate(targetTemplateId) ?? getTemplate('rest.full.v1');
     if (!tpl) {
       return {
         toolResult: JSON.stringify({
-          error: `template ${before.templateId} not found`,
+          error: `template ${targetTemplateId} not found`,
         }),
       };
     }
+
+    // Build a ScheduleEntry from the existing workout row so we can re-run
+    // the parameterizer in place. If the user explicitly requested a new
+    // workout type, replace the template instead of silently regenerating the
+    // old one.
+    const entry: ScheduleEntry = {
+      ...workoutRowToScheduleEntry(before),
+      sport: tpl.fixed.sport,
+      templateId: targetTemplateId,
+      reason: call.arguments.reason,
+    };
 
     const progression =
       ctx.recentState.fatigue === 'tired' || ctx.recentState.fatigue === 'high_risk'
@@ -2520,7 +2534,13 @@ async function dispatchChatToolCall(
 
     const templateId = chooseSecondWorkoutTemplate({
       requestedSport: call.arguments.sport,
-      requestedTemplateId: call.arguments.templateId,
+      requestedTemplateId:
+        normalizeChatTemplateId(call.arguments.templateId) ??
+        inferChatTemplateId(intentText, {
+          forSecondWorkout: true,
+          sportHint: call.arguments.sport,
+        }) ??
+        undefined,
       dayWorkouts: candidates,
       athleteProfile: ctx.athleteProfile,
     });
@@ -2533,6 +2553,14 @@ async function dispatchChatToolCall(
       };
     }
 
+    const isExplicitTemplate = Boolean(
+      normalizeChatTemplateId(call.arguments.templateId) ??
+      inferChatTemplateId(intentText, {
+        forSecondWorkout: true,
+        sportHint: call.arguments.sport,
+      }),
+    );
+
     const entry: ScheduleEntry = {
       dayIndex,
       date: String(candidates[0].date),
@@ -2543,8 +2571,10 @@ async function dispatchChatToolCall(
       sessionLabel: slotIndex === 2 ? '下午' : '加练',
       timeOfDay: slotIndex === 2 ? 'afternoon' : 'evening',
       reason: call.arguments.reason,
-      durationCapMinutes: secondWorkoutDurationCap(templateId),
-      durationCapReason: '聊天加练：第二课时默认控制为短低压力训练。',
+      durationCapMinutes: isExplicitTemplate ? undefined : secondWorkoutDurationCap(templateId),
+      durationCapReason: isExplicitTemplate
+        ? undefined
+        : '聊天加练：用户未指定训练类型，默认控制为短低压力训练。',
     };
 
     const progression =
@@ -2626,6 +2656,58 @@ async function dispatchChatToolCall(
   return {
     toolResult: JSON.stringify({ error: 'unknown tool call' }),
   };
+}
+
+function normalizeChatTemplateId(templateId: string | undefined): string | undefined {
+  if (!templateId) return undefined;
+  const trimmed = templateId.trim();
+  return getTemplate(trimmed) ? trimmed : undefined;
+}
+
+function inferChatTemplateId(
+  text: string,
+  opts: {
+    forSecondWorkout: boolean;
+    sportHint?: 'running' | 'cycling' | 'swimming' | 'mobility';
+  },
+): string | undefined {
+  const lower = text.toLowerCase();
+  const sportHint = opts.sportHint;
+
+  if (/双阈值|double\s*threshold/.test(lower)) {
+    return opts.forSecondWorkout ? 'run.double_threshold_pm.v1' : 'run.double_threshold_am.v1';
+  }
+  if (/倒金字塔|递减金字塔|reverse\s*pyramid|inverted\s*pyramid/.test(lower)) {
+    return 'run.reverse_pyramid.v1';
+  }
+
+  if (/恢复游|恢复.*游|swim.*recovery|recovery.*swim/.test(lower)) return 'swim.recovery.v1';
+  if (/恢复骑|恢复.*骑|recovery.*ride|recovery.*bike/.test(lower)) return 'bike.recovery_spin.v1';
+  if (/恢复跑|恢复.*跑|recovery.*run/.test(lower)) return 'run.recovery.v1';
+
+  if (/甜区|sweet\s*spot/.test(lower)) return 'bike.sweet_spot.v1';
+  if (/阈值骑|骑.*阈值/.test(lower)) return 'bike.threshold.v1';
+  if (/阈值游|游.*阈值|css/.test(lower)) return 'swim.css_threshold.v1';
+  if (/阈值跑|跑.*阈值|threshold|zone\s*4|z4|hr\s*z4/.test(lower)) {
+    if (sportHint === 'cycling') return 'bike.threshold.v1';
+    if (sportHint === 'swimming') return 'swim.css_threshold.v1';
+    return 'run.threshold.v1';
+  }
+
+  if (/最大摄氧|vo2|max\s*oxygen|vvo2/.test(lower)) {
+    if (sportHint === 'cycling') return 'bike.vo2max.v1';
+    if (sportHint === 'swimming') return 'swim.vo2max.v1';
+    return 'run.vo2max.v1';
+  }
+  if (/短间歇|间歇|400|800|interval/.test(lower)) return 'run.interval.v1';
+  if (/节奏跑|tempo/.test(lower)) return 'run.tempo.v1';
+  if (/递进跑|progression/.test(lower)) return 'run.progression.v1';
+  if (/大步跑|strides?/.test(lower)) return 'run.strides.v1';
+  if (/坡跑|上坡|hill/.test(lower)) return 'run.hill.v1';
+  if (/有氧跑|普通有氧|zone\s*2|z2/.test(lower)) return 'run.aerobic.v1';
+  if (/lsd|长距离|长跑/.test(lower)) return 'run.lsd.v1';
+
+  return undefined;
 }
 
 function chooseSecondWorkoutTemplate(args: {

@@ -315,6 +315,53 @@ const runInterval: WorkoutTemplate = {
 };
 
 // ---------------------------------------------------------------------------
+// run.reverse_pyramid.v1 — 倒金字塔间歇跑
+// 默认时长 60-75 分钟。1200m + 800m + 400m，距离逐段缩短、速度逐段提高。
+// ---------------------------------------------------------------------------
+const runReversePyramid: WorkoutTemplate = {
+  id: 'run.reverse_pyramid.v1',
+  fixed: {
+    sport: 'running',
+    workoutType: 'reverse_pyramid',
+    title: '倒金字塔间歇跑',
+    purpose: '用递减距离维持高质量速度输出，提高速度耐力和后程调动能力。',
+    intensity: 'high',
+    stress: 'high',
+    primaryMetric: 'pace',
+    allowedMetrics: ['pace', 'heart_rate'],
+    phases: [
+      { name: 'warmup', label: '热身', duration: '$warmupDuration', description: '含动态拉伸、跑姿练习和 4 x 20 秒加速。' },
+      { name: 'main', label: '主训练 1200m + 800m + 400m 倒金字塔', duration: '$mainDurationTotal', description: '第一段接近 10K 配速，第二段接近 5K 配速，第三段接近 3K 配速；组间慢跑恢复 $recoveryDuration 分钟。' },
+      { name: 'cooldown', label: '放松', duration: '$cooldownDuration' },
+    ],
+    contraindications: [
+      'latestStimulus.threshold',
+      'latestStimulus.vo2max',
+      'latestStimulus.anaerobic',
+      'fatigue.tired',
+      'fatigue.high_risk',
+      'hardSessions.atCap',
+      'confidence.low',
+    ],
+    downgradeTo: 'run.interval.v1',
+    requiredRecoveryHoursAfter: 48,
+    minDurationMinutes: 60,
+    maxDurationMinutes: 75,
+    notes: '倒金字塔由系统按能力自动给出结构：1200m + 800m + 400m，组间 3 分钟慢跑；如果睡眠差或腿部疲劳，将第三段改为 400m 放松加速而非全力冲刺。',
+  },
+  variables: {
+    warmupDuration: { source: { kind: 'template_default', default: 15, unit: 'minutes' } },
+    mainDurationTotal: { source: { kind: 'template_default', default: 22, unit: 'minutes' } },
+    recoveryDuration: { source: { kind: 'template_default', default: 3, unit: 'minutes' } },
+    cooldownDuration: { source: { kind: 'template_default', default: 13, unit: 'minutes' } },
+    targetPace: { source: { kind: 'athlete_profile', path: 'athleteProfile.running.intervalPaceSecPerKm', unit: 's/km' } },
+    vo2HrCap: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.vo2CapRange', unit: 'bpm' } },
+    totalFastDistance: { source: { kind: 'template_default', default: 2400, unit: '米' } },
+  },
+  progression: PROGRESSION_INTERVAL,
+};
+
+// ---------------------------------------------------------------------------
 // run.vo2max.v1 — 最大摄氧跑
 // 默认时长 55-70 分钟。6 x 3 分钟 RUN.vo2Pace，组间慢跑 3 分钟。
 // ---------------------------------------------------------------------------
@@ -645,6 +692,7 @@ export const RUNNING_TEMPLATES: Record<string, WorkoutTemplate> = {
   [runTempo.id]: runTempo,
   [runThreshold.id]: runThreshold,
   [runInterval.id]: runInterval,
+  [runReversePyramid.id]: runReversePyramid,
   [runVo2max.id]: runVo2max,
   [runHill.id]: runHill,
   [runStrides.id]: runStrides,

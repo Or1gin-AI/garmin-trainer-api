@@ -195,6 +195,7 @@ function isAdvancedTemplate(tpl: WorkoutTemplate): boolean {
   return (
     type === 'vo2max' ||
     type === 'interval' ||
+    type === 'reverse_pyramid' ||
     type === 'anaerobic' ||
     type === 'sprint' ||
     type === 'hill' ||

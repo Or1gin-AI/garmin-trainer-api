@@ -36,6 +36,7 @@ const HIGH_WORKOUT_TYPES = new Set([
   'css_threshold',
   'vo2max',
   'interval',
+  'reverse_pyramid',
   'anaerobic',
   'sprint',
   'hill',
@@ -178,6 +179,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
       }
 
       if (
+        plan.context.forceRequestedSchedule !== true &&
         plan.context.trainingCapacity &&
         isCapacitySport(w.sport) &&
         plan.context.trainingCapacity.sports[w.sport].confidence === 'low' &&
@@ -221,7 +223,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
   const hardBudget =
     plan.context.maxHardSessionsPerWeek -
     plan.context.hardSessionsAlreadyDoneThisWeek;
-  if (hardCount > Math.max(0, hardBudget)) {
+  if (plan.context.forceRequestedSchedule !== true && hardCount > Math.max(0, hardBudget)) {
     violations.push({
       rule: 'hard_cap_per_week',
       details: `本周高强度课 ${hardCount} > 剩余预算 ${Math.max(0, hardBudget)}（cap=${plan.context.maxHardSessionsPerWeek}, 已完成=${plan.context.hardSessionsAlreadyDoneThisWeek}）。`,
@@ -229,6 +231,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
   }
 
   if (
+    plan.context.forceRequestedSchedule !== true &&
     plan.context.trainingCapacity &&
     !plan.context.trainingCapacity.guardrails.allowHighIntensity &&
     hardCount > 0
@@ -239,7 +242,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
     });
   }
 
-  if (plan.context.trainingCapacity) {
+  if (plan.context.trainingCapacity && plan.context.forceRequestedSchedule !== true) {
     violations.push(...validateIntensityDistribution(plan));
     violations.push(...validateLongSessionShare(plan));
   }
