@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { subscription } from '../db/schema.js';
@@ -15,6 +16,11 @@ export interface UserPlanInfo {
   canUseAi: boolean;
   autoSyncEnabled: boolean;
   lastAutoSyncAt: Date | null;
+  referralCode: string;
+}
+
+function generateReferralCode(): string {
+  return crypto.randomBytes(4).toString('base64url').toUpperCase().slice(0, 6);
 }
 
 function normalizePlan(plan: string): SubscriptionPlan {
@@ -36,12 +42,13 @@ export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
     .limit(1);
   const row = rows[0];
   if (!row) {
-    // lazy create
     const now = new Date();
+    const referralCode = generateReferralCode();
     await db.insert(subscription).values({
       userId,
       plan: 'free',
       autoSyncEnabled: true,
+      referralCode,
       createdAt: now,
       updatedAt: now,
     });
@@ -55,7 +62,16 @@ export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
       canUseAi: false,
       autoSyncEnabled: true,
       lastAutoSyncAt: null,
+      referralCode,
     };
+  }
+  let referralCode = row.referralCode;
+  if (!referralCode) {
+    referralCode = generateReferralCode();
+    await db
+      .update(subscription)
+      .set({ referralCode, updatedAt: new Date() })
+      .where(eq(subscription.userId, userId));
   }
   const now = new Date();
   const storedPlan = normalizePlan(row.plan);
@@ -66,13 +82,13 @@ export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
     plan: activePlan,
     expiresAt: row.expiresAt,
     isPaidActive,
-    // Backward compatibility for older web clients: this means any paid plan.
     isProActive: isPaidActive,
     isMaxActive: activePlan === 'max',
     canAutoSync: activePlan === 'pro' || activePlan === 'max',
     canUseAi: activePlan === 'max',
     autoSyncEnabled: row.autoSyncEnabled,
     lastAutoSyncAt: row.lastAutoSyncAt,
+    referralCode,
   };
 }
 

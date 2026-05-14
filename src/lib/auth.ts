@@ -54,6 +54,14 @@ export const auth = betterAuth({
       const { subject, html } = buildEmailVerificationEmail(user.name || '', url);
       await sendEmail(user.email, subject, html);
     },
+    afterEmailVerification: async (user) => {
+      try {
+        const { processReferralReward } = await import('./referral.js');
+        await processReferralReward(user.email);
+      } catch (e) {
+        console.error('[referral] afterEmailVerification error', e);
+      }
+    },
   },
   plugins: [
     username({

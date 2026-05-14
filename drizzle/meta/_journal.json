@@ -64,6 +64,13 @@
       "when": 1779004800000,
       "tag": "0008_max_subscription_tier",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1779091200000,
+      "tag": "0009_referral_system",
+      "breakpoints": true
     }
   ]
 }

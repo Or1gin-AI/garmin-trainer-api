@@ -82,6 +82,7 @@ export const subscription = pgTable(
     expiresAt: timestamp('expires_at'),
     autoSyncEnabled: boolean('auto_sync_enabled').notNull().default(true),
     lastAutoSyncAt: timestamp('last_auto_sync_at'),
+    referralCode: text('referral_code').unique(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
   },
@@ -103,6 +104,31 @@ export const redemptionCode = pgTable(
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
   (t) => [index('redemption_used_by_idx').on(t.usedBy)],
+);
+
+// ===== Referral tracking =====
+
+export const referral = pgTable(
+  'referral',
+  {
+    id: text('id').primaryKey(),
+    referrerUserId: text('referrer_user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    referralCode: text('referral_code').notNull(),
+    refereeEmail: text('referee_email').notNull(),
+    refereeUserId: text('referee_user_id').references(() => user.id, {
+      onDelete: 'set null',
+    }),
+    status: text('status').notNull().default('pending'), // 'pending' | 'completed' | 'expired'
+    rewardDays: integer('reward_days').notNull().default(15),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    completedAt: timestamp('completed_at'),
+  },
+  (t) => [
+    uniqueIndex('referral_referee_email_idx').on(t.refereeEmail),
+    index('referral_referrer_idx').on(t.referrerUserId),
+  ],
 );
 
 // ===== Garmin account (per region per user) =====
@@ -460,6 +486,7 @@ export const llmConfig = pgTable(
 
 export type User = typeof user.$inferSelect;
 export type Subscription = typeof subscription.$inferSelect;
+export type Referral = typeof referral.$inferSelect;
 export type RedemptionCode = typeof redemptionCode.$inferSelect;
 export type GarminAccount = typeof garminAccount.$inferSelect;
 export type SyncJob = typeof syncJob.$inferSelect;

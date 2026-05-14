@@ -9,6 +9,7 @@ import { syncRouter } from './routes/sync.js';
 import { redemptionRouter } from './routes/redemption.js';
 import { adminRouter } from './routes/admin.js';
 import { adminAiRouter } from './routes/admin-ai.js';
+import { referralRouter } from './routes/referral.js';
 import { trainingRouter } from './routes/training.js';
 
 const app = express();
@@ -40,6 +41,7 @@ app.use('/api/me', meRouter);
 app.use('/api/garmin', garminRouter);
 app.use('/api/sync', syncRouter);
 app.use('/api/redemption', redemptionRouter);
+app.use('/api/referral', referralRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/admin', adminAiRouter);
 app.use('/api/training', trainingRouter);
