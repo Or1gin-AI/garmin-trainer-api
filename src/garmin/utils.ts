@@ -58,6 +58,11 @@ export interface MappedActivity {
   sleepScore?: number;
   recoveryTimeHours?: number;
   heartRateZones?: Array<[number, number]>;
+  hrTimeInZone_1?: number;
+  hrTimeInZone_2?: number;
+  hrTimeInZone_3?: number;
+  hrTimeInZone_4?: number;
+  hrTimeInZone_5?: number;
   deviceName?: string;
   source?: string;
   rawTrainingSummary?: unknown;
@@ -283,19 +288,6 @@ function readZoneBoundary(
 }
 
 function extractHeartRateZones(raw: unknown): Array<[number, number]> | undefined {
-  // DEBUG: log keys that look like zone data
-  for (const obj of collectObjects(raw)) {
-    if (
-      obj.zoneNumber !== undefined ||
-      obj.zone !== undefined ||
-      obj.zoneLowBoundary !== undefined ||
-      obj.secsInZone !== undefined ||
-      obj.zoneFloor !== undefined ||
-      obj.zoneCeiling !== undefined
-    ) {
-      console.log('[DEBUG extractHeartRateZones] zone-like obj:', JSON.stringify(obj).slice(0, 300));
-    }
-  }
   const byZone = new Map<number, [number, number]>();
   for (const obj of collectObjects(raw)) {
     const zone = readZoneNumber(obj);
@@ -458,6 +450,11 @@ export function mapActivity(
       toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.recoveryTimeHours)),
     ),
     heartRateZones: extractHeartRateZones(raw),
+    hrTimeInZone_1: toFiniteNumber((activity as unknown as Record<string, unknown>).hrTimeInZone_1),
+    hrTimeInZone_2: toFiniteNumber((activity as unknown as Record<string, unknown>).hrTimeInZone_2),
+    hrTimeInZone_3: toFiniteNumber((activity as unknown as Record<string, unknown>).hrTimeInZone_3),
+    hrTimeInZone_4: toFiniteNumber((activity as unknown as Record<string, unknown>).hrTimeInZone_4),
+    hrTimeInZone_5: toFiniteNumber((activity as unknown as Record<string, unknown>).hrTimeInZone_5),
     deviceName: toNonEmptyString(pickFirst(raw, ACTIVITY_FIELD_ALIASES.deviceName)),
     source: 'garmin',
     rawTrainingSummary: summaryDTO,

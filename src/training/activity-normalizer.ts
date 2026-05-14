@@ -46,6 +46,7 @@ export interface NormalizedActivity {
   sleepScore: number | null;
   recoveryTimeHours: number | null;
   heartRateZones: Array<[number, number]>;
+  hrTimeInZones: [number, number, number, number, number] | null;
   elevationGain: number | null;
   deviceName: string | null;
 }
@@ -140,6 +141,16 @@ function readDate(value: unknown): Date | null {
   if (typeof value !== 'string' && typeof value !== 'number') return null;
   const d = new Date(value);
   return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function readHrTimeInZones(obj: Record<string, unknown>): [number, number, number, number, number] | null {
+  const z1 = readNumber(obj.hrTimeInZone_1);
+  const z2 = readNumber(obj.hrTimeInZone_2);
+  const z3 = readNumber(obj.hrTimeInZone_3);
+  const z4 = readNumber(obj.hrTimeInZone_4);
+  const z5 = readNumber(obj.hrTimeInZone_5);
+  if (z1 === null && z2 === null && z3 === null && z4 === null && z5 === null) return null;
+  return [z1 ?? 0, z2 ?? 0, z3 ?? 0, z4 ?? 0, z5 ?? 0];
 }
 
 function readRegion(value: unknown): 'cn' | 'global' | 'manual' {
@@ -244,6 +255,7 @@ export function normalizeActivity(raw: unknown): NormalizedActivity | null {
     sleepScore: readNumber(obj.sleepScore),
     recoveryTimeHours: readNumber(obj.recoveryTimeHours),
     heartRateZones: readHeartRateZones(obj.heartRateZones),
+    hrTimeInZones: readHrTimeInZones(obj),
     elevationGain: readNumber(obj.elevationGain),
     deviceName: readString(obj.deviceName),
   };

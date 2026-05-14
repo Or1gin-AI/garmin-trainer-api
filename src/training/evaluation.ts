@@ -1103,20 +1103,37 @@ function computeEdwardsTRIMP(a: NormalizedActivity, maxHr: number): number | nul
 // ---------------------------------------------------------------------------
 
 function classifyHrZoneFromActivity(a: NormalizedActivity, _maxHr: number): number | null {
-  if (!a.averageHr) return null;
-
-  // Only use Garmin's personal zone boundaries — no fallback %HRmax guessing.
-  if (!a.heartRateZones || a.heartRateZones.length < 2) return null;
-
-  const avg = a.averageHr;
-  for (let i = a.heartRateZones.length - 1; i >= 0; i--) {
-    const [low] = a.heartRateZones[i];
-    if (avg >= low) return Math.min(i + 1, 5);
+  // Use Garmin's time-in-zone data (seconds per zone) to determine the
+  // primary zone. Returns a float like 2.0 or 1.5 for "between zones".
+  if (!a.hrTimeInZones) {
+    // Fallback: try zone boundary approach
+    if (!a.averageHr || !a.heartRateZones || a.heartRateZones.length < 2) return null;
+    const avg = a.averageHr;
+    for (let i = a.heartRateZones.length - 1; i >= 0; i--) {
+      const [low] = a.heartRateZones[i];
+      if (avg >= low) return Math.min(i + 1, 5);
+    }
+    return 1;
   }
-  return 1;
+
+  const times = a.hrTimeInZones;
+  const total = times[0] + times[1] + times[2] + times[3] + times[4];
+  if (total <= 0) return null;
+
+  // Weighted average zone: sum(zone_i * time_i) / total_time
+  const weighted = (1 * times[0] + 2 * times[1] + 3 * times[2] + 4 * times[3] + 5 * times[4]) / total;
+  // Round to nearest 0.5
+  return Math.round(weighted * 2) / 2;
 }
 
-const ZONE_LABELS = ['', 'Z1 恢复', 'Z2 有氧', 'Z3 节奏', 'Z4 阈值', 'Z5 VO₂max'];
+const ZONE_LABELS: Record<string, string> = {
+  '1': 'Z1 恢复', '1.5': 'Z1-2', '2': 'Z2 有氧', '2.5': 'Z2-3',
+  '3': 'Z3 节奏', '3.5': 'Z3-4', '4': 'Z4 阈值', '4.5': 'Z4-5', '5': 'Z5 VO₂max',
+};
+
+function zoneLabel(z: number): string {
+  return ZONE_LABELS[String(z)] ?? `Z${z}`;
+}
 
 function expectedZoneRange(workoutType: string | null, intensity: string): [number, number] {
   const wt = (workoutType ?? '').toLowerCase();
@@ -1278,7 +1295,7 @@ function buildPhysiologyMetrics(
   let zoneMatch: boolean | null = null;
   if (nonRestWorkout && primaryZone !== null) {
     const [lo, hi] = expectedZoneRange(nonRestWorkout.workoutType, nonRestWorkout.intensity);
-    plannedZone = `${ZONE_LABELS[lo]} ~ ${ZONE_LABELS[hi]}`;
+    plannedZone = `${zoneLabel(lo)} ~ ${zoneLabel(hi)}`;
     zoneMatch = primaryZone >= lo && primaryZone <= hi;
   }
 
@@ -1325,7 +1342,7 @@ function buildPhysiologyRisks(
   }
 
   if (physiology.zoneMatch === false && physiology.hrZone !== null && physiology.plannedZone) {
-    const actualZoneLabel = ZONE_LABELS[physiology.hrZone] || `Zone ${physiology.hrZone}`;
+    const actualZoneLabel = physiology.hrZone !== null ? zoneLabel(physiology.hrZone) : '未知';
     risks.push(`实际训练区间 (${actualZoneLabel}) 偏离计划要求 (${physiology.plannedZone})`);
   }
 
@@ -1347,7 +1364,7 @@ function buildPhysiologyHighlights(
   }
 
   if (physiology.zoneMatch === true && physiology.hrZone !== null) {
-    highlights.push(`心率区间 ${ZONE_LABELS[physiology.hrZone]} 与计划匹配`);
+    highlights.push(`心率区间 ${zoneLabel(physiology.hrZone)} 与计划匹配`);
   }
 
   if (physiology.tss !== null && physiology.intensityFactor !== null) {
