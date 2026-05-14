@@ -158,6 +158,26 @@ export const garminAccount = pgTable(
   ],
 );
 
+export const garminBindLog = pgTable(
+  'garmin_bind_log',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    region: text('region').notNull(), // 'cn' | 'global'
+    profile: jsonb('profile').$type<{
+      fullName?: string;
+      userName?: string;
+      location?: string;
+    } | null>(),
+    boundAt: timestamp('bound_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('garmin_bind_log_user_region_bound_idx').on(t.userId, t.region, t.boundAt),
+  ],
+);
+
 // ===== Sync job =====
 
 export const syncJob = pgTable(
@@ -489,6 +509,7 @@ export type Subscription = typeof subscription.$inferSelect;
 export type Referral = typeof referral.$inferSelect;
 export type RedemptionCode = typeof redemptionCode.$inferSelect;
 export type GarminAccount = typeof garminAccount.$inferSelect;
+export type GarminBindLog = typeof garminBindLog.$inferSelect;
 export type SyncJob = typeof syncJob.$inferSelect;
 export type TrainingPlan = typeof trainingPlan.$inferSelect;
 export type Workout = typeof workout.$inferSelect;

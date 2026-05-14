@@ -20,6 +20,7 @@
 import {
   applyDurationCap,
   buildWeeklySchedule,
+  estimateTrainingMinutesPerActiveDay,
   MAX_WEEKLY_TRAINING_MINUTES,
   requestedDoubleDayIndex,
 } from './scheduler.js';
@@ -562,6 +563,8 @@ function hasLongSameDayTrainingWindow(request: ScheduleRequest): boolean {
   if (request.dailyPreferredMinutes !== null && request.dailyPreferredMinutes !== undefined) {
     return request.dailyPreferredMinutes >= 90;
   }
+  const dailyBudget = estimateTrainingMinutesPerActiveDay(request);
+  if (dailyBudget !== null && dailyBudget >= 90) return true;
   const text = [
     request.availableTime,
     request.notes,
@@ -829,6 +832,8 @@ function hasAdvancedTrainingWindow(request: ScheduleRequest): boolean {
   if (request.dailyPreferredMinutes !== null && request.dailyPreferredMinutes !== undefined) {
     return request.dailyPreferredMinutes >= 75;
   }
+  const dailyBudget = estimateTrainingMinutesPerActiveDay(request);
+  if (dailyBudget !== null && dailyBudget >= 75) return true;
   const hardCap = request.maxHardSessionsPerWeek;
   if (hardCap !== null && hardCap !== undefined && hardCap >= 3) return true;
   const text = [request.availableTime, request.notes, request.goal].filter(Boolean).join('\n');

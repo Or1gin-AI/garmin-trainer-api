@@ -745,7 +745,7 @@ function pickRotationCandidates(input: PickInput): string[] {
 function shouldPreferAdvancedTemplates(input: PickInput): boolean {
   if (input.request.allowAdvancedWorkouts !== true) return false;
   if (input.hardCap <= 0 || input.recentState.fatigue === 'high_risk') return false;
-  const daily = input.request.dailyPreferredMinutes ?? 0;
+  const daily = estimateTrainingMinutesPerActiveDay(input.request) ?? 0;
   const hardCap = input.request.maxHardSessionsPerWeek ?? input.hardCap;
   return daily >= 75 || hardCap >= 3 || input.athleteProfile.experienceLevel === 'advanced';
 }
@@ -1001,6 +1001,26 @@ function clamp(n: number, min: number, max: number): number {
 
 export function normalizeDaysPerWeek(value: number): number {
   return clamp(Math.round(value), 1, 7);
+}
+
+export function estimateTrainingMinutesPerActiveDay(
+  request: Pick<ScheduleRequest, 'dailyPreferredMinutes' | 'weeklyMaxMinutes' | 'daysPerWeek'>,
+): number | null {
+  if (
+    request.dailyPreferredMinutes !== null &&
+    request.dailyPreferredMinutes !== undefined &&
+    Number.isFinite(request.dailyPreferredMinutes)
+  ) {
+    return request.dailyPreferredMinutes;
+  }
+  if (
+    request.weeklyMaxMinutes !== null &&
+    request.weeklyMaxMinutes !== undefined &&
+    Number.isFinite(request.weeklyMaxMinutes)
+  ) {
+    return request.weeklyMaxMinutes / normalizeDaysPerWeek(request.daysPerWeek);
+  }
+  return null;
 }
 
 export function formatDayIndexes(days: Iterable<number>): string {

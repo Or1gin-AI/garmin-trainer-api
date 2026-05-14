@@ -13,6 +13,20 @@ export const QUOTA_DEFAULTS: Record<QuotaKind, number> = {
   chat_message: 200,
 };
 
+const QUOTA_FEATURE_LABELS: Record<QuotaKind, string> = {
+  plan_generation: 'AI 训练计划生成（包含高级训练计划）',
+  chat_message: 'AI 教练对话',
+};
+
+function maxRequiredMessage(kind: QuotaKind): string {
+  return `${QUOTA_FEATURE_LABELS[kind]}是 Max 会员功能。当前账号是免费版、Plus，或 Max 已过期，所以暂时不能使用；升级或兑换 Max 后即可解锁。`;
+}
+
+function quotaExceededMessage(kind: QuotaKind, used: number, limit: number, periodEnd: string): string {
+  const resetDate = new Date(periodEnd).toLocaleDateString('zh-CN');
+  return `本月 ${QUOTA_FEATURE_LABELS[kind]}额度已用完（${used}/${limit}）。额度会在 ${resetDate} 重置；也可以等待下月额度恢复后再使用。`;
+}
+
 /**
  * Returns the current monthly quota limit for a kind.
  * Today this is just the static default; admin overrides will land in U4.
@@ -102,7 +116,7 @@ async function readCount(
  * Express middleware: require Max AI access + verify quota not exceeded.
  *
  *   1. Reads req.userId set by upstream requireUser. Returns 401 if missing.
- *   2. Reads getUserPlan(userId). Returns 402 { error: 'max_required' } if
+ *   2. Reads getUserPlan(userId). Returns 402 { error: 'max_required', ... } if
  *      the plan cannot use AI (free, Pro sync-only, expired Max, etc).
  *   3. Lazily creates the ai_usage row for (userId, current month start).
  *   4. Looks up the current count. If >= limit, returns 402
@@ -125,7 +139,15 @@ export function requireAiPlanAndQuota(kind: QuotaKind): RequestHandler {
 
         const plan = await getUserPlan(userId);
         if (!plan.canUseAi) {
-          res.status(402).json({ error: 'max_required' });
+          res.status(402).json({
+            error: 'max_required',
+            message: maxRequiredMessage(kind),
+            feature: kind,
+            featureLabel: QUOTA_FEATURE_LABELS[kind],
+            requiredPlan: 'max',
+            currentPlan: plan.plan,
+            expiresAt: plan.expiresAt,
+          });
           return;
         }
 
@@ -135,12 +157,15 @@ export function requireAiPlanAndQuota(kind: QuotaKind): RequestHandler {
         const used = await readCount(userId, periodStart, kind);
         const limit = getQuotaLimit(kind);
         if (used >= limit) {
+          const periodEnd = nextPeriodStart();
           res.status(402).json({
             error: 'quota_exceeded',
+            message: quotaExceededMessage(kind, used, limit, periodEnd),
             kind,
+            featureLabel: QUOTA_FEATURE_LABELS[kind],
             limit,
             used,
-            periodEnd: nextPeriodStart(),
+            periodEnd,
           });
           return;
         }
