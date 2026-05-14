@@ -1291,26 +1291,12 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
     return (a.slotIndex ?? 99) - (b.slotIndex ?? 99);
   });
 
-  let evaluations = await loadCalendarEvaluations(userId, from, to);
-
-  // Auto-evaluate past days that have planned workouts + activities but no evaluation,
-  // and re-evaluate stale placeholder evaluations (ones without a score field).
+  // Compute evaluations on-the-fly — no DB storage needed.
+  // For each past day with both planned workouts and activities, run the rule engine.
+  const evaluations: CalendarEvaluation[] = [];
   if (active) {
     const todayStr = localDateString(today);
 
-    // Find dates with stale placeholder evaluations that need re-evaluation
-    const staleByDate = new Map<string, CalendarEvaluation>();
-    for (const e of evaluations) {
-      const r = e.result as Record<string, unknown> | null;
-      if (r && r.score === undefined) {
-        staleByDate.set(e.date, e);
-      }
-    }
-    const evaluatedDates = new Set(
-      evaluations.filter((e) => !staleByDate.has(e.date)).map((e) => e.date),
-    );
-
-    // Group activities by date
     const activitiesByDate = new Map<string, NormalizedActivity[]>();
     for (const { activity } of byActivity.values()) {
       if (!activity.startTimeLocal) continue;
@@ -1319,19 +1305,15 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
       activitiesByDate.get(date)!.push(activity);
     }
 
-    const newEvaluations: CalendarEvaluation[] = [];
     for (const [date, dayActivities] of activitiesByDate) {
       if (date > todayStr) continue;
-      if (evaluatedDates.has(date)) continue;
 
       const workoutsForDay = planWorkoutsForDate(active.plan, active.workouts, date);
       if (workoutsForDay.length === 0) continue;
 
       const qualities = new Map<string, QualityResult>();
       for (const a of dayActivities) {
-        const quality = byActivity.get(`${a.region}:${String(a.activityId)}`)?.quality ??
-          classifyActivityQuality(a);
-        addActivityQuality(qualities, a, quality);
+        qualities.set(a.id, classifyActivityQuality(a));
       }
       const activityRefs = dayActivities.map((a) => ({
         region: a.region,
@@ -1355,51 +1337,20 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
         activityQualities: qualities,
       });
 
-      const stale = staleByDate.get(date);
-      if (stale) {
-        // Update existing stale evaluation with real result
-        const updated = (
-          await db
-            .update(trainingEvaluation)
-            .set({ result, activityRefs, updatedAt: new Date() })
-            .where(eq(trainingEvaluation.id, stale.id))
-            .returning()
-        )[0];
-        newEvaluations.push(evaluationToSummary(updated));
-      } else {
-        const now = new Date();
-        const row = (
-          await db
-            .insert(trainingEvaluation)
-            .values({
-              id: crypto.randomUUID(),
-              userId,
-              planId: active.plan.id,
-              evaluationDate: date,
-              plannedWorkoutIds: workoutsForDay.map((w) => w.id),
-              activityRefs,
-              status: 'ready',
-              result,
-              note: null,
-              createdAt: now,
-              updatedAt: now,
-            })
-            .returning()
-        )[0];
-        newEvaluations.push(evaluationToSummary(row));
-      }
+      evaluations.push({
+        id: `eval:${date}`,
+        date,
+        planId: active.plan.id,
+        plannedWorkoutIds: workoutsForDay.map((w) => w.id),
+        activityRefs,
+        status: 'ready',
+        result,
+        note: null,
+        createdAt: new Date().toISOString(),
+      });
     }
 
-    if (newEvaluations.length > 0) {
-      // Replace stale evaluations in the list and add new ones
-      const updatedIds = new Set(newEvaluations.map((e) => e.id));
-      evaluations = [
-        ...evaluations.filter((e) => !updatedIds.has(e.id) && !staleByDate.has(e.date)),
-        ...newEvaluations,
-      ].sort(
-        (a, b) => b.date.localeCompare(a.date),
-      );
-    }
+    evaluations.sort((a, b) => b.date.localeCompare(a.date));
   }
 
   res.json({
@@ -1413,99 +1364,6 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
     events,
     evaluations,
   });
-});
-
-trainingRouter.post('/calendar/evaluations', requireUser, async (req, res) => {
-  const userId = (req as AuthedRequest).user.id;
-  const parsed = trainingEvaluationSchema.safeParse(req.body);
-  if (!parsed.success) {
-    const first = parsed.error.issues[0];
-    res.status(400).json({
-      error: 'invalid_input',
-      field: first?.path.join('.') ?? null,
-      reason: first?.message ?? 'invalid input',
-    });
-    return;
-  }
-
-  const active = await loadActiveCalendarPlan(userId);
-  if (!active) {
-    res.status(409).json({ error: 'no_active_training_plan' });
-    return;
-  }
-
-  const activityLoad = await loadActivityEvents(userId, parsed.data.date, parsed.data.date);
-  const available = new Set(
-    activityLoad.events.map((event) => `${event.region}:${String(event.activityId)}`),
-  );
-  const requested = parsed.data.activityRefs.map((ref) => ({
-    region: ref.region,
-    activityId: ref.activityId,
-  }));
-  const invalid = requested.filter(
-    (ref) => !available.has(`${ref.region}:${ref.activityId}`),
-  );
-  if (invalid.length > 0) {
-    res.status(400).json({ error: 'invalid_activity_selection' });
-    return;
-  }
-
-  const plannedWorkoutRows = planWorkoutsForDate(
-    active.plan,
-    active.workouts,
-    parsed.data.date,
-  );
-  const plannedWorkoutIds = plannedWorkoutRows.map((row) => row.id);
-
-  const activityMap = await loadNormalizedActivitiesForDate(userId, parsed.data.date);
-  const normalizedActivities = requested
-    .map((ref) => activityMap.get(`${ref.region}:${ref.activityId}`)?.activity)
-    .filter((a): a is NormalizedActivity => a != null);
-  const qualities = new Map<string, QualityResult>();
-  for (const a of normalizedActivities) {
-    const quality =
-      activityMap.get(`${a.region}:${String(a.activityId)}`)?.quality ??
-      classifyActivityQuality(a);
-    addActivityQuality(qualities, a, quality);
-  }
-  const result = evaluateTrainingDay({
-    plannedWorkouts: plannedWorkoutRows.map((w) => ({
-      id: w.id,
-      title: w.title,
-      sport: w.sport,
-      intensity: w.intensity,
-      durationMinutes: w.durationMinutes,
-      distanceKm: w.distanceKm,
-      targetMetric: w.targetMetric,
-      targetHeartRate: w.targetHeartRate,
-      targetPace: w.targetPace,
-      targetPower: w.targetPower,
-      workoutType: w.workoutType,
-    })),
-    activities: normalizedActivities,
-    activityQualities: qualities,
-  });
-  const now = new Date();
-  const row = (
-    await db
-      .insert(trainingEvaluation)
-      .values({
-        id: crypto.randomUUID(),
-        userId,
-        planId: active.plan.id,
-        evaluationDate: parsed.data.date,
-        plannedWorkoutIds,
-        activityRefs: requested,
-        status: 'ready',
-        result,
-        note: parsed.data.note ?? null,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning()
-  )[0];
-
-  res.json({ evaluation: evaluationToSummary(row) });
 });
 
 trainingRouter.delete('/calendar/active-plan', requireUser, async (req, res) => {
