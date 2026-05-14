@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import cron from 'node-cron';
 import crypto from 'node:crypto';
-import { and, asc, eq, isNotNull, lt, or, sql, gt, isNull } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { subscription, syncJob, garminAccount } from '../db/schema.js';
 import { runBidirectionalSync, type SyncProgress } from '../garmin/sync.js';
@@ -165,7 +165,7 @@ async function workerLoop() {
 }
 
 /**
- * Cron tick — every 10 minutes, scan for Pro users whose last auto-sync was
+ * Cron tick — every 10 minutes, scan for paid users whose last auto-sync was
  * more than AUTO_SYNC_INTERVAL_HOURS ago, and enqueue an incremental sync.
  */
 async function autoSyncTick() {
@@ -180,7 +180,7 @@ async function autoSyncTick() {
     .from(subscription)
     .where(
       and(
-        eq(subscription.plan, 'pro'),
+        inArray(subscription.plan, ['pro', 'max']),
         eq(subscription.autoSyncEnabled, true),
         or(
           isNull(subscription.expiresAt),

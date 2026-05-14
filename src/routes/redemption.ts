@@ -1,10 +1,14 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { eq, isNull, and, sql } from 'drizzle-orm';
+import { eq, isNull, and } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { redemptionCode } from '../db/schema.js';
 import { requireUser, type AuthedRequest } from '../lib/session.js';
-import { extendProSubscription, getUserPlan } from '../lib/plan.js';
+import {
+  extendPlanSubscription,
+  getUserPlan,
+  type PaidSubscriptionPlan,
+} from '../lib/plan.js';
 
 export const redemptionRouter = Router();
 
@@ -43,10 +47,16 @@ redemptionRouter.post('/redeem', requireUser, async (req, res) => {
     return;
   }
 
-  const newExpiresAt = await extendProSubscription(userId, claimed[0].planDays);
+  const planName: PaidSubscriptionPlan = claimed[0].plan === 'pro' ? 'pro' : 'max';
+  const newExpiresAt = await extendPlanSubscription(
+    userId,
+    planName,
+    claimed[0].planDays,
+  );
   const plan = await getUserPlan(userId);
   res.json({
     ok: true,
+    subscriptionPlan: planName,
     planDays: claimed[0].planDays,
     expiresAt: newExpiresAt,
     plan,

@@ -22,13 +22,14 @@ async function main() {
     return args[i + 1];
   };
   const count = Number(get('--count', '10'));
+  const plan = get('--plan', 'max');
   const planDays = Number(get('--days', '30'));
   const prefix = get('--prefix', '');
   const note = get('--note');
 
-  if (!count || !planDays) {
+  if (!count || !planDays || (plan !== 'pro' && plan !== 'max')) {
     console.error(
-      'usage: tsx src/scripts/generate-codes.ts --count 10 --days 30 [--prefix PRO] [--note "first batch"]',
+      'usage: tsx src/scripts/generate-codes.ts --count 10 --plan max --days 30 [--prefix MAX] [--note "first batch"]',
     );
     process.exit(1);
   }
@@ -45,6 +46,7 @@ async function main() {
   await db.insert(redemptionCode).values(
     codes.map((c) => ({
       code: c,
+      plan,
       planDays,
       batchId,
       note: note ?? null,
@@ -52,7 +54,7 @@ async function main() {
     })),
   );
 
-  console.log(`batch=${batchId} planDays=${planDays} count=${count}`);
+  console.log(`batch=${batchId} plan=${plan} planDays=${planDays} count=${count}`);
   for (const c of codes) console.log(c);
   process.exit(0);
 }

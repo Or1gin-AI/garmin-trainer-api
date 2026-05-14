@@ -8,7 +8,7 @@
 //   POST   /api/training/plans/:id/regenerate-day        SSE; regen one day
 //   PATCH  /api/training/workouts/:id                    update status
 //
-// Quota middleware (`requireProAndQuota`) gates the two SSE endpoints. Quota
+// Quota middleware (`requireAiPlanAndQuota`) gates the two SSE endpoints. Quota
 // CONSUMPTION is intentionally deferred to U11 — we leave a TODO marker.
 //
 // All endpoints require an authenticated user; ownership is checked on every
@@ -43,7 +43,7 @@ import {
   pushPlanToGarmin,
 } from '../garmin/workout-publisher.js';
 import { requireUser, type AuthedRequest } from '../lib/session.js';
-import { requireProAndQuota, consumeQuota } from '../lib/quota.js';
+import { requireAiPlanAndQuota, consumeQuota } from '../lib/quota.js';
 import { openSse, writeEvent, endSse, startHeartbeat, emitToolEvent, type ToolEventPayload } from '../lib/sse.js';
 import {
   TOOL_DISPLAY,
@@ -969,7 +969,7 @@ async function loadActiveCalendarPlan(
 trainingRouter.post(
   '/plans',
   requireUser,
-  requireProAndQuota('plan_generation'),
+  requireAiPlanAndQuota('plan_generation'),
   async (req, res) => {
     const userId = (req as AuthedRequest).user.id;
 
@@ -1686,7 +1686,7 @@ function toUtf16BeHex(value: string): string {
 trainingRouter.post(
   '/plans/:id/regenerate-day',
   requireUser,
-  requireProAndQuota('plan_generation'),
+  requireAiPlanAndQuota('plan_generation'),
   async (req, res) => {
     const userId = (req as AuthedRequest).user.id;
     const planId = String(req.params.id);
@@ -2031,7 +2031,7 @@ trainingRouter.get('/plans/:id/messages', requireUser, async (req, res) => {
 trainingRouter.post(
   '/plans/:id/chat',
   requireUser,
-  requireProAndQuota('chat_message'),
+  requireAiPlanAndQuota('chat_message'),
   async (req, res) => {
     const userId = (req as AuthedRequest).user.id;
     const planId = String(req.params.id);

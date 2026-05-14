@@ -57,6 +57,13 @@
       "when": 1778918400000,
       "tag": "0007_training_evaluations",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1779004800000,
+      "tag": "0008_max_subscription_tier",
+      "breakpoints": true
     }
   ]
 }

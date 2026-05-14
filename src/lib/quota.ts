@@ -99,18 +99,18 @@ async function readCount(
 }
 
 /**
- * Express middleware: require Pro + verify quota not exceeded.
+ * Express middleware: require Max AI access + verify quota not exceeded.
  *
  *   1. Reads req.userId set by upstream requireUser. Returns 401 if missing.
- *   2. Reads getUserPlan(userId). Returns 402 { error: 'pro_required' } if
- *      plan is not currently Pro (free, expired Pro, etc).
+ *   2. Reads getUserPlan(userId). Returns 402 { error: 'max_required' } if
+ *      the plan cannot use AI (free, Pro sync-only, expired Max, etc).
  *   3. Lazily creates the ai_usage row for (userId, current month start).
  *   4. Looks up the current count. If >= limit, returns 402
  *      { error: 'quota_exceeded', kind, limit, used, periodEnd }.
  *   5. Otherwise calls next(). DOES NOT increment — call consumeQuota after
  *      the protected operation succeeds.
  */
-export function requireProAndQuota(kind: QuotaKind): RequestHandler {
+export function requireAiPlanAndQuota(kind: QuotaKind): RequestHandler {
   if (!(kind in QUOTA_DEFAULTS)) {
     throw new Error(`unknown quota kind: ${String(kind)}`);
   }
@@ -124,8 +124,8 @@ export function requireProAndQuota(kind: QuotaKind): RequestHandler {
         }
 
         const plan = await getUserPlan(userId);
-        if (!plan.isProActive) {
-          res.status(402).json({ error: 'pro_required' });
+        if (!plan.canUseAi) {
+          res.status(402).json({ error: 'max_required' });
           return;
         }
 
@@ -153,6 +153,8 @@ export function requireProAndQuota(kind: QuotaKind): RequestHandler {
     })();
   };
 }
+
+export const requireProAndQuota = requireAiPlanAndQuota;
 
 /**
  * Atomically increment the counter for (userId, current month) by 1, plus

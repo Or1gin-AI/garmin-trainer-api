@@ -2,12 +2,30 @@ import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { subscription } from '../db/schema.js';
 
+export type SubscriptionPlan = 'free' | 'pro' | 'max';
+export type PaidSubscriptionPlan = Exclude<SubscriptionPlan, 'free'>;
+
 export interface UserPlanInfo {
-  plan: 'free' | 'pro';
+  plan: SubscriptionPlan;
   expiresAt: Date | null;
+  isPaidActive: boolean;
   isProActive: boolean;
+  isMaxActive: boolean;
+  canAutoSync: boolean;
+  canUseAi: boolean;
   autoSyncEnabled: boolean;
   lastAutoSyncAt: Date | null;
+}
+
+function normalizePlan(plan: string): SubscriptionPlan {
+  return plan === 'pro' || plan === 'max' ? plan : 'free';
+}
+
+function higherPaidPlan(
+  current: SubscriptionPlan,
+  next: PaidSubscriptionPlan,
+): PaidSubscriptionPlan {
+  return current === 'max' || next === 'max' ? 'max' : 'pro';
 }
 
 export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
@@ -30,24 +48,39 @@ export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
     return {
       plan: 'free',
       expiresAt: null,
+      isPaidActive: false,
       isProActive: false,
+      isMaxActive: false,
+      canAutoSync: false,
+      canUseAi: false,
       autoSyncEnabled: true,
       lastAutoSyncAt: null,
     };
   }
   const now = new Date();
-  const isProActive =
-    row.plan === 'pro' && (!row.expiresAt || row.expiresAt > now);
+  const storedPlan = normalizePlan(row.plan);
+  const isPaidActive =
+    storedPlan !== 'free' && (!row.expiresAt || row.expiresAt > now);
+  const activePlan = isPaidActive ? storedPlan : 'free';
   return {
-    plan: isProActive ? 'pro' : 'free',
+    plan: activePlan,
     expiresAt: row.expiresAt,
-    isProActive,
+    isPaidActive,
+    // Backward compatibility for older web clients: this means any paid plan.
+    isProActive: isPaidActive,
+    isMaxActive: activePlan === 'max',
+    canAutoSync: activePlan === 'pro' || activePlan === 'max',
+    canUseAi: activePlan === 'max',
     autoSyncEnabled: row.autoSyncEnabled,
     lastAutoSyncAt: row.lastAutoSyncAt,
   };
 }
 
-export async function extendProSubscription(userId: string, days: number) {
+export async function extendPlanSubscription(
+  userId: string,
+  plan: PaidSubscriptionPlan,
+  days: number,
+) {
   const now = new Date();
   const existing = (
     await db
@@ -60,15 +93,20 @@ export async function extendProSubscription(userId: string, days: number) {
     ? existing.expiresAt.getTime()
     : now.getTime();
   const newExpiresAt = new Date(baseTime + days * 24 * 60 * 60 * 1000);
+  const storedPlan = normalizePlan(existing?.plan ?? 'free');
+  const targetPlan =
+    existing?.expiresAt && existing.expiresAt > now
+      ? higherPaidPlan(storedPlan, plan)
+      : plan;
   if (existing) {
     await db
       .update(subscription)
-      .set({ plan: 'pro', expiresAt: newExpiresAt, updatedAt: now })
+      .set({ plan: targetPlan, expiresAt: newExpiresAt, updatedAt: now })
       .where(eq(subscription.userId, userId));
   } else {
     await db.insert(subscription).values({
       userId,
-      plan: 'pro',
+      plan: targetPlan,
       expiresAt: newExpiresAt,
       autoSyncEnabled: true,
       createdAt: now,
@@ -76,6 +114,14 @@ export async function extendProSubscription(userId: string, days: number) {
     });
   }
   return newExpiresAt;
+}
+
+export async function extendProSubscription(userId: string, days: number) {
+  return extendPlanSubscription(userId, 'pro', days);
+}
+
+export async function extendMaxSubscription(userId: string, days: number) {
+  return extendPlanSubscription(userId, 'max', days);
 }
 
 export async function setAutoSyncEnabled(userId: string, enabled: boolean) {

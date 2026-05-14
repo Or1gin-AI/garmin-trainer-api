@@ -1,15 +1,17 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { eq, desc } from 'drizzle-orm';
+import { desc } from 'drizzle-orm';
 import crypto from 'node:crypto';
 import { db } from '../db/index.js';
-import { redemptionCode, user, subscription } from '../db/schema.js';
+import { redemptionCode, user } from '../db/schema.js';
 import { requireAdmin } from '../lib/session.js';
+import { extendPlanSubscription, type PaidSubscriptionPlan } from '../lib/plan.js';
 
 export const adminRouter = Router();
 
 const generateSchema = z.object({
   count: z.number().int().min(1).max(1000).default(10),
+  plan: z.enum(['pro', 'max']).default('max'),
   planDays: z.number().int().min(1).max(3650),
   prefix: z.string().regex(/^[A-Z0-9]{0,8}$/).optional(),
   note: z.string().max(200).optional(),
@@ -29,7 +31,7 @@ adminRouter.post('/codes', requireAdmin, async (req, res) => {
     res.status(400).json({ error: 'invalid', issues: parsed.error.issues });
     return;
   }
-  const { count, planDays, prefix, note } = parsed.data;
+  const { count, plan, planDays, prefix, note } = parsed.data;
   const batchId = crypto.randomUUID();
   const codes: string[] = [];
   const seen = new Set<string>();
@@ -43,13 +45,14 @@ adminRouter.post('/codes', requireAdmin, async (req, res) => {
   await db.insert(redemptionCode).values(
     codes.map((c) => ({
       code: c,
+      plan,
       planDays,
       batchId,
       note: note ?? null,
       createdAt: now,
     })),
   );
-  res.json({ batchId, planDays, count, codes });
+  res.json({ batchId, plan, planDays, count, codes });
 });
 
 adminRouter.get('/codes', requireAdmin, async (req, res) => {
@@ -79,6 +82,7 @@ adminRouter.get('/users', requireAdmin, async (_req, res) => {
 
 const grantSchema = z.object({
   userId: z.string().min(1),
+  plan: z.enum(['pro', 'max']).default('max'),
   planDays: z.number().int().min(1).max(3650),
 });
 
@@ -89,29 +93,7 @@ adminRouter.post('/grant', requireAdmin, async (req, res) => {
     return;
   }
   const { userId, planDays } = parsed.data;
-  const now = new Date();
-  const existing = (
-    await db.select().from(subscription).where(eq(subscription.userId, userId)).limit(1)
-  )[0];
-  const baseTime =
-    existing?.expiresAt && existing.expiresAt > now
-      ? existing.expiresAt.getTime()
-      : now.getTime();
-  const expiresAt = new Date(baseTime + planDays * 86400000);
-  if (existing) {
-    await db
-      .update(subscription)
-      .set({ plan: 'pro', expiresAt, updatedAt: now })
-      .where(eq(subscription.userId, userId));
-  } else {
-    await db.insert(subscription).values({
-      userId,
-      plan: 'pro',
-      expiresAt,
-      autoSyncEnabled: true,
-      createdAt: now,
-      updatedAt: now,
-    });
-  }
-  res.json({ ok: true, expiresAt });
+  const plan = parsed.data.plan as PaidSubscriptionPlan;
+  const expiresAt = await extendPlanSubscription(userId, plan, planDays);
+  res.json({ ok: true, plan, expiresAt });
 });

@@ -78,7 +78,7 @@ export const subscription = pgTable(
     userId: text('user_id')
       .primaryKey()
       .references(() => user.id, { onDelete: 'cascade' }),
-    plan: text('plan').notNull().default('free'), // 'free' | 'pro'
+    plan: text('plan').notNull().default('free'), // 'free' | 'pro' | 'max'
     expiresAt: timestamp('expires_at'),
     autoSyncEnabled: boolean('auto_sync_enabled').notNull().default(true),
     lastAutoSyncAt: timestamp('last_auto_sync_at'),
@@ -94,6 +94,7 @@ export const redemptionCode = pgTable(
   'redemption_code',
   {
     code: text('code').primaryKey(),
+    plan: text('plan').notNull().default('max'), // 'pro' | 'max'
     planDays: integer('plan_days').notNull(),
     batchId: text('batch_id'),
     note: text('note'),
