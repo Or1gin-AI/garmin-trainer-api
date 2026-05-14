@@ -28,6 +28,21 @@ export interface WorkoutActivityPairing {
   notes: string[];
 }
 
+export interface PhysiologyMetrics {
+  edwardsTRIMP: number | null;
+  garminLoad: number | null;
+  aerobicTE: number | null;
+  anaerobicTE: number | null;
+  hrZone: number | null;
+  plannedZone: string | null;
+  zoneMatch: boolean | null;
+  intensityFactor: number | null;
+  tss: number | null;
+  recoveryHoursRemaining: number | null;
+  hrvStatus: string | null;
+  sleepScore: number | null;
+}
+
 export interface TrainingEvaluationResult {
   title: string;
   summary: string;
@@ -47,12 +62,14 @@ export interface TrainingEvaluationResult {
   risks: string[];
   suggestions: string[];
   pairings: WorkoutActivityPairing[];
+  physiology: PhysiologyMetrics | null;
 }
 
 export interface EvaluateInput {
   plannedWorkouts: PlannedWorkout[];
   activities: NormalizedActivity[];
   activityQualities: Map<string, QualityResult>;
+  athleteMaxHr?: number | null;
 }
 
 export interface PlannedWorkout {
@@ -570,12 +587,18 @@ function buildIntensitySummary(
 export function evaluateTrainingDay(input: EvaluateInput): TrainingEvaluationResult {
   const { plannedWorkouts, activities, activityQualities } = input;
 
+  // Determine maxHR for physiology calculations
+  const derivedMax = Math.max(...activities.map((a) => a.maxHr ?? 0).filter((v) => v > 0), 0);
+  const maxHr = input.athleteMaxHr ?? (derivedMax > 0 ? derivedMax : 190);
+
   const isRestDay = plannedWorkouts.length > 0 &&
     plannedWorkouts.every((w) => REST_SPORTS.has(w.sport));
 
   // Rest day with activities
   if (isRestDay && activities.length > 0) {
-    return buildRestDayActiveResult(plannedWorkouts, activities);
+    const result = buildRestDayActiveResult(plannedWorkouts, activities);
+    result.physiology = buildPhysiologyMetrics(plannedWorkouts, activities, maxHr);
+    return result;
   }
 
   // Rest day, no activities — perfect
@@ -585,7 +608,9 @@ export function evaluateTrainingDay(input: EvaluateInput): TrainingEvaluationRes
 
   // No planned workouts but activities exist (shouldn't happen per API validation, but handle)
   if (plannedWorkouts.length === 0) {
-    return buildNoPlannedResult(activities);
+    const result = buildNoPlannedResult(activities);
+    result.physiology = buildPhysiologyMetrics([], activities, maxHr);
+    return result;
   }
 
   // Normal evaluation: pair and score
@@ -628,10 +653,22 @@ export function evaluateTrainingDay(input: EvaluateInput): TrainingEvaluationRes
   // Verdict
   const verdict = determineVerdict(score, allSportsMatched, avgDurationRatio, avgDistanceRatio, pairings);
 
+  // Physiology metrics
+  const physiology = buildPhysiologyMetrics(plannedWorkouts, activities, maxHr);
+
   // Text generation
-  const highlights = buildHighlights(pairings, activities);
-  const risks = buildRisks(pairings, activities, activityQualities);
-  const suggestions = buildSuggestions(verdict, pairings);
+  const highlights = [
+    ...buildHighlights(pairings, activities),
+    ...buildPhysiologyHighlights(plannedWorkouts, activities, physiology),
+  ];
+  const risks = [
+    ...buildRisks(pairings, activities, activityQualities),
+    ...buildPhysiologyRisks(plannedWorkouts, activities, physiology),
+  ];
+  const suggestions = [
+    ...buildSuggestions(verdict, pairings),
+    ...buildPhysiologySuggestions(plannedWorkouts, activities, physiology),
+  ];
   const load = buildLoadComment(plannedWorkouts, activities);
   const intensity = buildIntensitySummary(plannedWorkouts, activities);
   const title = buildTitle(verdict, score);
@@ -652,10 +689,11 @@ export function evaluateTrainingDay(input: EvaluateInput): TrainingEvaluationRes
     },
     load,
     intensity,
-    highlights,
-    risks,
-    suggestions,
+    highlights: [...new Set(highlights)],
+    risks: [...new Set(risks)],
+    suggestions: [...new Set(suggestions)],
     pairings,
+    physiology,
   };
 }
 
@@ -748,6 +786,7 @@ function buildRestDayActiveResult(
       subScore: isLight ? 80 : 50,
       notes: isLight ? ['轻度恢复活动'] : ['休息日运动强度偏高'],
     })),
+    physiology: null,
   };
 }
 
@@ -779,6 +818,7 @@ function buildRestDayCleanResult(workouts: PlannedWorkout[]): TrainingEvaluation
       subScore: 100,
       notes: [],
     })),
+    physiology: null,
   };
 }
 
@@ -802,6 +842,7 @@ function buildNoPlannedResult(activities: NormalizedActivity[]): TrainingEvaluat
     risks: [],
     suggestions: [],
     pairings: [],
+    physiology: null,
   };
 }
 
@@ -1031,4 +1072,294 @@ const INTENSITY_ZH: Record<string, string> = {
 
 function intensityZh(s: string): string {
   return INTENSITY_ZH[s] ?? s;
+}
+
+// ---------------------------------------------------------------------------
+// Sports science: Edwards TRIMP
+// ---------------------------------------------------------------------------
+
+function computeEdwardsTRIMP(a: NormalizedActivity, maxHr: number): number | null {
+  if (!a.averageHr || maxHr <= 0 || a.durationMin <= 0) return null;
+  const zone = classifyHrZone(a.averageHr, maxHr);
+  return Math.round(a.durationMin * zone);
+}
+
+// ---------------------------------------------------------------------------
+// Sports science: HR Zone classification (Edwards 5-zone model)
+// ---------------------------------------------------------------------------
+
+function classifyHrZone(avgHr: number, maxHr: number): number {
+  if (maxHr <= 0) return 1;
+  const pct = avgHr / maxHr;
+  if (pct >= 0.90) return 5;
+  if (pct >= 0.80) return 4;
+  if (pct >= 0.70) return 3;
+  if (pct >= 0.60) return 2;
+  return 1;
+}
+
+const ZONE_LABELS = ['', 'Z1 恢复', 'Z2 有氧', 'Z3 节奏', 'Z4 阈值', 'Z5 VO₂max'];
+
+function expectedZoneRange(workoutType: string | null, intensity: string): [number, number] {
+  const wt = (workoutType ?? '').toLowerCase();
+  if (wt.includes('recovery') || intensity === 'low') return [1, 2];
+  if (wt.includes('aerobic') || wt.includes('endurance') || wt.includes('long')) return [2, 3];
+  if (wt.includes('tempo') || wt.includes('sweet_spot')) return [3, 4];
+  if (wt.includes('threshold') || wt.includes('lactate')) return [4, 4];
+  if (wt.includes('vo2') || wt.includes('interval') || wt.includes('anaerobic')) return [4, 5];
+  if (intensity === 'medium') return [2, 4];
+  if (intensity === 'high') return [4, 5];
+  return [2, 4];
+}
+
+// ---------------------------------------------------------------------------
+// Sports science: Training Effect evaluation
+// ---------------------------------------------------------------------------
+
+interface TEResult {
+  match: boolean;
+  note: string | null;
+}
+
+function evaluateTrainingEffect(a: NormalizedActivity, intensity: string): TEResult {
+  const aer = a.aerobicTrainingEffect;
+  const ana = a.anaerobicTrainingEffect;
+  if (aer === null) return { match: true, note: null };
+
+  if (intensity === 'low') {
+    if (aer > 3.5) {
+      return { match: false, note: `有氧训练效果 ${aer.toFixed(1)}，对于恢复日偏高` };
+    }
+    return { match: true, note: aer <= 2.0 ? `有氧效果 ${aer.toFixed(1)}，适合恢复日` : null };
+  }
+
+  if (intensity === 'medium') {
+    if (aer < 2.0) {
+      return { match: false, note: `有氧效果仅 ${aer.toFixed(1)}，未达到中强度刺激水平` };
+    }
+    if (aer > 4.5) {
+      return { match: false, note: `有氧效果 ${aer.toFixed(1)}，超出中强度计划预期` };
+    }
+    return { match: true, note: `有氧效果 ${aer.toFixed(1)}，符合中强度训练` };
+  }
+
+  if (intensity === 'high') {
+    if (aer < 3.0 && (ana === null || ana < 1.0)) {
+      return { match: false, note: `有氧效果 ${aer.toFixed(1)}${ana !== null ? `，无氧效果 ${ana.toFixed(1)}` : ''}，未达高强度目标` };
+    }
+    return { match: true, note: `训练效果 ${aer.toFixed(1)}/${(ana ?? 0).toFixed(1)}，达到高强度刺激` };
+  }
+
+  return { match: true, note: null };
+}
+
+// ---------------------------------------------------------------------------
+// Sports science: Recovery risk check
+// ---------------------------------------------------------------------------
+
+function checkRecoveryRisks(a: NormalizedActivity, intensity: string): string[] {
+  const risks: string[] = [];
+
+  if (intensity === 'high' && a.recoveryTimeHours !== null && a.recoveryTimeHours > 24) {
+    risks.push(`高强度训练时恢复时间仍剩余 ${Math.round(a.recoveryTimeHours)}h，存在过度训练风险`);
+  }
+
+  if (a.hrvStatus) {
+    const lower = a.hrvStatus.toLowerCase();
+    if (lower === 'low' || lower === 'poor' || lower === 'unbalanced') {
+      risks.push(`HRV 状态偏低 (${a.hrvStatus})，建议关注恢复`);
+    }
+  }
+
+  if (a.sleepScore !== null && a.sleepScore < 50) {
+    risks.push(`前夜睡眠评分偏低 (${a.sleepScore}分)，可能影响训练质量`);
+  }
+
+  return risks;
+}
+
+// ---------------------------------------------------------------------------
+// Sports science: Cycling TSS estimation
+// ---------------------------------------------------------------------------
+
+function estimateCyclingTSS(
+  a: NormalizedActivity,
+  targetPowerMid: number | null,
+): { intensityFactor: number; tss: number } | null {
+  if (a.sport !== 'cycling') return null;
+  const np = a.normalizedPower ?? a.averagePower;
+  if (!np || !targetPowerMid || targetPowerMid <= 0 || a.durationMin <= 0) return null;
+
+  const intensityFactor = np / targetPowerMid;
+  const tss = Math.round((a.durationMin / 60) * intensityFactor * intensityFactor * 100);
+  return { intensityFactor: Math.round(intensityFactor * 100) / 100, tss };
+}
+
+// ---------------------------------------------------------------------------
+// Sports science: Aggregate physiology metrics
+// ---------------------------------------------------------------------------
+
+function buildPhysiologyMetrics(
+  workouts: PlannedWorkout[],
+  activities: NormalizedActivity[],
+  maxHr: number,
+): PhysiologyMetrics | null {
+  if (activities.length === 0) return null;
+
+  let totalTRIMP = 0;
+  let hasTRIMP = false;
+  let totalGarminLoad = 0;
+  let hasGarminLoad = false;
+  let bestAerTE: number | null = null;
+  let bestAnaTE: number | null = null;
+  let primaryZone: number | null = null;
+  let recoveryHours: number | null = null;
+  let hrvStatus: string | null = null;
+  let sleepScore: number | null = null;
+  let ifResult: number | null = null;
+  let tssResult: number | null = null;
+
+  for (const a of activities) {
+    const trimp = computeEdwardsTRIMP(a, maxHr);
+    if (trimp !== null) { totalTRIMP += trimp; hasTRIMP = true; }
+    if (a.trainingLoad !== null) { totalGarminLoad += a.trainingLoad; hasGarminLoad = true; }
+    if (a.aerobicTrainingEffect !== null && (bestAerTE === null || a.aerobicTrainingEffect > bestAerTE)) {
+      bestAerTE = a.aerobicTrainingEffect;
+    }
+    if (a.anaerobicTrainingEffect !== null && (bestAnaTE === null || a.anaerobicTrainingEffect > bestAnaTE)) {
+      bestAnaTE = a.anaerobicTrainingEffect;
+    }
+    if (a.averageHr && maxHr > 0) {
+      const zone = classifyHrZone(a.averageHr, maxHr);
+      if (primaryZone === null || zone > primaryZone) primaryZone = zone;
+    }
+    if (a.recoveryTimeHours !== null && (recoveryHours === null || a.recoveryTimeHours > recoveryHours)) {
+      recoveryHours = a.recoveryTimeHours;
+    }
+    if (a.hrvStatus) hrvStatus = a.hrvStatus;
+    if (a.sleepScore !== null) sleepScore = a.sleepScore;
+  }
+
+  // Cycling TSS from first cycling activity
+  const primaryIntensity = workouts.length > 0 ? workouts[0].intensity : 'medium';
+  for (const a of activities) {
+    if (a.sport === 'cycling') {
+      const targetMid = parsePowerMidpoint(workouts.find((w) => w.sport === 'cycling')?.targetPower);
+      const tssCalc = estimateCyclingTSS(a, targetMid);
+      if (tssCalc) {
+        ifResult = tssCalc.intensityFactor;
+        tssResult = tssCalc.tss;
+      }
+      break;
+    }
+  }
+
+  // Planned zone
+  const nonRestWorkout = workouts.find((w) => !REST_SPORTS.has(w.sport));
+  let plannedZone: string | null = null;
+  let zoneMatch: boolean | null = null;
+  if (nonRestWorkout && primaryZone !== null) {
+    const [lo, hi] = expectedZoneRange(nonRestWorkout.workoutType, nonRestWorkout.intensity);
+    plannedZone = `${ZONE_LABELS[lo]} ~ ${ZONE_LABELS[hi]}`;
+    zoneMatch = primaryZone >= lo && primaryZone <= hi;
+  }
+
+  return {
+    edwardsTRIMP: hasTRIMP ? Math.round(totalTRIMP) : null,
+    garminLoad: hasGarminLoad ? Math.round(totalGarminLoad) : null,
+    aerobicTE: bestAerTE,
+    anaerobicTE: bestAnaTE,
+    hrZone: primaryZone,
+    plannedZone,
+    zoneMatch,
+    intensityFactor: ifResult,
+    tss: tssResult,
+    recoveryHoursRemaining: recoveryHours,
+    hrvStatus,
+    sleepScore,
+  };
+}
+
+function parsePowerMidpoint(s: string | null | undefined): number | null {
+  if (!s) return null;
+  const range = s.match(/^(\d+)\s*-\s*(\d+)\s*W$/i);
+  if (range) return (Number(range[1]) + Number(range[2])) / 2;
+  const single = s.match(/(\d+)\s*W/i);
+  if (single) return Number(single[1]);
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Sports science: Enhanced risks from physiology
+// ---------------------------------------------------------------------------
+
+function buildPhysiologyRisks(
+  workouts: PlannedWorkout[],
+  activities: NormalizedActivity[],
+  physiology: PhysiologyMetrics | null,
+): string[] {
+  if (!physiology) return [];
+  const risks: string[] = [];
+  const primaryIntensity = workouts.find((w) => !REST_SPORTS.has(w.sport))?.intensity ?? 'medium';
+
+  for (const a of activities) {
+    risks.push(...checkRecoveryRisks(a, primaryIntensity));
+  }
+
+  if (physiology.zoneMatch === false && physiology.hrZone !== null && physiology.plannedZone) {
+    const actualZoneLabel = ZONE_LABELS[physiology.hrZone] || `Zone ${physiology.hrZone}`;
+    risks.push(`实际训练区间 (${actualZoneLabel}) 偏离计划要求 (${physiology.plannedZone})`);
+  }
+
+  return risks;
+}
+
+function buildPhysiologyHighlights(
+  workouts: PlannedWorkout[],
+  activities: NormalizedActivity[],
+  physiology: PhysiologyMetrics | null,
+): string[] {
+  if (!physiology) return [];
+  const highlights: string[] = [];
+  const primaryIntensity = workouts.find((w) => !REST_SPORTS.has(w.sport))?.intensity ?? 'medium';
+
+  for (const a of activities) {
+    const te = evaluateTrainingEffect(a, primaryIntensity);
+    if (te.match && te.note) highlights.push(te.note);
+  }
+
+  if (physiology.zoneMatch === true && physiology.hrZone !== null) {
+    highlights.push(`心率区间 ${ZONE_LABELS[physiology.hrZone]} 与计划匹配`);
+  }
+
+  if (physiology.tss !== null && physiology.intensityFactor !== null) {
+    highlights.push(`骑行 IF=${physiology.intensityFactor.toFixed(2)}，TSS=${physiology.tss}`);
+  }
+
+  return highlights;
+}
+
+function buildPhysiologySuggestions(
+  workouts: PlannedWorkout[],
+  activities: NormalizedActivity[],
+  physiology: PhysiologyMetrics | null,
+): string[] {
+  if (!physiology) return [];
+  const suggestions: string[] = [];
+  const primaryIntensity = workouts.find((w) => !REST_SPORTS.has(w.sport))?.intensity ?? 'medium';
+
+  if (primaryIntensity === 'low' && physiology.hrZone !== null && physiology.hrZone >= 3) {
+    suggestions.push('轻松日保持 Zone 1-2 有助于长期适应（Seiler 极化训练原则）');
+  }
+
+  for (const a of activities) {
+    const te = evaluateTrainingEffect(a, primaryIntensity);
+    if (!te.match && te.note) suggestions.push(te.note);
+  }
+
+  if (physiology.edwardsTRIMP !== null && physiology.edwardsTRIMP > 400) {
+    suggestions.push('单日 TRIMP 偏高，注意安排充足恢复');
+  }
+
+  return suggestions;
 }
