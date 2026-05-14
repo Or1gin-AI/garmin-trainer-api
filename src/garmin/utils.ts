@@ -283,6 +283,19 @@ function readZoneBoundary(
 }
 
 function extractHeartRateZones(raw: unknown): Array<[number, number]> | undefined {
+  // DEBUG: log keys that look like zone data
+  for (const obj of collectObjects(raw)) {
+    if (
+      obj.zoneNumber !== undefined ||
+      obj.zone !== undefined ||
+      obj.zoneLowBoundary !== undefined ||
+      obj.secsInZone !== undefined ||
+      obj.zoneFloor !== undefined ||
+      obj.zoneCeiling !== undefined
+    ) {
+      console.log('[DEBUG extractHeartRateZones] zone-like obj:', JSON.stringify(obj).slice(0, 300));
+    }
+  }
   const byZone = new Map<number, [number, number]>();
   for (const obj of collectObjects(raw)) {
     const zone = readZoneNumber(obj);
