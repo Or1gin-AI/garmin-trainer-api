@@ -54,7 +54,7 @@ import {
 import { normalizeActivity } from '../training/activity-normalizer.js';
 import type { NormalizedActivity } from '../training/activity-normalizer.js';
 import { classifyActivityQuality } from '../training/activity-quality.js';
-import type { QualityResult } from '../training/activity-quality.js';
+import type { QualityContext, QualityResult } from '../training/activity-quality.js';
 import { evaluateTrainingDay, type TrainingEvaluationResult } from '../training/evaluation.js';
 import { deriveRecentTrainingState } from '../training/recent-state.js';
 import { buildAthleteProfile } from '../training/athlete-profile.js';
@@ -599,6 +599,14 @@ function workoutToCalendarEvent(w: Workout, dateOverride?: string): CalendarEven
   };
 }
 
+function isCalendarSport(sport: string | null | undefined): sport is 'running' | 'cycling' | 'swimming' {
+  return sport === 'running' || sport === 'cycling' || sport === 'swimming';
+}
+
+function isCalendarWorkout(row: Workout): boolean {
+  return isCalendarSport(row.sport);
+}
+
 function dayOffset(from: Date, to: Date): number {
   const a = new Date(from);
   const b = new Date(to);
@@ -620,6 +628,7 @@ function expandPlanWorkoutsAcrossRange(
 ): CalendarEvent[] {
   const byDay = new Map<number, Workout[]>();
   for (const row of rows) {
+    if (!isCalendarWorkout(row)) continue;
     const list = byDay.get(row.dayIndex) ?? [];
     list.push(row);
     byDay.set(row.dayIndex, list);
@@ -694,12 +703,120 @@ function activityToCalendarEvent(
   };
 }
 
+interface CalendarActivityEntry {
+  activity: NormalizedActivity;
+  raw: unknown;
+  quality: QualityResult;
+}
+
+function qualityKeyForActivity(activity: NormalizedActivity): string {
+  return `${activity.region}-${String(activity.activityId)}`;
+}
+
+function addActivityQuality(
+  qualities: Map<string, QualityResult>,
+  activity: NormalizedActivity,
+  quality: QualityResult,
+): void {
+  qualities.set(activity.id, quality);
+  qualities.set(qualityKeyForActivity(activity), quality);
+  qualities.set(`${activity.region}:${String(activity.activityId)}`, quality);
+}
+
+function buildCalendarQualityContext(activities: NormalizedActivity[]): QualityContext {
+  const runningPaces = activities
+    .filter((a) => a.sport === 'running' && a.averagePaceSecPerKm !== null)
+    .map((a) => a.averagePaceSecPerKm as number);
+  const runningPowers = activities
+    .filter((a) => a.sport === 'running' && a.averagePower !== null)
+    .map((a) => a.averagePower as number);
+  const cyclingSpeeds = activities
+    .filter((a) => a.sport === 'cycling' && a.averageSpeed !== null)
+    .map((a) => a.averageSpeed as number);
+
+  return {
+    cyclingMedianSpeedMps: median(cyclingSpeeds),
+    runningMedianPaceSecPerKm: median(runningPaces),
+    runningMedianPowerWatts: median(runningPowers),
+    sportMedianDistanceKm: sportMetric(activities, (a) => a.distanceKm, median),
+    sportP90DistanceKm: sportMetric(activities, (a) => a.distanceKm, (v) => percentile(v, 0.9)),
+    sportMedianDurationMin: sportMetric(activities, (a) => a.durationMin, median),
+    sportP90DurationMin: sportMetric(activities, (a) => a.durationMin, (v) => percentile(v, 0.9)),
+    sportMedianTrainingLoad: sportMetric(
+      activities,
+      (a) => a.trainingLoad ?? null,
+      median,
+    ),
+  };
+}
+
+function sportMetric(
+  activities: NormalizedActivity[],
+  read: (activity: NormalizedActivity) => number | null,
+  aggregate: (values: number[]) => number | null,
+): Partial<Record<'running' | 'cycling' | 'swimming', number>> {
+  const out: Partial<Record<'running' | 'cycling' | 'swimming', number>> = {};
+  for (const sport of ['running', 'cycling', 'swimming'] as const) {
+    const values = activities
+      .filter((a) => a.sport === sport)
+      .map(read)
+      .filter((v): v is number => v !== null && Number.isFinite(v) && v > 0);
+    const value = aggregate(values);
+    if (value !== null) out[sport] = value;
+  }
+  return out;
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function percentile(values: number[], p: number): number | null {
+  if (values.length === 0) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * p) - 1));
+  return sorted[idx];
+}
+
+function filterCalendarActivities(
+  entries: Map<string, { activity: NormalizedActivity; raw: unknown }>,
+): Map<string, CalendarActivityEntry> {
+  const enduranceEntries = Array.from(entries.entries()).filter(([, { activity }]) =>
+    isCalendarSport(activity.sport),
+  );
+  const context = buildCalendarQualityContext(
+    enduranceEntries.map(([, { activity }]) => activity),
+  );
+  const filtered = new Map<string, CalendarActivityEntry>();
+  for (const [key, entry] of enduranceEntries) {
+    const quality = classifyActivityQuality(entry.activity, context);
+    if (quality.confidence === 'low') continue;
+    filtered.set(key, { ...entry, quality });
+  }
+  return filtered;
+}
+
+function countCalendarActivitiesByRegion(
+  byActivity: Map<string, CalendarActivityEntry>,
+  region: 'cn' | 'global',
+): number {
+  let count = 0;
+  for (const { activity } of byActivity.values()) {
+    if (activity.region === region) count += 1;
+  }
+  return count;
+}
+
 async function loadRawActivityMap(
   userId: string,
   from: string,
   to: string,
 ): Promise<{
-  byActivity: Map<string, { activity: NormalizedActivity; raw: unknown }>;
+  byActivity: Map<string, CalendarActivityEntry>;
   live: Awaited<ReturnType<typeof fetchCalendarActivities>>;
 }> {
   const byActivity = new Map<string, { activity: NormalizedActivity; raw: unknown }>();
@@ -731,7 +848,7 @@ async function loadRawActivityMap(
     byActivity.set(`${activity.region}:${String(activity.activityId)}`, { activity, raw });
   }
 
-  return { byActivity, live };
+  return { byActivity: filterCalendarActivities(byActivity), live };
 }
 
 async function loadActivityEvents(
@@ -748,8 +865,8 @@ async function loadActivityEvents(
       activityToCalendarEvent(activity, raw),
     ),
     sources: [
-      { region: 'cn', count: live.cn.count, error: live.cn.error },
-      { region: 'global', count: live.global.count, error: live.global.error },
+      { region: 'cn', count: countCalendarActivitiesByRegion(byActivity, 'cn'), error: live.cn.error },
+      { region: 'global', count: countCalendarActivitiesByRegion(byActivity, 'global'), error: live.global.error },
     ],
   };
 }
@@ -757,13 +874,9 @@ async function loadActivityEvents(
 async function loadNormalizedActivitiesForDate(
   userId: string,
   date: string,
-): Promise<Map<string, NormalizedActivity>> {
+): Promise<Map<string, CalendarActivityEntry>> {
   const { byActivity } = await loadRawActivityMap(userId, date, date);
-  const result = new Map<string, NormalizedActivity>();
-  for (const [key, { activity }] of byActivity) {
-    result.set(key, activity);
-  }
-  return result;
+  return byActivity;
 }
 
 function buildEvaluationPlaceholder(
@@ -823,7 +936,7 @@ function planWorkoutsForDate(
 ): Workout[] {
   const dayIndex = circularDayIndex(String(planRow.weekStartDate), date);
   return rows
-    .filter((row) => row.dayIndex === dayIndex)
+    .filter((row) => row.dayIndex === dayIndex && isCalendarWorkout(row))
     .sort((a, b) => (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
 }
 
@@ -1165,8 +1278,8 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
     activityToCalendarEvent(activity, raw),
   );
   const activitySources: CalendarActivitySourceStatus[] = [
-    { region: 'cn', count: live.cn.count, error: live.cn.error },
-    { region: 'global', count: live.global.count, error: live.global.error },
+    { region: 'cn', count: countCalendarActivitiesByRegion(byActivity, 'cn'), error: live.cn.error },
+    { region: 'global', count: countCalendarActivitiesByRegion(byActivity, 'global'), error: live.global.error },
   ];
   events.push(...activityEvents);
 
@@ -1216,7 +1329,9 @@ trainingRouter.get('/calendar', requireUser, async (req, res) => {
 
       const qualities = new Map<string, QualityResult>();
       for (const a of dayActivities) {
-        qualities.set(a.id, classifyActivityQuality(a));
+        const quality = byActivity.get(`${a.region}:${String(a.activityId)}`)?.quality ??
+          classifyActivityQuality(a);
+        addActivityQuality(qualities, a, quality);
       }
       const activityRefs = dayActivities.map((a) => ({
         region: a.region,
@@ -1344,11 +1459,14 @@ trainingRouter.post('/calendar/evaluations', requireUser, async (req, res) => {
 
   const activityMap = await loadNormalizedActivitiesForDate(userId, parsed.data.date);
   const normalizedActivities = requested
-    .map((ref) => activityMap.get(`${ref.region}:${ref.activityId}`))
+    .map((ref) => activityMap.get(`${ref.region}:${ref.activityId}`)?.activity)
     .filter((a): a is NormalizedActivity => a != null);
   const qualities = new Map<string, QualityResult>();
   for (const a of normalizedActivities) {
-    qualities.set(a.id, classifyActivityQuality(a));
+    const quality =
+      activityMap.get(`${a.region}:${String(a.activityId)}`)?.quality ??
+      classifyActivityQuality(a);
+    addActivityQuality(qualities, a, quality);
   }
   const result = evaluateTrainingDay({
     plannedWorkouts: plannedWorkoutRows.map((w) => ({

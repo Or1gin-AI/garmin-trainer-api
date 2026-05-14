@@ -6,7 +6,7 @@
 //
 // No I/O, no LLM, no DB.
 
-import type { NormalizedActivity } from './activity-normalizer.js';
+import type { NormalizedActivity, NormalizedSport } from './activity-normalizer.js';
 
 export type Confidence = 'high' | 'medium' | 'low';
 
@@ -21,7 +21,10 @@ export type QualityFlag =
   | 'long_distance_no_training_load'
   | 'speed_inconsistent_with_hr'
   | 'implausible_distance_duration'
-  | 'type_benefit_mismatch';
+  | 'type_benefit_mismatch'
+  | 'below_training_signal_threshold'
+  | 'above_personal_capacity'
+  | 'extreme_distance_low_load';
 
 export interface QualityResult {
   confidence: Confidence;
@@ -39,6 +42,11 @@ export interface QualityContext {
   // corresponding cardiovascular / biomechanical signature.
   runningMedianPaceSecPerKm?: number | null;
   runningMedianPowerWatts?: number | null;
+  sportMedianDistanceKm?: Partial<Record<NormalizedSport, number>>;
+  sportP90DistanceKm?: Partial<Record<NormalizedSport, number>>;
+  sportMedianDurationMin?: Partial<Record<NormalizedSport, number>>;
+  sportP90DurationMin?: Partial<Record<NormalizedSport, number>>;
+  sportMedianTrainingLoad?: Partial<Record<NormalizedSport, number>>;
 }
 
 // Substring patterns hinting that Garmin labelled the activity "no training
@@ -213,6 +221,62 @@ export function classifyActivityQuality(
     flags.push('speed_inconsistent_with_hr');
   }
 
+  // ---- 8) too small to be a meaningful training record -------------------
+  // Calendar should not show accidental starts, parking-lot spins, watch
+  // tests, or tiny commutes as training sessions. Keep genuinely intense
+  // short work if Garmin recorded enough load/effect, otherwise hide it.
+  if (isEnduranceSport(activity.sport)) {
+    const min = minimumTrainingSignal(activity.sport);
+    const load = activity.trainingLoad ?? 0;
+    const aerobic = activity.aerobicTrainingEffect ?? 0;
+    const anaerobic = activity.anaerobicTrainingEffect ?? 0;
+    const hasMeaningfulLoad = load >= min.trainingLoad ||
+      aerobic >= min.trainingEffect ||
+      anaerobic >= min.anaerobicEffect;
+    const tooShort =
+      activity.distanceKm < min.distanceKm ||
+      activity.durationMin < min.durationMin;
+    if (tooShort && !hasMeaningfulLoad) {
+      flags.push('below_training_signal_threshold');
+    }
+  }
+
+  // ---- 9) distance far outside personal capacity without matching load ----
+  if (isEnduranceSport(activity.sport) && activity.distanceKm > 0) {
+    const medianDistance = historicalContext?.sportMedianDistanceKm?.[activity.sport] ?? null;
+    const p90Distance = historicalContext?.sportP90DistanceKm?.[activity.sport] ?? null;
+    const medianDuration = historicalContext?.sportMedianDurationMin?.[activity.sport] ?? null;
+    const p90Duration = historicalContext?.sportP90DurationMin?.[activity.sport] ?? null;
+    const upperDistance = personalDistanceUpper(activity.sport, medianDistance, p90Distance);
+    const upperDuration = personalDurationUpper(activity.sport, medianDuration, p90Duration);
+    const farBeyondDistance = upperDistance !== null && activity.distanceKm > upperDistance;
+    const farBeyondDuration = upperDuration !== null && activity.durationMin > upperDuration;
+    if (farBeyondDistance || farBeyondDuration) {
+      const expectedLoad = minimumLongActivityLoad(activity.sport, activity.distanceKm, activity.durationMin);
+      const load = activity.trainingLoad;
+      const hasStrongPhysiology =
+        (load !== null && load >= expectedLoad) ||
+        (activity.aerobicTrainingEffect !== null && activity.aerobicTrainingEffect >= 3) ||
+        (activity.averageHr !== null && activity.averageHr >= 115) ||
+        (activity.averagePower !== null && activity.averagePower > 0);
+      if (!hasStrongPhysiology) {
+        flags.push('above_personal_capacity');
+      }
+    }
+  }
+
+  // ---- 10) absolute extreme distance but Garmin saw almost no load --------
+  if (isEnduranceSport(activity.sport) && activity.distanceKm > absoluteExtremeDistance(activity.sport)) {
+    const load = activity.trainingLoad;
+    const effect = Math.max(
+      activity.aerobicTrainingEffect ?? 0,
+      activity.anaerobicTrainingEffect ?? 0,
+    );
+    if ((load === null || load < minimumLongActivityLoad(activity.sport, activity.distanceKm, activity.durationMin)) && effect < 2) {
+      flags.push('extreme_distance_low_load');
+    }
+  }
+
   return { confidence: deriveConfidence(flags), flags };
 }
 
@@ -224,6 +288,9 @@ function deriveConfidence(flags: QualityFlag[]): Confidence {
     'distance_without_physiology',
     'long_distance_no_training_load',
     'implausible_distance_duration',
+    'below_training_signal_threshold',
+    'above_personal_capacity',
+    'extreme_distance_low_load',
   ]);
   if (flags.some((f) => hard.has(f))) return 'low';
   const soft = new Set<QualityFlag>([
@@ -235,6 +302,74 @@ function deriveConfidence(flags: QualityFlag[]): Confidence {
   ]);
   if (flags.some((f) => soft.has(f))) return 'medium';
   return 'high';
+}
+
+function isEnduranceSport(sport: NormalizedSport): sport is 'running' | 'cycling' | 'swimming' {
+  return sport === 'running' || sport === 'cycling' || sport === 'swimming';
+}
+
+function minimumTrainingSignal(
+  sport: 'running' | 'cycling' | 'swimming',
+): { distanceKm: number; durationMin: number; trainingLoad: number; trainingEffect: number; anaerobicEffect: number } {
+  if (sport === 'running') {
+    return { distanceKm: 1, durationMin: 8, trainingLoad: 10, trainingEffect: 1, anaerobicEffect: 0.7 };
+  }
+  if (sport === 'cycling') {
+    return { distanceKm: 3, durationMin: 10, trainingLoad: 10, trainingEffect: 1, anaerobicEffect: 0.7 };
+  }
+  return { distanceKm: 0.2, durationMin: 8, trainingLoad: 8, trainingEffect: 0.8, anaerobicEffect: 0.6 };
+}
+
+function personalDistanceUpper(
+  sport: 'running' | 'cycling' | 'swimming',
+  medianDistance: number | null,
+  p90Distance: number | null,
+): number | null {
+  const absolute = sport === 'running' ? 70 : sport === 'cycling' ? 220 : 10;
+  const candidates = [absolute];
+  if (medianDistance !== null && medianDistance > 0) {
+    candidates.push(medianDistance * (sport === 'cycling' ? 4 : 3.5));
+  }
+  if (p90Distance !== null && p90Distance > 0) {
+    candidates.push(p90Distance * (sport === 'cycling' ? 2.2 : 2));
+  }
+  return Math.max(...candidates);
+}
+
+function personalDurationUpper(
+  sport: 'running' | 'cycling' | 'swimming',
+  medianDuration: number | null,
+  p90Duration: number | null,
+): number | null {
+  const absolute = sport === 'running' ? 300 : sport === 'cycling' ? 720 : 240;
+  const candidates = [absolute];
+  if (medianDuration !== null && medianDuration > 0) {
+    candidates.push(medianDuration * (sport === 'cycling' ? 4 : 3.5));
+  }
+  if (p90Duration !== null && p90Duration > 0) {
+    candidates.push(p90Duration * (sport === 'cycling' ? 2.2 : 2));
+  }
+  return Math.max(...candidates);
+}
+
+function minimumLongActivityLoad(
+  sport: 'running' | 'cycling' | 'swimming',
+  distanceKm: number,
+  durationMin: number,
+): number {
+  if (sport === 'cycling') {
+    return Math.max(60, Math.min(300, distanceKm * 0.9, durationMin * 0.45));
+  }
+  if (sport === 'running') {
+    return Math.max(45, Math.min(220, distanceKm * 4, durationMin * 0.6));
+  }
+  return Math.max(25, Math.min(160, distanceKm * 20, durationMin * 0.5));
+}
+
+function absoluteExtremeDistance(sport: 'running' | 'cycling' | 'swimming'): number {
+  if (sport === 'cycling') return 250;
+  if (sport === 'running') return 80;
+  return 12;
 }
 
 function normalizeVerticalOscillationCm(value: number | null): number | null {
