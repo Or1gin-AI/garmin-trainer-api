@@ -517,8 +517,8 @@ function buildLoadComment(
   if (workouts.length === 0) {
     return {
       planned: null,
-      actual: hasActualLoad ? totalActualLoad : null,
-      comment: hasActualLoad ? `实际训练负荷 ${totalActualLoad}` : '无负荷数据',
+      actual: hasActualLoad ? Math.round(totalActualLoad) : null,
+      comment: hasActualLoad ? `实际训练负荷 ${Math.round(totalActualLoad)}` : '无负荷数据',
     };
   }
 
@@ -541,11 +541,11 @@ function buildLoadComment(
 
   let comment: string;
   if (totalActualLoad < totalLow * 0.7) {
-    comment = `训练负荷偏低：实际 ${totalActualLoad}，期望 ${planned}`;
+    comment = `训练负荷偏低：实际 ${Math.round(totalActualLoad)}，期望 ${planned}`;
   } else if (totalActualLoad > totalHigh * 1.3) {
-    comment = `训练负荷偏高：实际 ${totalActualLoad}，期望 ${planned}`;
+    comment = `训练负荷偏高：实际 ${Math.round(totalActualLoad)}，期望 ${planned}`;
   } else {
-    comment = `训练负荷在合理范围：实际 ${totalActualLoad}，期望 ${planned}`;
+    comment = `训练负荷在合理范围：实际 ${Math.round(totalActualLoad)}，期望 ${planned}`;
   }
 
   return { planned, actual: totalActualLoad, comment };
@@ -1091,22 +1091,28 @@ function intensityZh(s: string): string {
 // ---------------------------------------------------------------------------
 
 function computeEdwardsTRIMP(a: NormalizedActivity, maxHr: number): number | null {
-  if (!a.averageHr || maxHr <= 0 || a.durationMin <= 0) return null;
-  const zone = classifyHrZone(a.averageHr, maxHr);
+  if (!a.averageHr || a.durationMin <= 0) return null;
+  const zone = classifyHrZoneFromActivity(a, maxHr);
+  if (zone === null) return null;
   return Math.round(a.durationMin * zone);
 }
 
 // ---------------------------------------------------------------------------
-// Sports science: HR Zone classification (Edwards 5-zone model)
+// Sports science: HR Zone classification
+// Prefer Garmin's own zone boundaries (from user profile) over %HRmax.
 // ---------------------------------------------------------------------------
 
-function classifyHrZone(avgHr: number, maxHr: number): number {
-  if (maxHr <= 0) return 1;
-  const pct = avgHr / maxHr;
-  if (pct >= 0.90) return 5;
-  if (pct >= 0.80) return 4;
-  if (pct >= 0.70) return 3;
-  if (pct >= 0.60) return 2;
+function classifyHrZoneFromActivity(a: NormalizedActivity, _maxHr: number): number | null {
+  if (!a.averageHr) return null;
+
+  // Only use Garmin's personal zone boundaries — no fallback %HRmax guessing.
+  if (!a.heartRateZones || a.heartRateZones.length < 2) return null;
+
+  const avg = a.averageHr;
+  for (let i = a.heartRateZones.length - 1; i >= 0; i--) {
+    const [low] = a.heartRateZones[i];
+    if (avg >= low) return Math.min(i + 1, 5);
+  }
   return 1;
 }
 
@@ -1241,9 +1247,9 @@ function buildPhysiologyMetrics(
     if (a.anaerobicTrainingEffect !== null && (bestAnaTE === null || a.anaerobicTrainingEffect > bestAnaTE)) {
       bestAnaTE = a.anaerobicTrainingEffect;
     }
-    if (a.averageHr && maxHr > 0) {
-      const zone = classifyHrZone(a.averageHr, maxHr);
-      if (primaryZone === null || zone > primaryZone) primaryZone = zone;
+    if (a.averageHr) {
+      const zone = classifyHrZoneFromActivity(a, maxHr);
+      if (zone !== null && (primaryZone === null || zone > primaryZone)) primaryZone = zone;
     }
     if (a.recoveryTimeHours !== null && (recoveryHours === null || a.recoveryTimeHours > recoveryHours)) {
       recoveryHours = a.recoveryTimeHours;
