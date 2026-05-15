@@ -16,6 +16,7 @@ import type {
 import {
   streamChat,
   completeChat,
+  extractJsonObjectText,
   getActiveLlmConfig,
   shouldUseNonStreamingToolCalls,
 } from '../lib/llm.js';
@@ -124,6 +125,7 @@ const ALLOWED_SPORTS: ReadonlySet<string> = new Set([
 ]);
 
 const TOOL_NAME = 'select_weekly_schedule';
+const SCHEDULE_TOOL_CALL_TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Public entry
@@ -285,6 +287,7 @@ export async function llmBuildWeeklySchedule(
       tools,
       toolChoice: { type: 'function', function: { name: TOOL_NAME } },
       temperature: 0.4,
+      timeoutMs: SCHEDULE_TOOL_CALL_TIMEOUT_MS,
       signal: args.signal,
     });
     const toolCall = completion.choices?.[0]?.message?.tool_calls?.find(
@@ -293,7 +296,9 @@ export async function llmBuildWeeklySchedule(
         'function' in tc &&
         tc.function?.name === TOOL_NAME,
     ) as { function?: { arguments?: string } } | undefined;
-    const argsBuffer = toolCall?.function?.arguments ?? '';
+    const argsBuffer =
+      toolCall?.function?.arguments ??
+      extractJsonObjectText(completion.choices?.[0]?.message?.content);
     if (argsBuffer.length === 0) {
       throw new InvalidLlmScheduleError(['model did not emit tool call']);
     }
@@ -335,6 +340,7 @@ export async function llmBuildWeeklySchedule(
     tools,
     toolChoice: { type: 'function', function: { name: TOOL_NAME } },
     temperature: 0.4,
+    timeoutMs: SCHEDULE_TOOL_CALL_TIMEOUT_MS,
     signal: args.signal,
   });
 
@@ -494,7 +500,7 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
       continue;
     }
 
-    if (tpl.fixed.sport !== day.sport) {
+    if (tpl.fixed.sport !== day.sport && !areCompatibleRestLikeSports(tpl.fixed.sport, day.sport)) {
       violations.push(
         `day ${day.dayIndex}: template ${day.templateId} sport=${tpl.fixed.sport} != claimed sport=${day.sport}`,
       );
@@ -543,6 +549,7 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
     .sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
   const requestedTrainingDays = effectiveTrainingDaysPerWeek(request);
   const protectedTrainingDays = requestedTrainingDayIndexes(request);
+  const enabledSports = collectEnabledSports(request);
   const activeTrainingCount = new Set(
     sortedEntries
       .filter((e) => !isRestLikeSport(e.sport))
@@ -568,7 +575,28 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
     }
   }
 
-  const enabledSports = collectEnabledSports(request);
+  if (allowDoubleDays) {
+    const allowSameSportDouble = hasExplicitSameSportDoubleRequest(request);
+    for (const dayIndex of coveredDayIndexes) {
+      const dayEntries = sortedEntries.filter((e) => e.dayIndex === dayIndex);
+      if (dayEntries.length < 2) continue;
+      const activeEntries = dayEntries.filter((e) => !isRestLikeSport(e.sport));
+      const templateIds = activeEntries.map((e) => e.templateId);
+      if (!allowSameSportDouble && new Set(templateIds).size < templateIds.length) {
+        violations.push(`day ${dayIndex}: repeated templateId in double day`);
+      }
+      const activeSports = new Set(activeEntries.map((e) => e.sport));
+      if (
+        !allowSameSportDouble &&
+        enabledSports.length > 1 &&
+        activeEntries.length > 1 &&
+        activeSports.size < activeEntries.length
+      ) {
+        violations.push(`day ${dayIndex}: double day repeats ${Array.from(activeSports).join('/')} instead of cross-training`);
+      }
+    }
+  }
+
   if (request.daysPerWeek >= enabledSports.length) {
     for (const sport of enabledSports) {
       if (!sortedEntries.some((e) => e.sport === sport)) {
@@ -705,6 +733,9 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   if (allowExtraSlots) {
     systemParts.push(
       '- 必须覆盖 7 个 dayIndex (1..7)；允许为了满足同日多练或平均训练时长目标让 days 数组超过 7 条，同一 dayIndex 用 slotIndex=1/2 表示上午/下午两课。加练优先使用低强度 Z2、有氧、恢复或技术模板。',
+    );
+    systemParts.push(
+      '- 当用户开启多个运动项目时，非明确“双阈值/同项目两练”请求下，同一天第二练应优先安排跨项目低压力恢复或技术训练；禁止用同一 sport 或同一 templateId 重复堆普通有氧。',
     );
   } else {
     systemParts.push('- 必须输出且仅输出 7 条，覆盖 dayIndex 1..7；');
@@ -901,6 +932,18 @@ function collectEnabledSports(request: ScheduleRequest): ActiveSport[] {
   return out;
 }
 
+function hasExplicitSameSportDoubleRequest(request: ScheduleRequest): boolean {
+  const text = [
+    request.goal,
+    request.availableTime,
+    request.notes,
+    ...(request.preferredTrainingWindows ?? []),
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return /双阈值|双阈|同项目.*两练|两练.*同项目|一天.*两.*跑|一天.*两.*骑|一天.*两.*游|double\s*threshold|same[-\s]?sport/i.test(text);
+}
+
 function catalogLineForTemplate(templateId: string): string | null {
   const tpl = getTemplate(templateId);
   if (!tpl) return null;
@@ -1017,6 +1060,10 @@ function effectiveTrainingDaysPerWeek(request: ScheduleRequest): number {
 
 function isRestLikeSport(sport: string): boolean {
   return sport === 'rest' || sport === 'mobility';
+}
+
+function areCompatibleRestLikeSports(templateSport: string, claimedSport: string): boolean {
+  return isRestLikeSport(templateSport) && isRestLikeSport(claimedSport);
 }
 
 function hoursSinceLatest(state: RecentState): number | null {

@@ -13,6 +13,7 @@ import type {
 import {
   streamChat,
   completeChat,
+  extractJsonObjectText,
   getActiveLlmConfig,
   shouldUseNonStreamingToolCalls,
 } from '../lib/llm.js';
@@ -73,6 +74,7 @@ interface LlmWorkoutPayload {
 }
 
 const TOOL_NAME = 'parameterize_workout';
+const PARAMETERIZE_TOOL_CALL_TIMEOUT_MS = 18_000;
 const NA = '不适用';
 const DETERMINISTIC_PARAMETERIZATION_TEMPLATE_IDS = new Set([
   'run.reverse_pyramid.v1',
@@ -170,6 +172,7 @@ export async function llmParameterizeWorkout(
       tools,
       toolChoice: { type: 'function', function: { name: TOOL_NAME } },
       temperature: 0.5,
+      timeoutMs: PARAMETERIZE_TOOL_CALL_TIMEOUT_MS,
       signal: args.signal,
     });
     const toolCall = completion.choices?.[0]?.message?.tool_calls?.find(
@@ -178,7 +181,9 @@ export async function llmParameterizeWorkout(
         'function' in tc &&
         tc.function?.name === TOOL_NAME,
     ) as { function?: { arguments?: string } } | undefined;
-    const argsBuffer = toolCall?.function?.arguments ?? '';
+    const argsBuffer =
+      toolCall?.function?.arguments ??
+      extractJsonObjectText(completion.choices?.[0]?.message?.content);
     if (argsBuffer.length === 0) {
       throw new InvalidLlmWorkoutError(['model did not emit tool call']);
     }
@@ -212,6 +217,7 @@ export async function llmParameterizeWorkout(
     tools,
     toolChoice: { type: 'function', function: { name: TOOL_NAME } },
     temperature: 0.5,
+    timeoutMs: PARAMETERIZE_TOOL_CALL_TIMEOUT_MS,
     signal: args.signal,
   });
 

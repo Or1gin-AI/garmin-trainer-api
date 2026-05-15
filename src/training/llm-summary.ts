@@ -43,6 +43,7 @@ const HEADER_TO_KIND: ReadonlyArray<readonly [string, SummaryDeltaKind]> = [
   ['## 监控重点', 'monitoring'],
   ['## 调整规则', 'adjustment_rules'],
 ];
+const SUMMARY_STREAM_TIMEOUT_MS = 45_000;
 
 export async function llmStreamSummary(
   args: LlmStreamSummaryArgs,
@@ -52,6 +53,7 @@ export async function llmStreamSummary(
   const stream = await streamChat({
     messages,
     temperature: 0.6,
+    timeoutMs: SUMMARY_STREAM_TIMEOUT_MS,
     signal: args.signal,
   });
 

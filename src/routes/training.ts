@@ -17,7 +17,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, asc, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, lt } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import {
   activityCache,
@@ -161,6 +161,8 @@ const trainingEvaluationSchema = z.object({
 const ACTIVITY_LOOKBACK_DAYS = 56;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_TRAINING_PLANS_PER_USER = 10;
+const GENERATION_TIMEOUT_MS = 180_000;
+const STALE_GENERATING_PLAN_MS = 20 * 60_000;
 
 interface DerivedContext {
   request: ScheduleRequest;
@@ -1000,6 +1002,8 @@ trainingRouter.post(
     }
     const request = toScheduleRequest(parsed.data);
 
+    await markStaleGeneratingPlans(userId);
+
     const heldCount = await countHeldTrainingPlans(userId);
     if (heldCount >= MAX_TRAINING_PLANS_PER_USER) {
       res.status(409).json({
@@ -1035,6 +1039,16 @@ trainingRouter.post(
 
     openSse(res);
     const heartbeat = startHeartbeat(res);
+    const generationController = new AbortController();
+    let sseFinished = false;
+    const generationTimer = setTimeout(() => {
+      generationController.abort(new Error('generation_timeout'));
+    }, GENERATION_TIMEOUT_MS);
+    res.once('close', () => {
+      if (!sseFinished && !generationController.signal.aborted) {
+        generationController.abort(new Error('client_disconnected'));
+      }
+    });
     writeEvent(res, 'plan_created', { planId });
 
     const emitToolEv = (e: ToolEventPayload) => emitToolEvent(res, e);
@@ -1080,6 +1094,7 @@ trainingRouter.post(
         isColdStart: ctx.isColdStart,
         recentState: ctx.recentState,
         trainingCapacity: ctx.trainingCapacity,
+        signal: generationController.signal,
         onSummaryDelta: (delta) => {
           summaryDeltas.push(delta);
         },
@@ -1143,6 +1158,8 @@ trainingRouter.post(
         console.error('[training] persist failed:', (txErr as Error).message);
         await markPlanFailed(planId, (txErr as Error).message);
         clearInterval(heartbeat);
+        clearTimeout(generationTimer);
+        sseFinished = true;
         endSse(res, 'error', { error: 'persist_failed' });
         return;
       }
@@ -1187,15 +1204,31 @@ trainingRouter.post(
       }
 
       clearInterval(heartbeat);
+      clearTimeout(generationTimer);
+      sseFinished = true;
       endSse(res, 'done', { planId });
     } catch (err) {
-      console.error('[training] generate failed:', (err as Error).message);
-      await markPlanFailed(planId, (err as Error).message);
+      const message = generationController.signal.aborted
+        ? abortReasonMessage(generationController.signal, err)
+        : (err as Error).message;
+      console.error('[training] generate failed:', message);
+      await markPlanFailed(planId, message);
       clearInterval(heartbeat);
-      const errorPayload =
-        err instanceof GarminUnavailableError
-          ? { error: (err as Error).message }
-          : { error: 'generation_failed' };
+      clearTimeout(generationTimer);
+      sseFinished = true;
+      let errorPayload: Record<string, string>;
+      if (err instanceof GarminUnavailableError) {
+        errorPayload = { error: (err as Error).message };
+      } else if (message === 'generation_timeout') {
+        errorPayload = {
+          error: 'generation_timeout',
+          message: '训练计划生成超时，请稍后重试。',
+        };
+      } else if (message === 'client_disconnected') {
+        errorPayload = { error: 'client_disconnected' };
+      } else {
+        errorPayload = { error: 'generation_failed' };
+      }
       endSse(res, 'error', errorPayload);
     }
   },
@@ -1214,6 +1247,35 @@ async function markPlanFailed(planId: string, message: string): Promise<void> {
   } catch (err) {
     console.error('[training] markPlanFailed failed:', (err as Error).message);
   }
+}
+
+async function markStaleGeneratingPlans(userId: string): Promise<void> {
+  const cutoff = new Date(Date.now() - STALE_GENERATING_PLAN_MS);
+  try {
+    await db
+      .update(trainingPlan)
+      .set({
+        status: 'failed',
+        modelMeta: { error: 'generation_stale_or_interrupted' },
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(trainingPlan.userId, userId),
+          eq(trainingPlan.status, 'generating'),
+          lt(trainingPlan.updatedAt, cutoff),
+        ),
+      );
+  } catch (err) {
+    console.error('[training] markStaleGeneratingPlans failed:', (err as Error).message);
+  }
+}
+
+function abortReasonMessage(signal: AbortSignal, err: unknown): string {
+  const reason = signal.reason;
+  if (reason instanceof Error && reason.message) return reason.message;
+  if (typeof reason === 'string' && reason) return reason;
+  return err instanceof Error && err.message ? err.message : 'request_aborted';
 }
 
 // ---------------------------------------------------------------------------

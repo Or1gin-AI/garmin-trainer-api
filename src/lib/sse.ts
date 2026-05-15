@@ -31,7 +31,7 @@ export function openSse(res: Response): void {
  * so a single bad payload won't kill an in-flight LLM stream.
  */
 export function writeEvent(res: Response, event: string, data: unknown): void {
-  if (res.writableEnded) return;
+  if (res.writableEnded || res.destroyed) return;
   let json: string;
   try {
     json = JSON.stringify(data);
@@ -94,7 +94,7 @@ export function emitToolEvent(res: Response, payload: ToolEventPayload): void {
  * like 'done' and 'error'.
  */
 export function endSse(res: Response, event: string, data: unknown): void {
-  if (res.writableEnded) return;
+  if (res.writableEnded || res.destroyed) return;
   writeEvent(res, event, data);
   res.end();
 }

@@ -25,16 +25,25 @@ export interface ActiveLlmConfig {
 }
 
 export function shouldUseNonStreamingToolCalls(
-  config: Pick<ActiveLlmConfig, 'name' | 'baseUrl' | 'model'>,
+  _config: Pick<ActiveLlmConfig, 'name' | 'baseUrl' | 'model'>,
 ): boolean {
-  const name = config.name.toLowerCase();
-  const baseUrl = config.baseUrl.toLowerCase();
-  const model = config.model.toLowerCase();
-  return (
-    name.includes('xiaomi') ||
-    baseUrl.includes('xiaomimimo.com') ||
-    model.startsWith('mimo-')
-  );
+  // Tool-call streaming deltas vary the most across OpenAI-compatible
+  // providers. The schedule and workout-parameter stages do not need token
+  // streaming for UX, so use the standard non-streaming tool_calls response
+  // for every provider, including official GPT models and Xiaomi/MiMo.
+  return true;
+}
+
+export function extractJsonObjectText(content: string | null | undefined): string {
+  if (!content) return '';
+  let text = content.trim();
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced?.[1]) text = fenced[1].trim();
+  if (text.startsWith('{') && text.endsWith('}')) return text;
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start >= 0 && end > start) return text.slice(start, end + 1);
+  return '';
 }
 
 const CACHE_TTL_MS = 60_000;
@@ -108,6 +117,7 @@ export interface StreamChatArgs {
   toolChoice?: ChatCompletionToolChoiceOption;
   temperature?: number;
   maxTokens?: number;
+  timeoutMs?: number;
   signal?: AbortSignal;
   responseFormat?: ChatCompletionCreateParamsStreaming['response_format'];
 }
@@ -154,6 +164,7 @@ export async function streamChat(
 
   return client.chat.completions.create(body, {
     signal: args.signal,
+    ...(args.timeoutMs !== undefined ? { timeout: args.timeoutMs } : {}),
   });
 }
 
@@ -187,5 +198,6 @@ export async function completeChat(
 
   return client.chat.completions.create(body, {
     signal: args.signal,
+    ...(args.timeoutMs !== undefined ? { timeout: args.timeoutMs } : {}),
   });
 }

@@ -15,7 +15,8 @@
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "codes:gen": "tsx src/scripts/generate-codes.ts"
+    "codes:gen": "tsx src/scripts/generate-codes.ts",
+    "training:audit": "tsx src/scripts/audit-training-generation.ts"
   },
   "engines": {
     "node": ">=20"

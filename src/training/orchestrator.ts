@@ -106,6 +106,7 @@ export interface GeneratedPlan {
 const HARD_STIMULI: ReadonlySet<string> = new Set(['threshold', 'vo2max', 'anaerobic']);
 const DETERMINISTIC_PROVIDER = 'deterministic-fallback';
 const DETERMINISTIC_MODEL = 'v1';
+const PARAMETERIZE_CONCURRENCY = 3;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -152,6 +153,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     trainingCapacity,
   );
   schedule = applyExplicitWorkoutRequirements(schedule, request, requestIntent, trainingCapacity);
+  schedule = normalizeDoubleDayVariety(schedule, request, athleteProfile, trainingCapacity);
   schedule = enforceUserHardWorkoutLayout(schedule, request, requestIntent);
   schedule = appendForcedScheduleRiskNotes(schedule, request, recentState, trainingCapacity);
 
@@ -165,123 +167,29 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
   let fallbackParamCount = 0;
   const workouts: ParameterizedWorkout[] = [];
 
-  for (const entry of schedule.days) {
-    if (signal?.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
-    const tpl = getTemplate(entry.templateId) ?? getTemplate('rest.full.v1');
-    if (!tpl) {
-      // Should never happen — both rest templates are baked in.
-      throw new Error(`Missing template ${entry.templateId} and no rest fallback`);
-    }
-    const progression = decideProgression(athleteProfile, recentState, entry, progressionCapacity);
-    const tplResolved: WorkoutTemplate = tpl;
-
-    // Skip LLM for rest/mobility — they're trivially deterministic and the
-    // model would just fill in zeros. We don't emit a tool_event for these
-    // either: they'd just be noise.
-    const isRest = tplResolved.fixed.sport === 'rest' || tplResolved.fixed.sport === 'mobility';
-    if (isRest) {
-      workouts.push(
-        parameterizeWorkout({
-          template: tplResolved,
-          athleteProfile,
-          recentState,
-          request: {
-            targetMetricPreference: request.targetMetricPreference,
-            availableTime: request.availableTime,
-            dailyPreferredMinutes: request.dailyPreferredMinutes,
-          },
-          scheduleEntry: entry,
-          progression,
-        }),
-      );
-      fallbackParamCount += 1;
-      continue;
-    }
-
-    const paramId = crypto.randomUUID();
-    const paramDisplay = dayDisplay(entry.dayIndex, tplResolved.fixed.sport);
-    const paramStart = Date.now();
-    emit({
-      id: paramId,
-      name: 'llm_parameterize_workout',
-      displayName: paramDisplay,
-      phase: 'start',
-    });
-
-    try {
-      const llmRes = await llmParameterizeWorkout({
-        template: tplResolved,
+  const parameterized = await mapWithConcurrency(
+    schedule.days,
+    PARAMETERIZE_CONCURRENCY,
+    (entry) =>
+      parameterizeScheduleEntry({
+        entry,
+        request,
         athleteProfile,
-        recentState,
-        request: {
-          targetMetricPreference: request.targetMetricPreference,
-          availableTime: request.availableTime,
-          dailyPreferredMinutes: request.dailyPreferredMinutes,
-        },
-        scheduleEntry: entry,
-        progression,
         isColdStart,
-        signal,
-      });
-      const w = {
-        ...llmRes.workout,
-        parameterSource: {
-          ...llmRes.workout.parameterSource,
-          replacedVariables: {
-            ...llmRes.workout.parameterSource.replacedVariables,
-            __source: 'llm',
-          },
-        },
-      };
-      workouts.push(w);
-      totalInputTokens += llmRes.meta.inputTokens;
-      totalOutputTokens += llmRes.meta.outputTokens;
-      llmParamCount += 1;
-      emit({
-        id: paramId,
-        name: 'llm_parameterize_workout',
-        displayName: paramDisplay,
-        phase: 'done',
-        summary: summarizeParameterized('llm', w),
-        durationMs: Date.now() - paramStart,
-      });
-    } catch (err) {
-      if (signal?.aborted) {
-        throw err;
-      }
-      if (err instanceof InvalidLlmWorkoutError) {
-        console.error(
-          `[orchestrator] day ${entry.dayIndex} llm parameterize invalid: ${err.violations.join('; ')}`,
-        );
-      } else {
-        console.error(
-          `[orchestrator] day ${entry.dayIndex} llm parameterize failed: ${(err as Error).message}`,
-        );
-      }
-      const fallbackW = parameterizeWorkout({
-        template: tplResolved,
-        athleteProfile,
         recentState,
-        request: {
-          targetMetricPreference: request.targetMetricPreference,
-          availableTime: request.availableTime,
-          dailyPreferredMinutes: request.dailyPreferredMinutes,
-        },
-        scheduleEntry: entry,
-        progression,
-      });
-      workouts.push(fallbackW);
+        progressionCapacity,
+        signal,
+        emit,
+      }),
+  );
+  for (const item of parameterized) {
+    workouts.push(item.workout);
+    totalInputTokens += item.inputTokens;
+    totalOutputTokens += item.outputTokens;
+    if (item.source === 'llm') {
+      llmParamCount += 1;
+    } else {
       fallbackParamCount += 1;
-      emit({
-        id: paramId,
-        name: 'llm_parameterize_workout',
-        displayName: paramDisplay,
-        phase: 'done',
-        summary: summarizeParameterized('fallback', fallbackW),
-        durationMs: Date.now() - paramStart,
-      });
     }
   }
 
@@ -430,6 +338,158 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
       summarySource: summaryStage.source,
     },
   };
+}
+
+interface ParameterizeEntryResult {
+  workout: ParameterizedWorkout;
+  source: 'llm' | 'fallback';
+  inputTokens: number;
+  outputTokens: number;
+}
+
+async function parameterizeScheduleEntry(args: {
+  entry: ScheduleEntry;
+  request: ScheduleRequest;
+  athleteProfile: AthleteProfile;
+  isColdStart: boolean;
+  recentState: RecentState;
+  progressionCapacity?: TrainingCapacity;
+  signal?: AbortSignal;
+  emit: (e: ToolEventPayload) => void;
+}): Promise<ParameterizeEntryResult> {
+  const {
+    entry,
+    request,
+    athleteProfile,
+    isColdStart,
+    recentState,
+    progressionCapacity,
+    signal,
+    emit,
+  } = args;
+
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+  const tpl = getTemplate(entry.templateId) ?? getTemplate('rest.full.v1');
+  if (!tpl) {
+    throw new Error(`Missing template ${entry.templateId} and no rest fallback`);
+  }
+  const progression = decideProgression(athleteProfile, recentState, entry, progressionCapacity);
+  const tplResolved: WorkoutTemplate = tpl;
+
+  const buildFallback = (): ParameterizedWorkout =>
+    parameterizeWorkout({
+      template: tplResolved,
+      athleteProfile,
+      recentState,
+      request: {
+        targetMetricPreference: request.targetMetricPreference,
+        availableTime: request.availableTime,
+        dailyPreferredMinutes: request.dailyPreferredMinutes,
+      },
+      scheduleEntry: entry,
+      progression,
+    });
+
+  const isRest = tplResolved.fixed.sport === 'rest' || tplResolved.fixed.sport === 'mobility';
+  if (isRest) {
+    return { workout: buildFallback(), source: 'fallback', inputTokens: 0, outputTokens: 0 };
+  }
+
+  const paramId = crypto.randomUUID();
+  const paramDisplay = dayDisplay(entry.dayIndex, tplResolved.fixed.sport);
+  const paramStart = Date.now();
+  emit({
+    id: paramId,
+    name: 'llm_parameterize_workout',
+    displayName: paramDisplay,
+    phase: 'start',
+  });
+
+  try {
+    const llmRes = await llmParameterizeWorkout({
+      template: tplResolved,
+      athleteProfile,
+      recentState,
+      request: {
+        targetMetricPreference: request.targetMetricPreference,
+        availableTime: request.availableTime,
+        dailyPreferredMinutes: request.dailyPreferredMinutes,
+      },
+      scheduleEntry: entry,
+      progression,
+      isColdStart,
+      signal,
+    });
+    const workout = {
+      ...llmRes.workout,
+      parameterSource: {
+        ...llmRes.workout.parameterSource,
+        replacedVariables: {
+          ...llmRes.workout.parameterSource.replacedVariables,
+          __source: 'llm',
+        },
+      },
+    };
+    emit({
+      id: paramId,
+      name: 'llm_parameterize_workout',
+      displayName: paramDisplay,
+      phase: 'done',
+      summary: summarizeParameterized('llm', workout),
+      durationMs: Date.now() - paramStart,
+    });
+    return {
+      workout,
+      source: 'llm',
+      inputTokens: llmRes.meta.inputTokens,
+      outputTokens: llmRes.meta.outputTokens,
+    };
+  } catch (err) {
+    if (signal?.aborted) {
+      throw err;
+    }
+    if (err instanceof InvalidLlmWorkoutError) {
+      console.error(
+        `[orchestrator] day ${entry.dayIndex} llm parameterize invalid: ${err.violations.join('; ')}`,
+      );
+    } else {
+      console.error(
+        `[orchestrator] day ${entry.dayIndex} llm parameterize failed: ${(err as Error).message}`,
+      );
+    }
+    const workout = buildFallback();
+    emit({
+      id: paramId,
+      name: 'llm_parameterize_workout',
+      displayName: paramDisplay,
+      phase: 'done',
+      summary: summarizeParameterized('fallback', workout),
+      durationMs: Date.now() - paramStart,
+    });
+    return { workout, source: 'fallback', inputTokens: 0, outputTokens: 0 };
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await fn(items[index], index);
+      }
+    }),
+  );
+  return results;
 }
 
 export function expandMultiSessionSchedule(
@@ -723,6 +783,98 @@ function ensureDoubleThresholdPair(
     days: sortScheduleEntries([...nextDays, am, pm]),
     note: `${base.dayLabel} 已按用户要求安排双阈值上午/下午两练；恢复风险只作为提示，不自动删除。`,
   };
+}
+
+function normalizeDoubleDayVariety(
+  schedule: ScheduleResult,
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+  trainingCapacity?: TrainingCapacity,
+): ScheduleResult {
+  if (request.allowDoubleDays !== true) return schedule;
+  const enabledSports = enabledTrainingSports(request);
+  if (enabledSports.length <= 1) return schedule;
+  if (allowsSameSportDoubleDay(request)) return schedule;
+
+  const days = sortScheduleEntries(schedule.days.slice());
+  const notes = schedule.notes.slice();
+  let changed = false;
+
+  for (const dayIndex of new Set(days.map((day) => day.dayIndex))) {
+    const indexes = days
+      .map((day, index) => ({ day, index }))
+      .filter(({ day }) => day.dayIndex === dayIndex && !isRestLikeEntry(day));
+    if (indexes.length < 2) continue;
+    if (indexes.every(({ day }) => isDoubleThresholdTemplate(day.templateId))) continue;
+
+    const usedSports = new Set<ScheduleEntry['sport']>();
+    const usedTemplates = new Set<string>();
+    for (const { day, index } of indexes) {
+      const repeatsSport = usedSports.has(day.sport);
+      const repeatsTemplate = usedTemplates.has(day.templateId);
+      if (!repeatsSport && !repeatsTemplate) {
+        usedSports.add(day.sport);
+        usedTemplates.add(day.templateId);
+        continue;
+      }
+
+      const replacementId = chooseCrossTrainingRecoveryTemplate(
+        request,
+        athleteProfile,
+        usedSports,
+      );
+      if (!replacementId) continue;
+      const replacement = replaceEntryTemplate(
+        day,
+        replacementId,
+        `${day.reason ?? ''} 同日多练改为交叉恢复训练，避免重复堆同项目有氧。`.trim(),
+        request,
+        trainingCapacity,
+      );
+      days[index] = replacement;
+      usedSports.add(replacement.sport);
+      usedTemplates.add(replacement.templateId);
+      notes.push(
+        `${day.dayLabel} 的第二练已从 ${day.templateId} 调整为 ${replacement.templateId}，用于避免同一天重复堆同项目训练。`,
+      );
+      changed = true;
+    }
+  }
+
+  return changed ? { days: sortScheduleEntries(days), notes } : schedule;
+}
+
+function enabledTrainingSports(request: ScheduleRequest): ActiveSport[] {
+  const sports: ActiveSport[] = [];
+  if (request.sports.running) sports.push('running');
+  if (request.sports.cycling) sports.push('cycling');
+  if (request.sports.swimming) sports.push('swimming');
+  return sports;
+}
+
+function allowsSameSportDoubleDay(request: ScheduleRequest): boolean {
+  if (hasExplicitDoubleThresholdRequest(request)) return true;
+  const text = [request.goal, request.availableTime, request.notes]
+    .filter(Boolean)
+    .join('\n');
+  return /(一天|一日|同日)\s*两\s*(跑|骑|游)|两练都(跑|骑|游)|同项目\s*两练|两练\s*同项目/i.test(text);
+}
+
+function chooseCrossTrainingRecoveryTemplate(
+  request: ScheduleRequest,
+  athleteProfile: AthleteProfile,
+  usedSports: ReadonlySet<ScheduleEntry['sport']>,
+): string | null {
+  const options: Array<{ sport: ActiveSport; available: boolean; templateId: string }> = [
+    { sport: 'swimming', available: athleteProfile.swimming.available, templateId: 'swim.recovery.v1' },
+    { sport: 'cycling', available: athleteProfile.cycling.available, templateId: 'bike.recovery_spin.v1' },
+    { sport: 'running', available: athleteProfile.running.available, templateId: 'run.recovery.v1' },
+  ];
+  const enabled = options.filter((option) => request.sports[option.sport]);
+  const available = enabled.find((option) => option.available && !usedSports.has(option.sport));
+  if (available) return available.templateId;
+  const fallback = enabled.find((option) => !usedSports.has(option.sport));
+  return fallback?.templateId ?? null;
 }
 
 function replaceEntryTemplate(
@@ -1330,7 +1482,10 @@ async function runScheduleStage(args: {
         console.error(
           `[orchestrator] llm schedule attempt ${attempt + 1} invalid: ${err.violations.join('; ')}`,
         );
-        if (attempt === 0) {
+        const missingToolCall = err.violations.some((v) =>
+          /model did not emit tool call/i.test(v),
+        );
+        if (attempt === 0 && !missingToolCall) {
           firstViolations = err.violations;
           continue;
         }
@@ -2026,6 +2181,9 @@ function chooseExtraVolumeTemplate(
   for (const option of options) {
     if (!request.sports[option.sport]) continue;
     if (!sportsToday.has(option.sport)) return option.templateId;
+  }
+  if (options.filter((option) => request.sports[option.sport]).length > 1) {
+    return null;
   }
   for (const option of options) {
     if (!request.sports[option.sport]) continue;
