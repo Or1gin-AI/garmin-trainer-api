@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, desc, eq, ilike, or } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, or, sql } from 'drizzle-orm';
 import crypto from 'node:crypto';
 import { db } from '../db/index.js';
 import {
@@ -9,6 +9,7 @@ import {
   subscription,
   trainingPlan,
   user,
+  workout,
 } from '../db/schema.js';
 import { requireAdmin } from '../lib/session.js';
 import { extendPlanSubscription, type PaidSubscriptionPlan } from '../lib/plan.js';
@@ -116,7 +117,8 @@ const listChatMessagesSchema = z.object({
   planId: z.string().min(1).optional(),
   role: z.enum(['user', 'assistant', 'tool']).optional(),
   q: z.string().trim().max(200).optional(),
-  limit: z.coerce.number().int().min(1).max(500).default(200),
+  limit: z.coerce.number().int().min(1).max(100).default(25),
+  offset: z.coerce.number().int().min(0).default(0),
 });
 
 adminRouter.get('/chat-messages', requireAdmin, async (req, res) => {
@@ -126,7 +128,7 @@ adminRouter.get('/chat-messages', requireAdmin, async (req, res) => {
     return;
   }
 
-  const { userId, planId, role, q, limit } = parsed.data;
+  const { userId, planId, role, q, limit, offset } = parsed.data;
   const clauses = [];
   if (userId) clauses.push(eq(chatMessage.userId, userId));
   if (planId) clauses.push(eq(chatMessage.planId, planId));
@@ -141,6 +143,14 @@ adminRouter.get('/chat-messages', requireAdmin, async (req, res) => {
       ),
     );
   }
+
+  const whereExpr = clauses.length ? and(...clauses) : undefined;
+  const [{ total }] = await db
+    .select({ total: sql<number>`count(*)::int` })
+    .from(chatMessage)
+    .innerJoin(user, eq(chatMessage.userId, user.id))
+    .innerJoin(trainingPlan, eq(chatMessage.planId, trainingPlan.id))
+    .where(whereExpr);
 
   const rows = await db
     .select({
@@ -161,15 +171,147 @@ adminRouter.get('/chat-messages', requireAdmin, async (req, res) => {
     .from(chatMessage)
     .innerJoin(user, eq(chatMessage.userId, user.id))
     .innerJoin(trainingPlan, eq(chatMessage.planId, trainingPlan.id))
-    .where(clauses.length ? and(...clauses) : undefined)
-    .orderBy(desc(chatMessage.createdAt))
-    .limit(limit);
+    .where(whereExpr)
+    .orderBy(desc(chatMessage.createdAt), desc(chatMessage.id))
+    .limit(limit)
+    .offset(offset);
+
+  const totalRows = Number(total ?? 0);
 
   res.json({
     messages: rows.map((r) => ({
       ...r,
       displayName: r.displayName ?? r.name,
     })),
+    pagination: {
+      limit,
+      offset,
+      total: totalRows,
+      hasMore: offset + rows.length < totalRows,
+    },
+  });
+});
+
+const listTrainingPlansSchema = z.object({
+  userId: z.string().min(1).optional(),
+  status: z.enum(['generating', 'ready', 'failed', 'archived']).optional(),
+  q: z.string().trim().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(25),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+adminRouter.get('/training-plans', requireAdmin, async (req, res) => {
+  const parsed = listTrainingPlansSchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'invalid', issues: parsed.error.issues });
+    return;
+  }
+
+  const { userId, status, q, limit, offset } = parsed.data;
+  const clauses = [];
+  if (userId) clauses.push(eq(trainingPlan.userId, userId));
+  if (status) clauses.push(eq(trainingPlan.status, status));
+  if (q) {
+    clauses.push(
+      or(
+        ilike(user.email, `%${q}%`),
+        ilike(user.name, `%${q}%`),
+        ilike(user.displayUsername, `%${q}%`),
+        ilike(trainingPlan.summary, `%${q}%`),
+        ilike(trainingPlan.monitoring, `%${q}%`),
+        ilike(trainingPlan.adjustmentRules, `%${q}%`),
+      ),
+    );
+  }
+
+  const whereExpr = clauses.length ? and(...clauses) : undefined;
+  const [{ total }] = await db
+    .select({ total: sql<number>`count(*)::int` })
+    .from(trainingPlan)
+    .innerJoin(user, eq(trainingPlan.userId, user.id))
+    .where(whereExpr);
+
+  const rows = await db
+    .select({
+      id: trainingPlan.id,
+      userId: trainingPlan.userId,
+      weekStartDate: trainingPlan.weekStartDate,
+      status: trainingPlan.status,
+      request: trainingPlan.request,
+      summary: trainingPlan.summary,
+      monitoring: trainingPlan.monitoring,
+      adjustmentRules: trainingPlan.adjustmentRules,
+      modelMeta: trainingPlan.modelMeta,
+      createdAt: trainingPlan.createdAt,
+      updatedAt: trainingPlan.updatedAt,
+      email: user.email,
+      displayName: user.displayUsername,
+      name: user.name,
+    })
+    .from(trainingPlan)
+    .innerJoin(user, eq(trainingPlan.userId, user.id))
+    .where(whereExpr)
+    .orderBy(desc(trainingPlan.createdAt), desc(trainingPlan.id))
+    .limit(limit)
+    .offset(offset);
+
+  const totalRows = Number(total ?? 0);
+
+  res.json({
+    plans: rows.map((r) => ({
+      ...r,
+      displayName: r.displayName ?? r.name,
+    })),
+    pagination: {
+      limit,
+      offset,
+      total: totalRows,
+      hasMore: offset + rows.length < totalRows,
+    },
+  });
+});
+
+adminRouter.get('/training-plans/:id', requireAdmin, async (req, res) => {
+  const planId = String(req.params.id);
+  const [planRow] = await db
+    .select({
+      id: trainingPlan.id,
+      userId: trainingPlan.userId,
+      weekStartDate: trainingPlan.weekStartDate,
+      status: trainingPlan.status,
+      request: trainingPlan.request,
+      summary: trainingPlan.summary,
+      monitoring: trainingPlan.monitoring,
+      adjustmentRules: trainingPlan.adjustmentRules,
+      modelMeta: trainingPlan.modelMeta,
+      createdAt: trainingPlan.createdAt,
+      updatedAt: trainingPlan.updatedAt,
+      email: user.email,
+      displayName: user.displayUsername,
+      name: user.name,
+    })
+    .from(trainingPlan)
+    .innerJoin(user, eq(trainingPlan.userId, user.id))
+    .where(eq(trainingPlan.id, planId))
+    .limit(1);
+
+  if (!planRow) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+
+  const workouts = await db
+    .select()
+    .from(workout)
+    .where(eq(workout.planId, planId))
+    .orderBy(asc(workout.dayIndex), asc(workout.slotIndex));
+
+  res.json({
+    plan: {
+      ...planRow,
+      displayName: planRow.displayName ?? planRow.name,
+    },
+    workouts,
   });
 });
 
