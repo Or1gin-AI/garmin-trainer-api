@@ -171,50 +171,60 @@ export async function updateUserProfile(
     request: {},
   });
 
+  // Pass Garmin-authoritative values (FTP from power meter, CSS from biometric
+  // profile) into derive-zones so it skips PR-based estimation when Garmin
+  // already knows the answer. PR estimation is fallback only.
   const running = deriveRunning(bestPrs);
-  const swimming = deriveSwimming(bestPrs);
-  const cycling = deriveCycling(bestPrs);
+  const swimming = deriveSwimming(
+    bestPrs,
+    fullProfile.swimming.cssPaceSecPer100m ?? null,
+  );
+  const cycling = deriveCycling(bestPrs, fullProfile.cycling.ftpWatts ?? null);
   const lastActivityAt = latestActivityAt(activities);
 
+  // Snapshot merge priority: fullProfile (Garmin direct + activity-sample
+  // statistics) wins over derive-zones (PR-based estimation). derive-zones
+  // only fills in fields fullProfile cannot compute.
   const runningSnapshot = {
     ...fullProfile.running,
     available: fullProfile.running.available || running.available,
     vdot: running.vdot,
-    easyPaceSecPerKm: running.easyPaceSecPerKm ?? fullProfile.running.easyPaceSecPerKm,
-    longPaceSecPerKm: running.longPaceSecPerKm ?? fullProfile.running.longPaceSecPerKm,
+    easyPaceSecPerKm: fullProfile.running.easyPaceSecPerKm ?? running.easyPaceSecPerKm,
+    longPaceSecPerKm: fullProfile.running.longPaceSecPerKm ?? running.longPaceSecPerKm,
     thresholdPaceSecPerKm:
-      running.thresholdPaceSecPerKm ?? fullProfile.running.thresholdPaceSecPerKm,
-    vo2PaceSecPerKm: running.vo2PaceSecPerKm ?? fullProfile.running.vo2PaceSecPerKm,
+      fullProfile.running.thresholdPaceSecPerKm ?? running.thresholdPaceSecPerKm,
+    vo2PaceSecPerKm: fullProfile.running.vo2PaceSecPerKm ?? running.vo2PaceSecPerKm,
     intervalPaceSecPerKm:
-      running.intervalPaceSecPerKm ?? fullProfile.running.intervalPaceSecPerKm,
+      fullProfile.running.intervalPaceSecPerKm ?? running.intervalPaceSecPerKm,
     sourceAnchor: running.sourceAnchor,
     heartRateZones: fullProfile.heartRate,
   };
+  const swimmingCss =
+    fullProfile.swimming.cssPaceSecPer100m ?? swimming.cssSecPer100m ?? null;
   const swimmingSnapshot = {
     ...fullProfile.swimming,
     available: fullProfile.swimming.available || swimming.available,
-    cssSecPer100m: swimming.cssSecPer100m ?? fullProfile.swimming.cssPaceSecPer100m ?? null,
-    cssPaceSecPer100m:
-      swimming.cssSecPer100m ?? fullProfile.swimming.cssPaceSecPer100m,
+    cssSecPer100m: swimmingCss,
+    cssPaceSecPer100m: swimmingCss,
     easyPaceSecPer100m:
-      swimming.easyPaceSecPer100m ?? fullProfile.swimming.easyPaceSecPer100m,
+      fullProfile.swimming.easyPaceSecPer100m ?? swimming.easyPaceSecPer100m,
     endurancePaceSecPer100m:
-      swimming.endurancePaceSecPer100m ?? fullProfile.swimming.endurancePaceSecPer100m,
+      fullProfile.swimming.endurancePaceSecPer100m ?? swimming.endurancePaceSecPer100m,
     aerobicPaceSecPer100m:
-      swimming.aerobicPaceSecPer100m ?? fullProfile.swimming.aerobicPaceSecPer100m,
-    thresholdPaceSecPer100m:
-      swimming.thresholdPaceSecPer100m ?? fullProfile.swimming.cssPaceSecPer100m,
+      fullProfile.swimming.aerobicPaceSecPer100m ?? swimming.aerobicPaceSecPer100m,
+    thresholdPaceSecPer100m: swimmingCss,
     vo2PaceSecPer100m:
-      swimming.vo2PaceSecPer100m ?? fullProfile.swimming.vo2PaceSecPer100m,
+      fullProfile.swimming.vo2PaceSecPer100m ?? swimming.vo2PaceSecPer100m,
     sprintPaceSecPer100m:
-      swimming.sprintPaceSecPer100m ?? fullProfile.swimming.sprintPaceSecPer100m,
+      fullProfile.swimming.sprintPaceSecPer100m ?? swimming.sprintPaceSecPer100m,
     sourceAnchors: swimming.sourceAnchors,
     heartRateZones: fullProfile.heartRate,
   };
+  const cyclingFtp = fullProfile.cycling.ftpWatts ?? cycling.ftpWatts ?? null;
   const cyclingSnapshot = {
     ...fullProfile.cycling,
     available: fullProfile.cycling.available || cycling.available,
-    ftpWatts: cycling.ftpWatts ?? fullProfile.cycling.ftpWatts,
+    ftpWatts: cyclingFtp,
     enduranceWatts: cycling.enduranceWatts,
     tempoWatts: cycling.tempoWatts,
     thresholdWatts: cycling.thresholdWatts,
@@ -238,7 +248,7 @@ export async function updateUserProfile(
       sport: 'swimming',
       snapshot: swimmingSnapshot,
       primaryMetricUnit: 's_per_100m',
-      primaryMetric: swimming.cssSecPer100m,
+      primaryMetric: swimmingCss,
       activityCountUsed: activityCountForSport(activities, 'swimming'),
       lastActivityAt,
     }),
@@ -247,7 +257,7 @@ export async function updateUserProfile(
       sport: 'cycling',
       snapshot: cyclingSnapshot,
       primaryMetricUnit: 'watts',
-      primaryMetric: cycling.ftpWatts,
+      primaryMetric: cyclingFtp,
       activityCountUsed: activityCountForSport(activities, 'cycling'),
       lastActivityAt,
     }),

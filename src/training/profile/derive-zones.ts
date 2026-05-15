@@ -71,12 +71,24 @@ function pacePerKmFromVdotPct(vdot: number, pct: number): number {
 export function deriveRunning(prs: Map<Anchor, PrCandidate>): RunningDerived {
   const preferred: Anchor[] = ['run:5K', 'run:10K', 'run:HM', 'run:FM', 'run:3K'];
   let chosen: { anchor: Anchor; pr: PrCandidate; distM: number } | null = null;
+  // Prefer high-confidence PRs (exact-distance race-effort runs) over
+  // medium-confidence Riegel extrapolations from recovery/slow runs.
   for (const anchor of preferred) {
     const pr = prs.get(anchor);
     const distM = RUN_ANCHOR_DIST_M[anchor];
-    if (pr && distM) {
+    if (pr && distM && pr.confidence === 'high') {
       chosen = { anchor, pr, distM };
       break;
+    }
+  }
+  if (!chosen) {
+    for (const anchor of preferred) {
+      const pr = prs.get(anchor);
+      const distM = RUN_ANCHOR_DIST_M[anchor];
+      if (pr && distM) {
+        chosen = { anchor, pr, distM };
+        break;
+      }
     }
   }
   if (!chosen) return blankRunning();
@@ -114,7 +126,16 @@ const SWIM_ANCHOR_DIST_M: Partial<Record<Anchor, number>> = {
   'swim:1500m': 1500,
 };
 
-export function deriveSwimming(prs: Map<Anchor, PrCandidate>): SwimmingDerived {
+export function deriveSwimming(
+  prs: Map<Anchor, PrCandidate>,
+  garminCssSecPer100m?: number | null,
+): SwimmingDerived {
+  // Prefer Garmin's Critical Swim Speed from the biometric profile when available.
+  // Wakayoshi CSS from PR pairs is only used when Garmin has no CSS for us.
+  if (garminCssSecPer100m != null && garminCssSecPer100m > 0) {
+    return swimmingFromCss(garminCssSecPer100m, []);
+  }
+
   const pairs: [Anchor, Anchor][] = [
     ['swim:400m', 'swim:200m'],
     ['swim:800m', 'swim:200m'],
@@ -172,7 +193,16 @@ function swimmingFromCss(css: number, sourceAnchors: Anchor[]): SwimmingDerived 
   };
 }
 
-export function deriveCycling(prs: Map<Anchor, PrCandidate>): CyclingDerived {
+export function deriveCycling(
+  prs: Map<Anchor, PrCandidate>,
+  garminFtp?: number | null,
+): CyclingDerived {
+  // Prefer the FTP Garmin reports directly (from a power meter or auto-detection).
+  // Average-power-based PR estimation is only used when Garmin has no FTP for us.
+  if (garminFtp != null && garminFtp > 0) {
+    return cyclingFromFtp(garminFtp, null);
+  }
+
   const p20 = prs.get('bike:20min');
   const p60 = prs.get('bike:60min');
   let ftp: number | null = null;
@@ -206,6 +236,10 @@ export function deriveCycling(prs: Map<Anchor, PrCandidate>): CyclingDerived {
     };
   }
 
+  return cyclingFromFtp(ftp, sourceAnchor);
+}
+
+function cyclingFromFtp(ftp: number, sourceAnchor: Anchor | null): CyclingDerived {
   return {
     available: true,
     ftpWatts: Math.round(ftp),
