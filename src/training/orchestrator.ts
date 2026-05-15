@@ -24,7 +24,7 @@ import {
   MAX_WEEKLY_TRAINING_MINUTES,
   requestedDoubleDayIndex,
 } from './scheduler.js';
-import type { ScheduleRequest, ScheduleResult, ScheduleEntry } from './scheduler.js';
+import type { ActiveSport, ScheduleRequest, ScheduleResult, ScheduleEntry } from './scheduler.js';
 import { parameterizeWorkout } from './parameterizer.js';
 import type { ParameterizedWorkout } from './parameterizer.js';
 import { validatePlan } from './validation.js';
@@ -1627,6 +1627,7 @@ function enforceWeeklyDurationTarget(
   changed ||= balanced.changed;
 
   if (preferDoubleDays && total < target && request.allowDoubleDays === true) {
+    const beforeAdd = total;
     total = addLowIntensityVolumeSessions({
       schedule,
       workouts,
@@ -1636,7 +1637,7 @@ function enforceWeeklyDurationTarget(
       target,
       currentTotal: total,
     });
-    changed = true;
+    changed ||= total > beforeAdd;
   }
 
   if (total < target) {
@@ -1652,6 +1653,7 @@ function enforceWeeklyDurationTarget(
   }
 
   if (!preferDoubleDays && total < target && request.allowDoubleDays === true) {
+    const beforeAdd = total;
     total = addLowIntensityVolumeSessions({
       schedule,
       workouts,
@@ -1661,7 +1663,7 @@ function enforceWeeklyDurationTarget(
       target,
       currentTotal: total,
     });
-    changed = true;
+    changed ||= total > beforeAdd;
   }
 
   if (!changed) {
@@ -1675,7 +1677,7 @@ function enforceWeeklyDurationTarget(
 
   if (total >= Math.round(target * 0.97)) {
     schedule.notes.push(
-      `已按用户平均训练时长目标把本周训练时长调整到约 ${total}/${target} 分钟；高时长优先用低强度双练分摊，避免单次训练过长。`,
+      `已按用户平均训练时长目标把本周训练时长调整到约 ${total}/${target} 分钟；高时长优先用低压力训练分摊，避免单次训练过长或重复堆同类有氧。`,
     );
   } else {
     schedule.notes.push(
@@ -1889,29 +1891,32 @@ function addLowIntensityVolumeSessions(args: {
   let guard = 0;
   while (total < target && guard < 7) {
     guard += 1;
-    const day = chooseExtraVolumeDay(schedule, workouts);
+    const day = chooseExtraVolumeDay(schedule, workouts, request);
     if (!day) break;
-    const templateId = chooseExtraVolumeTemplate(request, day.sport);
+    const templateId = day.templateId;
     const tpl = getTemplate(templateId);
     if (!tpl) break;
     const remaining = target - total;
-    const minutes = Math.max(30, Math.min(extraSessionCap(request), roundToFive(remaining)));
+    const minutes = Math.max(
+      minimumExtraSessionMinutes(templateId),
+      Math.min(day.maxExtraMinutes, roundToFive(remaining)),
+    );
     const usedSlots = schedule.days
-      .filter((d) => d.dayIndex === day.dayIndex)
+      .filter((d) => d.dayIndex === day.entry.dayIndex)
       .map((d) => d.slotIndex ?? 1);
     const slotIndex = 2;
     if (usedSlots.includes(slotIndex)) break;
 
     const entry: ScheduleEntry = {
-      dayIndex: day.dayIndex,
-      date: day.date,
-      dayLabel: day.dayLabel,
+      dayIndex: day.entry.dayIndex,
+      date: day.entry.date,
+      dayLabel: day.entry.dayLabel,
       sport: tpl.fixed.sport,
       templateId,
       slotIndex,
-      sessionLabel: slotIndex === 2 ? '加练' : `加练 ${slotIndex}`,
-      timeOfDay: slotIndex === 2 ? 'evening' : 'afternoon',
-      reason: '用户明确给出周训练目标；用低强度加练补足总量，避免拉长质量课主项。',
+      sessionLabel: '训练 2',
+      timeOfDay: 'evening',
+      reason: day.reason,
     };
     const baseWorkout = parameterizeWorkout({
       template: tpl,
@@ -1932,45 +1937,115 @@ function addLowIntensityVolumeSessions(args: {
   return total;
 }
 
-function extraSessionCap(request: ScheduleRequest): number {
+function extraSessionCap(request: ScheduleRequest, existingDayMinutes: number): number {
   const daily = request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0
     ? request.dailyPreferredMinutes
     : 75;
-  return Math.max(45, Math.min(90, daily));
+  const dayCap = Math.round(daily * 1.1);
+  const remainingDayBudget = dayCap - existingDayMinutes;
+  return Math.max(0, Math.min(60, remainingDayBudget));
+}
+
+interface ExtraVolumeDayCandidate {
+  entry: ScheduleEntry;
+  templateId: string;
+  maxExtraMinutes: number;
+  reason: string;
+  hasHigh: boolean;
+  minutes: number;
+  index: number;
 }
 
 function chooseExtraVolumeDay(
   schedule: ScheduleResult,
   workouts: ParameterizedWorkout[],
-): ScheduleEntry | null {
-  const candidates = schedule.days
-    .map((entry, index) => {
-      const dayWorkouts = schedule.days
-        .map((d, i) => ({ d, w: workouts[i] }))
-        .filter(({ d }) => d.dayIndex === entry.dayIndex);
-      const hasHigh = dayWorkouts.some(({ w }) => w?.intensity === 'high');
-      const slots = dayWorkouts.length;
-      const minutes = dayWorkouts.reduce((sum, { w }) => sum + (w?.durationMinutes ?? 0), 0);
-      return { entry, index, hasHigh, slots, minutes };
-    })
-    .filter(({ entry, slots }) => entry.sport !== 'rest' && entry.sport !== 'mobility' && slots < 2)
+  request: ScheduleRequest,
+): ExtraVolumeDayCandidate | null {
+  const seenDays = new Set<number>();
+  const candidates: ExtraVolumeDayCandidate[] = [];
+
+  for (let index = 0; index < schedule.days.length; index += 1) {
+    const entry = schedule.days[index];
+    if (seenDays.has(entry.dayIndex)) continue;
+    seenDays.add(entry.dayIndex);
+    if (entry.sport === 'rest' || entry.sport === 'mobility') continue;
+
+    const dayWorkouts = schedule.days
+      .map((d, i) => ({ d, w: workouts[i] }))
+      .filter(({ d }) => d.dayIndex === entry.dayIndex);
+    const slots = dayWorkouts.length;
+    if (slots >= 2) continue;
+
+    const hasHigh = dayWorkouts.some(({ w }) => w?.intensity === 'high');
+    if (hasHigh) continue;
+    if (dayWorkouts.some(({ w }) => isLongEnduranceWorkout(w))) continue;
+
+    const minutes = dayWorkouts.reduce((sum, { w }) => sum + (w?.durationMinutes ?? 0), 0);
+    const maxExtraMinutes = roundToFive(extraSessionCap(request, minutes));
+    const templateId = chooseExtraVolumeTemplate(request, dayWorkouts);
+    if (!templateId) continue;
+    const minMinutes = minimumExtraSessionMinutes(templateId);
+    if (maxExtraMinutes < minMinutes) continue;
+    if (dayWorkouts.some(({ d }) => d.templateId === templateId)) continue;
+
+    const tpl = getTemplate(templateId);
+    if (!tpl) continue;
+    candidates.push({
+      entry,
+      templateId,
+      maxExtraMinutes,
+      reason:
+        tpl.fixed.sport === entry.sport
+          ? '用户高时长目标；新增一节短恢复训练，与当天主课区分，不重复堆有氧强度。'
+          : '用户高时长目标；新增一节低压力交叉训练，与当天主课区分，避免重复堆同项目有氧。',
+      hasHigh,
+      minutes,
+      index,
+    });
+  }
+
+  return candidates
     .sort((a, b) => {
       if (a.hasHigh !== b.hasHigh) return a.hasHigh ? 1 : -1;
-      if (a.slots !== b.slots) return a.slots - b.slots;
       if (a.minutes !== b.minutes) return a.minutes - b.minutes;
       return a.index - b.index;
-    });
-  return candidates[0]?.entry ?? null;
+    })[0] ?? null;
 }
 
-function chooseExtraVolumeTemplate(request: ScheduleRequest, anchorSport: Sport): string {
-  if (anchorSport === 'cycling' && request.sports.cycling) return 'bike.endurance.v1';
-  if (anchorSport === 'running' && request.sports.running) return 'run.aerobic.v1';
-  if (anchorSport === 'swimming' && request.sports.swimming) return 'swim.aerobic.v1';
-  if (request.sports.cycling) return 'bike.endurance.v1';
-  if (request.sports.running) return 'run.aerobic.v1';
-  if (request.sports.swimming) return 'swim.aerobic.v1';
-  return 'rest.mobility.v1';
+function chooseExtraVolumeTemplate(
+  request: ScheduleRequest,
+  dayWorkouts: Array<{ d: ScheduleEntry; w: ParameterizedWorkout | undefined }>,
+): string | null {
+  const sportsToday = new Set(dayWorkouts.map(({ d }) => d.sport));
+  const options: Array<{ sport: ActiveSport; templateId: string }> = [
+    { sport: 'cycling', templateId: 'bike.recovery_spin.v1' },
+    { sport: 'swimming', templateId: 'swim.recovery.v1' },
+    { sport: 'running', templateId: 'run.recovery.v1' },
+  ];
+
+  for (const option of options) {
+    if (!request.sports[option.sport]) continue;
+    if (!sportsToday.has(option.sport)) return option.templateId;
+  }
+  for (const option of options) {
+    if (!request.sports[option.sport]) continue;
+    return option.templateId;
+  }
+  return null;
+}
+
+function isLongEnduranceWorkout(workout: ParameterizedWorkout | undefined): boolean {
+  if (!workout) return false;
+  return (
+    workout.workoutType === 'lsd' ||
+    workout.workoutType === 'long_ride' ||
+    workout.durationMinutes >= 100
+  );
+}
+
+function minimumExtraSessionMinutes(templateId: string): number {
+  const tpl = getTemplate(templateId);
+  return tpl?.fixed.minDurationMinutes ?? 30;
 }
 
 function insertScheduleWorkout(
