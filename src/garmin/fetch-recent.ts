@@ -35,6 +35,7 @@ export interface FetchRecentResult {
   // averageHr, type, …). Garmin's raw payload uses different keys (distance
   // in meters, duration in seconds, averageHR, activityType.typeKey).
   activities: MappedActivity[];
+  physiology: GarminPhysiologyMetrics | null;
   cn: RegionFetchInfo;
   global: RegionFetchInfo;
 }
@@ -55,18 +56,62 @@ export class GarminUnavailableError extends Error {
 const DEFAULT_DAYS = 56;
 const DEFAULT_LIMIT = 100;
 
+export interface GarminHeartRateZoneSet {
+  sport: string;
+  trainingMethod: string | null;
+  restingHeartRate: number | null;
+  lactateThresholdHeartRate: number | null;
+  maxHeartRate: number | null;
+  zones: Array<[number, number]>;
+}
+
+export interface GarminPhysiologyMetrics {
+  heartRateZones: {
+    default: GarminHeartRateZoneSet | null;
+    cycling: GarminHeartRateZoneSet | null;
+    all: GarminHeartRateZoneSet[];
+  };
+  vo2MaxRunning: number | null;
+  vo2MaxCycling: number | null;
+  lactateThresholdHeartRate: number | null;
+  functionalThresholdPower: number | null;
+  criticalSwimSpeed: number | null;
+  ftpAutoDetected: boolean | null;
+  thresholdHeartRateAutoDetected: boolean | null;
+}
+
 async function fetchRegion(
   userId: string,
   region: 'cn' | 'global',
   limit: number,
-): Promise<{ list: RawActivity[]; error: string | null }> {
+  options: { includePhysiology?: boolean } = {},
+): Promise<{
+  list: RawActivity[];
+  physiology: GarminPhysiologyMetrics | null;
+  error: string | null;
+}> {
   try {
     const { client } = await authenticate(userId, region);
     const list = (await client.getActivities(0, limit)) as RawActivity[];
-    if (!Array.isArray(list)) return { list: [], error: null };
-    return { list: await enrichActivitiesWithDetails(client, list), error: null };
+    if (!Array.isArray(list)) {
+      const physiology = options.includePhysiology
+        ? await fetchGarminPhysiology(client)
+        : null;
+      return { list: [], physiology, error: null };
+    }
+    const [enriched, physiology] = await Promise.all([
+      enrichActivitiesWithDetails(client, list),
+      options.includePhysiology
+        ? fetchGarminPhysiology(client)
+        : Promise.resolve(null),
+    ]);
+    return { list: enriched, physiology, error: null };
   } catch (err) {
-    return { list: [], error: err instanceof Error ? err.message : String(err) };
+    return {
+      list: [],
+      physiology: null,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
@@ -81,6 +126,30 @@ function hasHrZoneDetailHint(activity: RawActivity): boolean {
   );
 }
 
+function activityTypeKey(activity: RawActivity): string {
+  const raw = activity as unknown as Record<string, unknown>;
+  const activityType = raw.activityType as { typeKey?: string } | undefined;
+  const activityTypeDTO = raw.activityTypeDTO as { typeKey?: string } | undefined;
+  return String(activityType?.typeKey ?? activityTypeDTO?.typeKey ?? '').toLowerCase();
+}
+
+function shouldFetchActivityDetail(activity: RawActivity): boolean {
+  const raw = activity as unknown as Record<string, unknown>;
+  const metadata = raw.metadataDTO as Record<string, unknown> | undefined;
+  const type = activityTypeKey(activity);
+  const isTrainingSport =
+    type.includes('run') ||
+    type.includes('cycl') ||
+    type.includes('bik') ||
+    type.includes('swim');
+  return (
+    isTrainingSport ||
+    hasHrZoneDetailHint(activity) ||
+    metadata?.hasPowerTimeInZones === true ||
+    raw.hasPowerTimeInZones === true
+  );
+}
+
 async function enrichActivitiesWithDetails(
   client: any,
   activities: RawActivity[],
@@ -88,8 +157,8 @@ async function enrichActivitiesWithDetails(
   const enriched = activities.slice();
   const candidates = activities
     .map((activity, index) => ({ activity, index }))
-    .filter(({ activity }) => hasHrZoneDetailHint(activity))
-    .slice(0, 25);
+    .filter(({ activity }) => shouldFetchActivityDetail(activity))
+    .slice(0, 40);
 
   await Promise.all(
     candidates.map(async ({ activity, index }) => {
@@ -97,6 +166,7 @@ async function enrichActivitiesWithDetails(
         const detail = await client.getActivity(activity);
         enriched[index] = {
           ...activity,
+          ...(detail && typeof detail === 'object' ? detail : {}),
           detail,
         } as RawActivity;
       } catch {
@@ -108,6 +178,119 @@ async function enrichActivitiesWithDetails(
   return enriched;
 }
 
+async function fetchGarminPhysiology(client: any): Promise<GarminPhysiologyMetrics | null> {
+  const [settings, personal, zonePayload] = await Promise.all([
+    safeCall(() => client.getUserSettings()),
+    safeCall(() => client.getPersonalInfo()),
+    safeCall(() => {
+      const base = String(client?.url?.GC_API ?? '').replace(/\/$/, '');
+      if (!base) return Promise.resolve(null);
+      return client.client.get(`${base}/biometric-service/heartRateZones`);
+    }),
+  ]);
+
+  const userData = readObj((settings as Record<string, unknown> | null)?.userData);
+  const biometricProfile = readObj(
+    (personal as Record<string, unknown> | null)?.biometricProfile,
+  );
+  const zones = Array.isArray(zonePayload)
+    ? zonePayload
+        .map(parseHeartRateZoneSet)
+        .filter((z): z is GarminHeartRateZoneSet => z !== null)
+    : [];
+
+  return {
+    heartRateZones: {
+      default: zones.find((z) => z.sport === 'DEFAULT') ?? zones[0] ?? null,
+      cycling: zones.find((z) => z.sport === 'CYCLING') ?? null,
+      all: zones,
+    },
+    vo2MaxRunning:
+      readNumber(userData?.vo2MaxRunning) ?? readNumber(biometricProfile?.vo2Max),
+    vo2MaxCycling:
+      readNumber(userData?.vo2MaxCycling) ?? readNumber(biometricProfile?.vo2MaxCycling),
+    lactateThresholdHeartRate:
+      readNumber(userData?.lactateThresholdHeartRate) ??
+      readNumber(biometricProfile?.lactateThresholdHeartRate),
+    functionalThresholdPower:
+      readNumber(userData?.functionalThresholdPower) ??
+      readNumber(biometricProfile?.functionalThresholdPower),
+    criticalSwimSpeed:
+      readNumber(userData?.criticalSwimSpeed) ??
+      readNumber(biometricProfile?.criticalSwimSpeed),
+    ftpAutoDetected: readBoolean(userData?.ftpAutoDetected),
+    thresholdHeartRateAutoDetected: readBoolean(userData?.thresholdHeartRateAutoDetected),
+  };
+}
+
+async function safeCall<T>(fn: () => Promise<T>): Promise<T | null> {
+  try {
+    return await fn();
+  } catch {
+    return null;
+  }
+}
+
+function readObj(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+}
+
+function readNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function readBoolean(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return null;
+}
+
+function parseHeartRateZoneSet(raw: unknown): GarminHeartRateZoneSet | null {
+  const obj = readObj(raw);
+  if (!obj) return null;
+  const zone1Floor = readNumber(obj.zone1Floor);
+  const zone2Floor = readNumber(obj.zone2Floor);
+  const zone3Floor = readNumber(obj.zone3Floor);
+  const zone4Floor = readNumber(obj.zone4Floor);
+  const zone5Floor = readNumber(obj.zone5Floor);
+  const maxHeartRate = readNumber(obj.maxHeartRateUsed);
+  if (
+    zone1Floor === null ||
+    zone2Floor === null ||
+    zone3Floor === null ||
+    zone4Floor === null ||
+    zone5Floor === null
+  ) {
+    return null;
+  }
+  const zone5High =
+    maxHeartRate !== null && maxHeartRate > zone5Floor
+      ? maxHeartRate
+      : zone5Floor + Math.max(10, zone5Floor - zone4Floor);
+  const floors = [zone1Floor, zone2Floor, zone3Floor, zone4Floor, zone5Floor]
+    .map((n) => Math.round(n));
+  const zonePairs: Array<[number, number]> = [
+    [floors[0], floors[1] - 1],
+    [floors[1], floors[2] - 1],
+    [floors[2], floors[3] - 1],
+    [floors[3], floors[4] - 1],
+    [floors[4], Math.round(zone5High)],
+  ];
+  const zones = zonePairs.filter(([low, high]) => high > low);
+  if (zones.length < 5) return null;
+  return {
+    sport: String(obj.sport ?? 'DEFAULT').toUpperCase(),
+    trainingMethod: obj.trainingMethod ? String(obj.trainingMethod) : null,
+    restingHeartRate: readNumber(obj.restingHeartRateUsed),
+    lactateThresholdHeartRate: readNumber(obj.lactateThresholdHeartRateUsed),
+    maxHeartRate: maxHeartRate !== null ? Math.round(maxHeartRate) : null,
+    zones,
+  };
+}
+
 export async function fetchRecentRawActivities(
   userId: string,
   options: FetchRecentOptions = {},
@@ -116,8 +299,12 @@ export async function fetchRecentRawActivities(
   const limit = options.limit ?? DEFAULT_LIMIT;
   const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
 
-  const cnRes = await fetchRegion(userId, 'cn', limit);
-  const globalRes = { list: [] as RawActivity[], error: null as string | null };
+  const cnRes = await fetchRegion(userId, 'cn', limit, { includePhysiology: true });
+  const globalRes = {
+    list: [] as RawActivity[],
+    physiology: null as GarminPhysiologyMetrics | null,
+    error: null as string | null,
+  };
 
   if (cnRes.error) {
     throw new GarminUnavailableError(
@@ -140,6 +327,7 @@ export async function fetchRecentRawActivities(
 
   return {
     activities: filtered,
+    physiology: cnRes.physiology,
     cn: { count: cnRes.list.length, error: cnRes.error },
     global: { count: globalRes.list.length, error: globalRes.error },
   };

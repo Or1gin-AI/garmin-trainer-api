@@ -267,6 +267,7 @@ async function loadDerivedContext(
   const athleteProfile = buildAthleteProfile({
     activities,
     qualities,
+    physiology: fetched.physiology,
     request: {
       injuries: request.injuries,
       raceDate: request.raceDate ?? null,

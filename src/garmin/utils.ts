@@ -43,6 +43,8 @@ export interface MappedActivity {
   averagePower?: number;
   normalizedPower?: number;
   maxPower?: number;
+  maxPowerTwentyMinutes?: number;
+  functionalThresholdPower?: number;
   averageCadence?: number;
   maxCadence?: number;
   groundContactTime?: number;
@@ -133,7 +135,8 @@ export const ACTIVITY_FIELD_ALIASES = {
     'trainingEffectMessage',
     'summaryDTO.trainingEffectMessage',
   ],
-  averageSpeed: ['averageSpeed', 'summaryDTO.averageSpeed'],
+  averageHr: ['averageHR', 'averageHr', 'summaryDTO.averageHR', 'summaryDTO.averageHr'],
+  averageSpeed: ['averageSpeed', 'summaryDTO.averageSpeed', 'detail.summaryDTO.averageSpeed'],
   maxHr: ['maxHR', 'maxHr', 'summaryDTO.maxHR', 'summaryDTO.maxHr'],
   maxSpeed: ['maxSpeed', 'summaryDTO.maxSpeed'],
   elevationGain: [
@@ -144,6 +147,20 @@ export const ACTIVITY_FIELD_ALIASES = {
   averagePower: ['averagePower', 'avgPower', 'summaryDTO.averagePower'],
   normalizedPower: ['normalizedPower', 'summaryDTO.normalizedPower'],
   maxPower: ['maxPower', 'summaryDTO.maxPower'],
+  maxPowerTwentyMinutes: [
+    'maxPowerTwentyMinutes',
+    'maxPower20Minutes',
+    'maxPower20Min',
+    'summaryDTO.maxPowerTwentyMinutes',
+    'summaryDTO.maxPower20Minutes',
+    'summaryDTO.maxPower20Min',
+  ],
+  functionalThresholdPower: [
+    'functionalThresholdPower',
+    'ftp',
+    'summaryDTO.functionalThresholdPower',
+    'summaryDTO.ftp',
+  ],
   averageCadence: [
     'averageCadence',
     'avgCadence',
@@ -333,9 +350,11 @@ function lactateThresholdPaceMinPerKm(raw: unknown): number | undefined {
 }
 
 export function activitySignature(activity: RawActivity): string {
+  const raw = activity as unknown as Record<string, unknown>;
+  const activityTypeDTO = raw.activityTypeDTO as { typeKey?: string } | undefined;
   return [
     activity.startTimeLocal || '',
-    activity.activityType?.typeKey || 'unknown',
+    activity.activityType?.typeKey || activityTypeDTO?.typeKey || 'unknown',
     Math.round(activity.distance || 0),
     Math.round(activity.duration || 0),
   ].join('|');
@@ -358,16 +377,23 @@ export function mapActivity(
   activity: RawActivity,
   region: 'cn' | 'global',
 ): MappedActivity {
-  const pace = paceFromSpeed(activity.averageSpeed);
   // Treat the activity as unknown when reading enriched fields — Garmin's
   // shape varies across endpoints and the RawActivity interface only locks
   // down the fields we already relied on.
   const raw: unknown = activity;
+  const averageSpeed =
+    toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.averageSpeed)) ??
+    activity.averageSpeed;
+  const pace = paceFromSpeed(averageSpeed);
 
   const summaryDTO =
     typeof raw === 'object' && raw !== null
       ? (raw as Record<string, unknown>).summaryDTO
       : undefined;
+  const rawObj = typeof raw === 'object' && raw !== null
+    ? (raw as Record<string, unknown>)
+    : {};
+  const activityTypeDTO = rawObj.activityTypeDTO as { typeKey?: string } | undefined;
 
   return {
     id: `${region}-${activity.activityId}`,
@@ -375,11 +401,14 @@ export function mapActivity(
     activityId: activity.activityId,
     signature: activitySignature(activity),
     name: activity.activityName || '未命名活动',
-    type: activity.activityType?.typeKey || 'unknown',
+    type: activity.activityType?.typeKey || activityTypeDTO?.typeKey || 'unknown',
     startTimeLocal: activity.startTimeLocal || null,
     distanceKm: Number(((activity.distance || 0) / 1000).toFixed(2)),
     durationMin: Number(((activity.duration || 0) / 60).toFixed(1)),
-    averageHr: activity.averageHR || null,
+    averageHr:
+      activity.averageHR ??
+      toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.averageHr)) ??
+      null,
     maxHr: activity.maxHR ?? toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.maxHr)) ?? null,
     averagePaceMinPerKm: pace.value,
     averagePaceText: pace.text,
@@ -405,7 +434,7 @@ export function mapActivity(
     trainingEffectMessage: toNonEmptyString(
       pickFirst(raw, ACTIVITY_FIELD_ALIASES.trainingEffectMessage),
     ),
-    averageSpeed: toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.averageSpeed)),
+    averageSpeed,
     maxSpeed: toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.maxSpeed)),
     elevationGain: toFiniteNumber(
       pickFirst(raw, ACTIVITY_FIELD_ALIASES.elevationGain),
@@ -417,6 +446,12 @@ export function mapActivity(
       pickFirst(raw, ACTIVITY_FIELD_ALIASES.normalizedPower),
     ),
     maxPower: toFiniteNumber(pickFirst(raw, ACTIVITY_FIELD_ALIASES.maxPower)),
+    maxPowerTwentyMinutes: toFiniteNumber(
+      pickFirst(raw, ACTIVITY_FIELD_ALIASES.maxPowerTwentyMinutes),
+    ),
+    functionalThresholdPower: toFiniteNumber(
+      pickFirst(raw, ACTIVITY_FIELD_ALIASES.functionalThresholdPower),
+    ),
     averageCadence: toFiniteNumber(
       pickFirst(raw, ACTIVITY_FIELD_ALIASES.averageCadence),
     ),

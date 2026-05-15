@@ -10,6 +10,10 @@
 import type { NormalizedActivity, NormalizedSport } from './activity-normalizer.js';
 import type { QualityResult } from './activity-quality.js';
 import { classifyStimulus } from './recent-state.js';
+import type {
+  GarminHeartRateZoneSet,
+  GarminPhysiologyMetrics,
+} from '../garmin/fetch-recent.js';
 
 export type Confidence = 'low' | 'medium' | 'high';
 
@@ -52,6 +56,12 @@ export interface AthleteProfileCycling {
   available: boolean;
   confidence: Confidence;
   ftpWatts?: number;
+  ftpSource?:
+    | 'garmin_activity'
+    | 'garmin_profile'
+    | 'estimated_20min_power'
+    | 'estimated_threshold_power';
+  vo2Max?: number;
   enduranceHrRange?: [number, number];
   tempoHrRange?: [number, number];
   thresholdHrRange?: [number, number];
@@ -66,6 +76,7 @@ export interface AthleteProfileSwimming {
   aerobicPaceSecPer100m?: number;
   endurancePaceSecPer100m?: number;
   cssPaceSecPer100m?: number;
+  cssSource?: 'garmin_critical_swim_speed' | 'activity_samples';
   vo2PaceSecPer100m?: number;
   sprintPaceSecPer100m?: number;
 }
@@ -127,6 +138,7 @@ export interface CapabilityEvidence {
 export interface BuildProfileInput {
   activities: NormalizedActivity[]; // last 28-56 days
   qualities: Map<string, QualityResult>;
+  physiology?: GarminPhysiologyMetrics | null;
   request: {
     injuries?: string;
     raceDate?: string | null;
@@ -143,15 +155,20 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export function buildAthleteProfile(input: BuildProfileInput): AthleteProfile {
   const reliable = input.activities.filter((a) => isReliable(a, input.qualities));
 
-  const heartRate = deriveHeartRate(reliable);
+  const heartRate = deriveHeartRate(reliable, input.physiology);
 
-  const running = deriveRunning(input.activities, input.qualities, heartRate);
-  const calibratedHeartRate = calibrateHeartRateFromRunning(
+  const running = deriveRunning(
+    input.activities,
+    input.qualities,
     heartRate,
-    running,
+    input.physiology,
   );
-  const cycling = deriveCycling(reliable, heartRate);
-  const swimming = deriveSwimming(reliable);
+  const calibratedHeartRate =
+    heartRate?.source === 'garmin_zones'
+      ? heartRate
+      : calibrateHeartRateFromRunning(heartRate, running);
+  const cycling = deriveCycling(reliable, calibratedHeartRate, input.physiology);
+  const swimming = deriveSwimming(reliable, input.physiology);
 
   const injuries = parseInjuries(input.request.injuries);
   const experienceLevel = deriveExperienceLevel({
@@ -219,6 +236,15 @@ function clampPair(low: number, high: number): [number, number] {
   return [Math.round(low), Math.round(high)];
 }
 
+function validPositive(value: number | null | undefined): number | null {
+  return value !== null &&
+    value !== undefined &&
+    Number.isFinite(value) &&
+    value > 0
+    ? value
+    : null;
+}
+
 function qualityOf(
   activity: NormalizedActivity,
   qualities: Map<string, QualityResult>,
@@ -245,8 +271,14 @@ function firstIsoDate(activity: NormalizedActivity): string | null {
 
 function deriveHeartRate(
   reliable: NormalizedActivity[],
+  physiology?: GarminPhysiologyMetrics | null,
 ): AthleteProfileHeartRate | null {
   const withHr = reliable.filter((a) => a.averageHr !== null && a.averageHr > 0);
+  const profileZones = deriveHeartRateFromGarminZoneSet(
+    physiology?.heartRateZones.default ?? null,
+  );
+  if (profileZones) return profileZones;
+
   const garminZones = deriveGarminHeartRateZones(reliable);
   if (garminZones) return garminZones;
 
@@ -296,6 +328,25 @@ function deriveHeartRate(
     thresholdRange: pct(0.88, 0.93),
     vo2CapRange: pct(0.92, 0.97),
     source: 'max_hr_estimate',
+  };
+}
+
+function deriveHeartRateFromGarminZoneSet(
+  zoneSet: GarminHeartRateZoneSet | null | undefined,
+): AthleteProfileHeartRate | null {
+  if (!zoneSet || zoneSet.zones.length < 5) return null;
+  const [z1, z2, z3, z4, z5] = zoneSet.zones;
+  if (!z2 || !z3 || !z4 || !z5) return null;
+  return {
+    maxHeartRate: zoneSet.maxHeartRate,
+    recoveryRange: z1 ?? [Math.max(80, z2[0] - 20), z2[0] - 1],
+    aerobicLowRange: z2,
+    aerobicRange: z2,
+    zone2Range: z2,
+    tempoRange: z3,
+    thresholdRange: z4,
+    vo2CapRange: z5,
+    source: 'garmin_zones',
   };
 }
 
@@ -354,6 +405,7 @@ function calibrateHeartRateFromRunning(
   running: AthleteProfileRunning,
 ): AthleteProfileHeartRate | null {
   if (!hr) return null;
+  if (hr.source === 'garmin_zones') return hr;
   const samples = running.evidence?.easyPace?.samples.filter((s) => s.included) ?? [];
   const hrs = samples
     .map((s) => s.avgHr)
@@ -393,6 +445,7 @@ function deriveRunning(
   activities: NormalizedActivity[],
   qualities: Map<string, QualityResult>,
   hr: AthleteProfileHeartRate | null,
+  physiology?: GarminPhysiologyMetrics | null,
 ): AthleteProfileRunning {
   const allRuns = activities.filter(
     (a) => a.sport === 'running' && a.averagePaceSecPerKm !== null,
@@ -487,12 +540,17 @@ function deriveRunning(
     easyWarnings.push('easy_too_close_to_threshold_adjusted_plus_75s');
   }
 
-  const vo2Values = runs
-    .map((r) => r.vo2Max)
-    .filter((n): n is number => n !== null && n > 0);
-  const vo2Max = median(vo2Values);
-  if (vo2Max !== null) {
-    profile.vo2Max = Math.round(vo2Max);
+  const garminVo2Max = validPositive(physiology?.vo2MaxRunning);
+  if (garminVo2Max !== null) {
+    profile.vo2Max = Math.round(garminVo2Max);
+  } else {
+    const vo2Values = runs
+      .map((r) => r.vo2Max)
+      .filter((n): n is number => n !== null && n > 0);
+    const vo2Max = median(vo2Values);
+    if (vo2Max !== null) {
+      profile.vo2Max = Math.round(vo2Max);
+    }
   }
 
   const runningEconomy = deriveRunningEconomy(runs);
@@ -748,6 +806,7 @@ function buildRunningEvidenceNotes(args: {
 function deriveCycling(
   reliable: NormalizedActivity[],
   hr: AthleteProfileHeartRate | null,
+  physiology?: GarminPhysiologyMetrics | null,
 ): AthleteProfileCycling {
   const rides = reliable.filter((a) => a.sport === 'cycling');
   const confidence = bucketConfidence(rides.length);
@@ -759,49 +818,76 @@ function deriveCycling(
 
   if (rides.length === 0) return profile;
 
-  // FTP estimate — prefer normalizedPower from a labelled threshold ride;
-  // fall back to 95% of the highest 20-min effort's normalizedPower; finally
-  // fall back to mean averagePower of threshold-labelled rides.
+  const garminCyclingVo2 = validPositive(physiology?.vo2MaxCycling);
+  if (garminCyclingVo2 !== null) {
+    profile.vo2Max = Math.round(garminCyclingVo2);
+  }
+
+  // FTP estimate — prefer Garmin's own functionalThresholdPower from recent
+  // ride details/profile, then fall back to 95% of actual 20-min max power.
+  // Normalized power is only a last-resort threshold proxy; using it before
+  // Garmin FTP materially under-prescribes workouts for users with sensors.
   let ftp: number | null = null;
+  let ftpSource: AthleteProfileCycling['ftpSource'] | null = null;
+  const garminActivityFtp = rides
+    .filter((r) => validPositive(r.functionalThresholdPower) !== null)
+    .sort((a, b) => {
+      const at = a.startTimeLocal?.getTime() ?? 0;
+      const bt = b.startTimeLocal?.getTime() ?? 0;
+      return bt - at;
+    })
+    .map((r) => r.functionalThresholdPower as number);
+  if (garminActivityFtp.length > 0) {
+    ftp = Math.round(garminActivityFtp[0]);
+    ftpSource = 'garmin_activity';
+  }
+  const garminProfileFtp = validPositive(physiology?.functionalThresholdPower);
+  if (ftp === null && garminProfileFtp !== null) {
+    ftp = Math.round(garminProfileFtp);
+    ftpSource = 'garmin_profile';
+  }
+
   const thresholdRides = rides.filter((r) => classifyStimulus(r) === 'threshold');
-  const npFromThreshold = thresholdRides
-    .map((r) => r.normalizedPower)
-    .filter((n): n is number => n !== null && n > 0);
-  if (npFromThreshold.length > 0) {
-    ftp = Math.round(median(npFromThreshold) as number);
-  } else {
+  if (ftp === null) {
     const candidate20 = rides
-      .filter(
-        (r) =>
-          r.durationMin >= 18 &&
-          r.durationMin <= 40 &&
-          (r.normalizedPower ?? 0) > 0,
-      )
-      .map((r) => r.normalizedPower as number)
+      .map((r) => r.maxPowerTwentyMinutes)
+      .filter((n): n is number => n !== null && n > 0)
       .sort((a, b) => b - a);
     if (candidate20.length > 0) {
       ftp = Math.round(candidate20[0] * 0.95);
+      ftpSource = 'estimated_20min_power';
+    }
+  }
+  if (ftp === null) {
+    const npFromThreshold = thresholdRides
+      .map((r) => r.normalizedPower)
+      .filter((n): n is number => n !== null && n > 0);
+    if (npFromThreshold.length > 0) {
+      ftp = Math.round(median(npFromThreshold) as number);
+      ftpSource = 'estimated_threshold_power';
     } else {
       const apFromThreshold = thresholdRides
         .map((r) => r.averagePower)
         .filter((n): n is number => n !== null && n > 0);
       if (apFromThreshold.length > 0) {
         ftp = Math.round(median(apFromThreshold) as number);
+        ftpSource = 'estimated_threshold_power';
       }
     }
   }
   if (ftp !== null && ftp > 0) {
     profile.ftpWatts = ftp;
+    if (ftpSource) profile.ftpSource = ftpSource;
   }
 
-  // HR ranges: borrow the global heartRate ranges if available — cycling
-  // shares the cardiovascular system. Templates already alias bike HR to
-  // global HR per the variable description tables.
-  if (hr) {
-    profile.enduranceHrRange = hr.aerobicRange;
-    profile.tempoHrRange = hr.tempoRange;
-    profile.thresholdHrRange = hr.thresholdRange;
-    profile.vo2HrCapRange = hr.vo2CapRange;
+  const cyclingHr =
+    deriveHeartRateFromGarminZoneSet(physiology?.heartRateZones.cycling ?? null) ??
+    hr;
+  if (cyclingHr) {
+    profile.enduranceHrRange = cyclingHr.aerobicRange;
+    profile.tempoHrRange = cyclingHr.tempoRange;
+    profile.thresholdHrRange = cyclingHr.thresholdRange;
+    profile.vo2HrCapRange = cyclingHr.vo2CapRange;
   }
 
   return profile;
@@ -811,7 +897,10 @@ function deriveCycling(
 // Swimming derivation
 // ---------------------------------------------------------------------------
 
-function deriveSwimming(reliable: NormalizedActivity[]): AthleteProfileSwimming {
+function deriveSwimming(
+  reliable: NormalizedActivity[],
+  physiology?: GarminPhysiologyMetrics | null,
+): AthleteProfileSwimming {
   const swims = reliable.filter(
     (a) => a.sport === 'swimming' && a.averagePaceSecPer100m !== null,
   );
@@ -841,31 +930,37 @@ function deriveSwimming(reliable: NormalizedActivity[]): AthleteProfileSwimming 
   }
   profile.poolLengthM = poolLengthM;
 
-  // CSS: prefer labelled threshold / tempo swims. If Garmin does not label
-  // CSS-like work, use sustained pool swims rather than the single fastest
-  // swim, which is often a short sprint set or noisy open-water GPS sample.
-  const cssCandidates = swims
-    .filter((s) => {
-      const stim = classifyStimulus(s);
-      return stim === 'threshold' || stim === 'tempo';
-    })
-    .map((s) => s.averagePaceSecPer100m as number);
-  let css = median(cssCandidates);
+  // CSS: prefer Garmin's criticalSwimSpeed when available. It is a profile
+  // capability value; average swim pace often includes drills and rests.
+  let css = cssPaceFromCriticalSwimSpeed(physiology?.criticalSwimSpeed);
+  let cssSource: AthleteProfileSwimming['cssSource'] | null =
+    css !== null ? 'garmin_critical_swim_speed' : null;
   if (css === null) {
-    const sustainedPaces = swims
-      .filter((s) => s.distanceKm >= 0.8 && s.durationMin >= 15)
-      .map((s) => s.averagePaceSecPer100m as number)
-      .sort((a, b) => a - b);
-    css =
-      sustainedPaces.length >= 3
-        ? percentile(sustainedPaces, 0.35)
-        : median(sustainedPaces);
+    const cssCandidates = swims
+      .filter((s) => {
+        const stim = classifyStimulus(s);
+        return stim === 'threshold' || stim === 'tempo';
+      })
+      .map((s) => s.averagePaceSecPer100m as number);
+    css = median(cssCandidates);
+    if (css === null) {
+      const sustainedPaces = swims
+        .filter((s) => s.distanceKm >= 0.8 && s.durationMin >= 15)
+        .map((s) => s.averagePaceSecPer100m as number)
+        .sort((a, b) => a - b);
+      css =
+        sustainedPaces.length >= 3
+          ? percentile(sustainedPaces, 0.35)
+          : median(sustainedPaces);
+    }
+    cssSource = css !== null ? 'activity_samples' : null;
   }
   if (css === null || !Number.isFinite(css) || css <= 0) {
     return profile;
   }
 
   profile.cssPaceSecPer100m = Math.round(css);
+  if (cssSource) profile.cssSource = cssSource;
   profile.easyPaceSecPer100m = Math.round(css + 18);
   profile.aerobicPaceSecPer100m = Math.round(css + 12);
   profile.endurancePaceSecPer100m = Math.round(css + 14);
@@ -873,6 +968,19 @@ function deriveSwimming(reliable: NormalizedActivity[]): AthleteProfileSwimming 
   profile.sprintPaceSecPer100m = Math.round(css - 14);
 
   return profile;
+}
+
+function cssPaceFromCriticalSwimSpeed(value: number | null | undefined): number | null {
+  const raw = validPositive(value);
+  if (raw === null) return null;
+  if (raw >= 400 && raw <= 2500) {
+    // Garmin biometricProfile.criticalSwimSpeed is returned as mm/s
+    // (for example 855 -> 0.855 m/s -> 117 s/100m).
+    return 100000 / raw;
+  }
+  if (raw >= 40 && raw <= 240) return raw;
+  if (raw >= 0.2 && raw <= 3) return 100 / raw;
+  return null;
 }
 
 // ---------------------------------------------------------------------------

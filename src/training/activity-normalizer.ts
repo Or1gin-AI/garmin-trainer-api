@@ -31,6 +31,8 @@ export interface NormalizedActivity {
   averagePower: number | null;
   normalizedPower: number | null;
   maxPower: number | null;
+  maxPowerTwentyMinutes: number | null;
+  functionalThresholdPower: number | null;
   averageCadence: number | null;
   maxCadence: number | null;
   groundContactTime: number | null; // ms
@@ -208,11 +210,22 @@ export function normalizeActivity(raw: unknown): NormalizedActivity | null {
       ? Math.round(lactateThresholdPaceMinPerKm * 60)
       : null;
 
-  // Swimming pace per 100m: only derive if it's a swim with both distance and
-  // duration. Garmin's averagePaceMinPerKm is meaningless for pool swims.
+  const averageSpeed = readNumber(obj.averageSpeed);
+
+  // Swimming pace per 100m: prefer Garmin's speed field because total
+  // duration usually includes wall/rest time for pool sessions. Falling back
+  // to duration/distance is still useful for imports that lack speed.
   let averagePaceSecPer100m: number | null = null;
-  if (sport === 'swimming' && distanceKm > 0 && durationMin > 0) {
-    averagePaceSecPer100m = Math.round((durationMin * 60) / (distanceKm * 10));
+  if (sport === 'swimming') {
+    if (averageSpeed !== null && averageSpeed > 0) {
+      const paceFromSpeed = Math.round(100 / averageSpeed);
+      if (paceFromSpeed >= 35 && paceFromSpeed <= 600) {
+        averagePaceSecPer100m = paceFromSpeed;
+      }
+    }
+    if (averagePaceSecPer100m === null && distanceKm > 0 && durationMin > 0) {
+      averagePaceSecPer100m = Math.round((durationMin * 60) / (distanceKm * 10));
+    }
   }
 
   const idStr = readString(obj.id);
@@ -236,10 +249,12 @@ export function normalizeActivity(raw: unknown): NormalizedActivity | null {
     aerobicTrainingEffect: readNumber(obj.aerobicTrainingEffect),
     anaerobicTrainingEffect: readNumber(obj.anaerobicTrainingEffect),
     primaryBenefit: readString(obj.primaryBenefit),
-    averageSpeed: readNumber(obj.averageSpeed),
+    averageSpeed,
     averagePower: readNumber(obj.averagePower),
     normalizedPower: readNumber(obj.normalizedPower),
     maxPower: readNumber(obj.maxPower),
+    maxPowerTwentyMinutes: readNumber(obj.maxPowerTwentyMinutes),
+    functionalThresholdPower: readNumber(obj.functionalThresholdPower),
     averageCadence: readNumber(obj.averageCadence),
     maxCadence: readNumber(obj.maxCadence),
     groundContactTime: readNumber(obj.groundContactTime),
