@@ -135,11 +135,18 @@ export function extractPrCandidates(input: ExtractInput): PrCandidate[] {
 
     if (activity.sport === 'swimming') {
       if (distKm <= 0 || durSec <= 0) continue;
+      // Pool workouts include rest time in duration; use pace × distance to get
+      // net swim time. averagePaceSecPer100m is derived from Garmin's averageSpeed
+      // (active-only) when available, so it excludes wall/rest time.
+      const pace = activity.averagePaceSecPer100m;
+      if (!pace || pace <= 0) continue;
+      const netSwimSec = Math.round(pace * distKm * 10);
+      if (netSwimSec <= 0) continue;
       for (const band of SWIM_BANDS) {
         if (distKm < band.minKm || distKm > band.maxKm) continue;
         out.push({
           anchor: band.anchor,
-          value: durSec,
+          value: netSwimSec,
           unit: 'seconds',
           achievedAt: date,
           sourceActivityId: key,
