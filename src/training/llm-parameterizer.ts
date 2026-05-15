@@ -74,7 +74,7 @@ interface LlmWorkoutPayload {
 }
 
 const TOOL_NAME = 'parameterize_workout';
-const PARAMETERIZE_TOOL_CALL_TIMEOUT_MS = 18_000;
+const PARAMETERIZE_TOOL_CALL_TIMEOUT_MS = 12_000;
 const NA = '不适用';
 const DETERMINISTIC_PARAMETERIZATION_TEMPLATE_IDS = new Set([
   'run.reverse_pyramid.v1',

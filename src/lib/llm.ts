@@ -47,6 +47,7 @@ export function extractJsonObjectText(content: string | null | undefined): strin
 }
 
 const CACHE_TTL_MS = 60_000;
+const LLM_MAX_RETRIES = 0;
 
 let cached: { config: ActiveLlmConfig; expiresAt: number } | null = null;
 
@@ -107,6 +108,7 @@ export async function getLlmClient(): Promise<{
   const client = new OpenAI({
     apiKey: config.apiKey,
     baseURL: config.baseUrl,
+    maxRetries: LLM_MAX_RETRIES,
   });
   return { client, config };
 }
@@ -164,6 +166,7 @@ export async function streamChat(
 
   return client.chat.completions.create(body, {
     signal: args.signal,
+    maxRetries: LLM_MAX_RETRIES,
     ...(args.timeoutMs !== undefined ? { timeout: args.timeoutMs } : {}),
   });
 }
@@ -198,6 +201,7 @@ export async function completeChat(
 
   return client.chat.completions.create(body, {
     signal: args.signal,
+    maxRetries: LLM_MAX_RETRIES,
     ...(args.timeoutMs !== undefined ? { timeout: args.timeoutMs } : {}),
   });
 }

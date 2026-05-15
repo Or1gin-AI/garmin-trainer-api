@@ -17,6 +17,7 @@
 // stays compatible with U7 — only the optional onSummaryDelta callback and
 // modelMeta field shape are widened.
 
+import { setMaxListeners } from 'node:events';
 import {
   applyDurationCap,
   buildWeeklySchedule,
@@ -124,6 +125,9 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
   } = input;
   const emit = onToolEvent ?? (() => {});
   const requestIntent = extractTrainingRequestIntent(request);
+  if (signal) {
+    setMaxListeners(50, signal);
+  }
 
   // Stage 1: schedule.
   const stageOne = await runScheduleStage({
