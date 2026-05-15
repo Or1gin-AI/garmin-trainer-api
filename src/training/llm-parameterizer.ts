@@ -14,7 +14,7 @@ import { streamChat } from '../lib/llm.js';
 import type { AthleteProfile } from './athlete-profile.js';
 import type { RecentState } from './recent-state.js';
 import { MAX_WEEKLY_TRAINING_MINUTES, type ScheduleEntry } from './scheduler.js';
-import type { ParameterizedWorkout } from './parameterizer.js';
+import { parameterizeWorkout, type ParameterizedWorkout } from './parameterizer.js';
 import type { WorkoutTemplate, PrimaryMetric, Intensity } from './templates/types.js';
 
 // ---------------------------------------------------------------------------
@@ -68,6 +68,16 @@ interface LlmWorkoutPayload {
 
 const TOOL_NAME = 'parameterize_workout';
 const NA = '不适用';
+const DETERMINISTIC_PARAMETERIZATION_TEMPLATE_IDS = new Set([
+  'run.reverse_pyramid.v1',
+  'run.progression.v1',
+  'bike.over_under.v1',
+  'bike.cadence_drill.v1',
+  'swim.sprint.v1',
+  'swim.kick.v1',
+  'swim.pull.v1',
+  'swim.open_water.v1',
+]);
 
 // ---------------------------------------------------------------------------
 // Public entry
@@ -77,6 +87,13 @@ export async function llmParameterizeWorkout(
   args: LlmParameterizeArgs,
 ): Promise<LlmParameterizeResult> {
   const { template, athleteProfile, recentState, request, scheduleEntry, progression } = args;
+
+  if (requiresDeterministicParameterization(template)) {
+    return {
+      workout: deterministicGuardWorkout(args),
+      meta: { inputTokens: 0, outputTokens: 0 },
+    };
+  }
 
   const tools: ChatCompletionTool[] = [
     {
@@ -206,6 +223,31 @@ export async function llmParameterizeWorkout(
   return {
     workout,
     meta: { inputTokens, outputTokens },
+  };
+}
+
+function requiresDeterministicParameterization(template: WorkoutTemplate): boolean {
+  return DETERMINISTIC_PARAMETERIZATION_TEMPLATE_IDS.has(template.id);
+}
+
+function deterministicGuardWorkout(args: LlmParameterizeArgs): ParameterizedWorkout {
+  const workout = parameterizeWorkout({
+    template: args.template,
+    athleteProfile: args.athleteProfile,
+    recentState: args.recentState,
+    request: args.request,
+    scheduleEntry: args.scheduleEntry,
+    progression: args.progression,
+  });
+  return {
+    ...workout,
+    parameterSource: {
+      ...workout.parameterSource,
+      replacedVariables: {
+        ...workout.parameterSource.replacedVariables,
+        __source: 'deterministic_parameterization_guard',
+      },
+    },
   };
 }
 
@@ -440,6 +482,7 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   systemParts.push('- 非休息日必须给出 HR / 配速 / 功率 中至少一个有数值；');
   systemParts.push('- workoutStructure 是中文一段话，必须含数字；targets 至少 1 项，每项含数字（或"不适用"）；');
   systemParts.push('- 数值需在模板 variables 给定的 min..max 之内（如未给出则参考运动员档案）；');
+  systemParts.push('- 分段训练必须逐段写清目标；不同强度段不能复用同一个配速/功率/心率，除非模板明确要求稳定阈值。');
   systemParts.push(
     `- 当前 progression=${args.progression}，对照模板的 progression 调整时长和重复次数。`,
   );

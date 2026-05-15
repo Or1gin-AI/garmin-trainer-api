@@ -200,8 +200,12 @@ function buildMessages(args: LlmStreamSummaryArgs): ChatCompletionMessageParam[]
   systemParts.push('（2-4 条规则，给出何时缩短训练、降低强度或全休的明确触发条件，每条 1-2 句。）');
   systemParts.push('');
   systemParts.push('禁止偏离上述结构、禁止增加新段落、禁止使用 Markdown 列表外的多级标题。');
+  systemParts.push('如果提到“质量课”或“高强度课”的数量，必须使用 payload.metrics.highSessions；如果提到高强度训练日，必须使用 payload.metrics.hardDays。');
+  systemParts.push('当 payload.metrics.forceRequestedSchedule=true 时，用户要求优先：不要说系统删除或强制修改了用户要求，只能说明风险、监控重点和执行时的降级条件。');
 
+  const metrics = buildPlanMetrics(args);
   const userPayload = {
+    metrics,
     request: {
       goal: args.request.goal ?? null,
       raceDate: args.request.raceDate ?? null,
@@ -253,4 +257,41 @@ function buildMessages(args: LlmStreamSummaryArgs): ChatCompletionMessageParam[]
       content: `请基于下列课表生成三段说明：\n\n${JSON.stringify(userPayload, null, 2)}`,
     },
   ];
+}
+
+function buildPlanMetrics(args: LlmStreamSummaryArgs) {
+  const highSessions = args.workouts.filter((w) => w.intensity === 'high').length;
+  const hardDayIndexes = new Set<number>();
+  let activeSessions = 0;
+  for (let i = 0; i < args.workouts.length; i += 1) {
+    const workout = args.workouts[i];
+    const entry = args.schedule.days[i];
+    if (workout.sport !== 'rest' && workout.sport !== 'mobility') {
+      activeSessions += 1;
+    }
+    if (workout.intensity === 'high') {
+      hardDayIndexes.add(entry?.dayIndex ?? i + 1);
+    }
+  }
+  const hardDays = Array.from(hardDayIndexes).sort((a, b) => a - b);
+  const consecutiveHardDayPairs: Array<[number, number]> = [];
+  for (let i = 1; i < hardDays.length; i += 1) {
+    if (hardDays[i] === hardDays[i - 1] + 1) {
+      consecutiveHardDayPairs.push([hardDays[i - 1], hardDays[i]]);
+    }
+  }
+  const maxHardSessionsPerWeek = args.request.maxHardSessionsPerWeek ?? null;
+  return {
+    activeSessions,
+    highSessions,
+    hardDays: hardDays.length,
+    hardDayIndexes: hardDays,
+    consecutiveHardDayPairs,
+    maxHardSessionsPerWeek,
+    hardSessionsLast7d: args.recentState.hardSessionsLast7d,
+    fatigue: args.recentState.fatigue,
+    forceRequestedSchedule: args.request.forceRequestedSchedule === true,
+    overRequestedHardCap:
+      maxHardSessionsPerWeek !== null ? hardDays.length > maxHardSessionsPerWeek : false,
+  };
 }

@@ -373,7 +373,7 @@ function resolveDerived(
       return {
         kind: 'number',
         value: baseRaw + paceAdj.singleOffset,
-        unit: `${paceAdj.unit}_upper`,
+        unit: key.endsWith('Cap') ? `${paceAdj.unit}_upper` : paceAdj.unit,
       };
     }
   }
@@ -708,6 +708,17 @@ function buildPaceString(
 ): string {
   if (sport === 'cycling') return NA;
 
+  if (sport === 'running' && template.fixed.workoutType === 'reverse_pyramid') {
+    const paces = [
+      paceSeconds(resolved, 'pyramid1200Pace'),
+      paceSeconds(resolved, 'pyramid800Pace'),
+      paceSeconds(resolved, 'pyramid400Pace'),
+    ].filter((v): v is number => v !== null);
+    if (paces.length === 3) {
+      return `${formatSeconds(Math.min(...paces))}-${formatSeconds(Math.max(...paces))}/km`;
+    }
+  }
+
   const candidates = [
     'targetPace',
     'targetPaceCap',
@@ -781,7 +792,9 @@ function buildPowerString(
     underPower.unit === 'W' &&
     overPower.unit === 'W'
   ) {
-    return `${Math.round(underPower.value)} W / ${Math.round(overPower.value)} W`;
+    const low = Math.min(underPower.value, overPower.value);
+    const high = Math.max(underPower.value, overPower.value);
+    return `${Math.round(low)}-${Math.round(high)} W`;
   }
   for (const key of candidates) {
     const v = resolved.get(key);
@@ -965,6 +978,9 @@ function buildWorkoutStructure(
   resolved: Map<string, ResolvedValue>,
   targets: { targetHeartRate: string; targetPace: string; targetPower: string },
 ): string {
+  const segmentStructure = buildSegmentWorkoutStructure(template, resolved);
+  if (segmentStructure) return segmentStructure;
+
   const parts: string[] = [];
   for (const phase of template.fixed.phases) {
     const segment = describePhase(phase, resolved, targets);
@@ -974,6 +990,100 @@ function buildWorkoutStructure(
     return `${template.fixed.title}：完全休息。`;
   }
   return parts.join('；') + '。';
+}
+
+function buildSegmentWorkoutStructure(
+  template: WorkoutTemplate,
+  resolved: Map<string, ResolvedValue>,
+): string | null {
+  const type = template.fixed.workoutType;
+  if (template.id === 'run.reverse_pyramid.v1') {
+    const warmup = integerValue(resolved, 'warmupDuration', 15);
+    const recovery = integerValue(resolved, 'recoveryDuration', 3);
+    const cooldown = integerValue(resolved, 'cooldownDuration', 13);
+    const pace1200 = paceText(resolved, 'pyramid1200Pace', '/km');
+    const pace800 = paceText(resolved, 'pyramid800Pace', '/km');
+    const pace400 = paceText(resolved, 'pyramid400Pace', '/km');
+    if (pace1200 && pace800 && pace400) {
+      return [
+        `热身 ${warmup} 分钟（动态拉伸、跑姿练习、4 x 20 秒加速）`,
+        `主训练 1200 米 @ ${pace1200}（约 10K 强度）+ 800 米 @ ${pace800}（约 5K 强度）+ 400 米 @ ${pace400}（约 3K 强度），组间慢跑恢复 ${recovery} 分钟`,
+        `放松 ${cooldown} 分钟`,
+      ].join('；') + '。';
+    }
+  }
+
+  if (template.id === 'run.progression.v1') {
+    const warmup = integerValue(resolved, 'warmupDuration', 10);
+    const segment = integerValue(resolved, 'segmentDuration', 15);
+    const cooldown = integerValue(resolved, 'cooldownDuration', 8);
+    const easy = paceText(resolved, 'easyPace', '/km');
+    const mid = paceText(resolved, 'progressionMidPace', '/km');
+    const finish = paceText(resolved, 'targetPace', '/km');
+    if (easy && mid && finish) {
+      return [
+        `热身 ${warmup} 分钟`,
+        `第一段 ${segment} 分钟 @ ${easy}，保持 Zone 2 下沿`,
+        `第二段 ${segment} 分钟 @ ${mid}，进入稳定有氧`,
+        `第三段 ${segment} 分钟 @ ${finish}，只到 Tempo 下沿，不进入阈值`,
+        `放松 ${cooldown} 分钟`,
+      ].join('；') + '。';
+    }
+  }
+
+  if (template.id === 'bike.over_under.v1') {
+    const warmup = integerValue(resolved, 'warmupDuration', 20);
+    const blocks = integerValue(resolved, 'blockRepeats', 3);
+    const blockDuration = integerValue(resolved, 'blockDuration', 12);
+    const recovery = integerValue(resolved, 'recoveryDuration', 6);
+    const cooldown = integerValue(resolved, 'cooldownDuration', 13);
+    const under = powerText(resolved, 'underPower');
+    const over = powerText(resolved, 'overPower');
+    if (under && over) {
+      const rounds = Math.max(1, Math.round(blockDuration / 3));
+      return [
+        `热身 ${warmup} 分钟`,
+        `主训练 ${blocks} x ${blockDuration} 分钟，每组内 ${rounds} 轮（2 分钟 ${under} + 1 分钟 ${over}），组间轻松骑 ${recovery} 分钟`,
+        `放松 ${cooldown} 分钟`,
+      ].join('；') + '。';
+    }
+  }
+
+  if (template.id === 'swim.sprint.v1') {
+    const warmup = integerValue(resolved, 'warmupMeters', 400);
+    const reps = integerValue(resolved, 'sprintRepeats', 16);
+    const distance = integerValue(resolved, 'sprintDistance', 25);
+    const rest = integerValue(resolved, 'sprintRestSeconds', 40);
+    const aux = integerValue(resolved, 'easyAuxRepeats', 6);
+    const cooldown = integerValue(resolved, 'cooldownMeters', 200);
+    const sprintPace = paceText(resolved, 'sprintPace', '/100m');
+    const easyPace = paceText(resolved, 'easyPace', '/100m');
+    if (sprintPace && easyPace) {
+      return [
+        `热身 ${warmup} 米（含 4 x 25 米渐进加速）`,
+        `主训练 ${reps} x ${distance} 米 @ ${sprintPace}，组间休息 ${rest} 秒`,
+        `辅助 ${aux} x 50 米轻松技术游 @ ${easyPace}，组间休息 20 秒`,
+        `放松 ${cooldown} 米`,
+      ].join('；') + '。';
+    }
+  }
+
+  if (type === 'cadence_drill') {
+    const warmup = integerValue(resolved, 'warmupDuration', 10);
+    const reps = integerValue(resolved, 'drillRepeats', 6);
+    const duration = integerValue(resolved, 'drillDuration', 4);
+    const recovery = integerValue(resolved, 'drillRecovery', 3);
+    const cooldown = integerValue(resolved, 'cooldownDuration', 8);
+    const high = stringValue(resolved, 'cadenceHighRange') ?? '100-110 rpm';
+    const normal = stringValue(resolved, 'cadenceNormalRange') ?? '85-90 rpm';
+    return [
+      `热身 ${warmup} 分钟`,
+      `主训练 ${reps} x ${duration} 分钟高踏频 ${high}，组间 ${recovery} 分钟 ${normal}`,
+      `放松 ${cooldown} 分钟`,
+    ].join('；') + '。';
+  }
+
+  return null;
 }
 
 function describePhase(
@@ -1008,6 +1118,8 @@ function describePhase(
 
   const pieces = [phase.label];
   if (durationLabel) pieces.push(durationLabel);
+  const detail = formatPhaseDescription(phase.description, resolved, targets);
+  if (detail) pieces.push(detail);
 
   // Add target hints for the main phase.
   if (phase.name === 'main') {
@@ -1021,6 +1133,37 @@ function describePhase(
   return pieces.join(' ');
 }
 
+function formatPhaseDescription(
+  description: string | undefined,
+  resolved: Map<string, ResolvedValue>,
+  targets: { targetHeartRate: string; targetPace: string; targetPower: string },
+): string | null {
+  if (!description) return null;
+  let out = description.replace(/\$(\w+)/g, (_full, key: string) => {
+    return valueText(resolved.get(key)) ?? key;
+  });
+
+  const logicalTargets: Record<string, string | null> = {
+    'RUN.easyPace': paceText(resolved, 'easyPace', '/km'),
+    'RUN.longPace': paceText(resolved, 'longPaceCap', '/km') ?? paceText(resolved, 'targetPace', '/km'),
+    'RUN.tempoPace': targets.targetPace !== NA ? targets.targetPace : null,
+    'RUN.thresholdPace': targets.targetPace !== NA ? targets.targetPace : null,
+    'RUN.intervalPace': targets.targetPace !== NA ? targets.targetPace : null,
+    'RUN.vo2Pace': targets.targetPace !== NA ? targets.targetPace : null,
+    'RUN.racePace': targets.targetPace !== NA ? targets.targetPace : null,
+    'RUN.progressionFinishPace': paceText(resolved, 'targetPace', '/km') ?? (targets.targetPace !== NA ? targets.targetPace : null),
+    'SWIM.sprintPace': paceText(resolved, 'sprintPace', '/100m') ?? (targets.targetPace !== NA ? targets.targetPace : null),
+    'SWIM.easyPace': paceText(resolved, 'easyPace', '/100m') ?? paceText(resolved, 'easyPaceCap', '/100m'),
+  };
+
+  for (const [token, value] of Object.entries(logicalTargets)) {
+    if (!value) continue;
+    out = out.replace(new RegExp(escapeRegExp(token), 'g'), value);
+  }
+
+  return out.replace(/\s+/g, ' ').replace(/[。；;,.，]\s*$/, '').trim();
+}
+
 function buildTargetsArray(args: {
   template: WorkoutTemplate;
   targetHeartRate: string;
@@ -1031,7 +1174,7 @@ function buildTargetsArray(args: {
   distanceKm: number | null;
   resolved: Map<string, ResolvedValue>;
 }): string[] {
-  const { template, targetHeartRate, targetPace, targetPower, durationMinutes, distanceKm, preferredDurationMinutes } = args;
+  const { template, targetHeartRate, targetPace, targetPower, durationMinutes, distanceKm, preferredDurationMinutes, resolved } = args;
   const out: string[] = [];
 
   if (durationMinutes > 0) out.push(`总时长 ${durationMinutes} 分钟`);
@@ -1052,12 +1195,63 @@ function buildTargetsArray(args: {
   if (targetHeartRate !== NA) out.push(`目标心率 ${targetHeartRate}`);
   if (targetPace !== NA) out.push(`目标配速 ${targetPace}`);
   if (targetPower !== NA) out.push(`目标功率 ${targetPower}`);
+  out.push(...buildSegmentTargets(template, resolved));
   const fueling = fuelingGuidance(template, durationMinutes);
   if (fueling) out.push(fueling);
 
   // Ensure at least one number-bearing bullet for non-rest workouts.
   if (out.length === 0) out.push('参考强度 不适用');
   return out;
+}
+
+function buildSegmentTargets(
+  template: WorkoutTemplate,
+  resolved: Map<string, ResolvedValue>,
+): string[] {
+  if (template.id === 'run.reverse_pyramid.v1') {
+    const pace1200 = paceText(resolved, 'pyramid1200Pace', '/km');
+    const pace800 = paceText(resolved, 'pyramid800Pace', '/km');
+    const pace400 = paceText(resolved, 'pyramid400Pace', '/km');
+    return [
+      pace1200 ? `1200 米目标配速 ${pace1200}（约 10K 强度）` : null,
+      pace800 ? `800 米目标配速 ${pace800}（约 5K 强度）` : null,
+      pace400 ? `400 米目标配速 ${pace400}（约 3K 强度）` : null,
+    ].filter((v): v is string => Boolean(v));
+  }
+
+  if (template.id === 'run.progression.v1') {
+    const segment = integerValue(resolved, 'segmentDuration', 15);
+    const easy = paceText(resolved, 'easyPace', '/km');
+    const mid = paceText(resolved, 'progressionMidPace', '/km');
+    const finish = paceText(resolved, 'targetPace', '/km');
+    return [
+      easy ? `递进第 1 段 ${segment} 分钟 ${easy}` : null,
+      mid ? `递进第 2 段 ${segment} 分钟 ${mid}` : null,
+      finish ? `递进第 3 段 ${segment} 分钟 ${finish}` : null,
+    ].filter((v): v is string => Boolean(v));
+  }
+
+  if (template.id === 'bike.over_under.v1') {
+    const under = powerText(resolved, 'underPower');
+    const over = powerText(resolved, 'overPower');
+    return [
+      under ? `Under 段 2 分钟 ${under}（95% FTP）` : null,
+      over ? `Over 段 1 分钟 ${over}（105% FTP）` : null,
+    ].filter((v): v is string => Boolean(v));
+  }
+
+  if (template.id === 'swim.sprint.v1') {
+    const reps = integerValue(resolved, 'sprintRepeats', 16);
+    const distance = integerValue(resolved, 'sprintDistance', 25);
+    const sprintPace = paceText(resolved, 'sprintPace', '/100m');
+    const easyPace = paceText(resolved, 'easyPace', '/100m');
+    return [
+      sprintPace ? `短冲 ${reps} x ${distance} 米目标配速 ${sprintPace}` : null,
+      easyPace ? `辅助轻松技术游 ${easyPace}` : null,
+    ].filter((v): v is string => Boolean(v));
+  }
+
+  return [];
 }
 
 function fuelingGuidance(template: WorkoutTemplate, durationMinutes: number): string | null {
@@ -1118,6 +1312,102 @@ function formatSeconds(secPerUnit: number): string {
   const m = Math.floor(total / 60);
   const s = total % 60;
   return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function paceSeconds(
+  resolved: Map<string, ResolvedValue>,
+  key: string,
+): number | null {
+  const v = resolved.get(key);
+  if (!v) return null;
+  if (
+    v.kind === 'number' &&
+    typeof v.unit === 'string' &&
+    (v.unit === 's/km' || v.unit === 's/100m')
+  ) {
+    return v.value;
+  }
+  if (
+    v.kind === 'range' &&
+    typeof v.unit === 'string' &&
+    (v.unit === 's/km' || v.unit === 's/100m')
+  ) {
+    return (v.low + v.high) / 2;
+  }
+  return null;
+}
+
+function paceText(
+  resolved: Map<string, ResolvedValue>,
+  key: string,
+  suffix: '/km' | '/100m',
+): string | null {
+  const v = resolved.get(key);
+  if (!v) return null;
+  if (v.kind === 'number') {
+    if (v.unit === 's/km_upper' || v.unit === 's/100m_upper') {
+      return `不快于 ${formatSeconds(v.value)}${suffix}`;
+    }
+    if (v.unit === 's/km' || v.unit === 's/100m' || !v.unit) {
+      return `${formatSeconds(v.value)}${suffix}`;
+    }
+  }
+  if (v.kind === 'range' && (v.unit === 's/km' || v.unit === 's/100m')) {
+    if (Math.abs(v.low - v.high) < 0.5) return `${formatSeconds(v.low)}${suffix}`;
+    return `${formatSeconds(v.low)}-${formatSeconds(v.high)}${suffix}`;
+  }
+  return null;
+}
+
+function powerText(
+  resolved: Map<string, ResolvedValue>,
+  key: string,
+): string | null {
+  const v = resolved.get(key);
+  if (!v) return null;
+  if (v.kind === 'number') {
+    if (v.unit === 'W') return `${Math.round(v.value)} W`;
+    if (v.unit === 'W_upper') return `<${Math.round(v.value)} W`;
+    if (v.unit === 'W_lower') return `>${Math.round(v.value)} W`;
+  }
+  if (v.kind === 'range' && v.unit === 'W') {
+    return `${Math.round(v.low)}-${Math.round(v.high)} W`;
+  }
+  return null;
+}
+
+function integerValue(
+  resolved: Map<string, ResolvedValue>,
+  key: string,
+  fallback: number,
+): number {
+  const v = resolved.get(key);
+  if (v?.kind === 'number' && Number.isFinite(v.value)) return Math.round(v.value);
+  return fallback;
+}
+
+function stringValue(
+  resolved: Map<string, ResolvedValue>,
+  key: string,
+): string | null {
+  const v = resolved.get(key);
+  if (v?.kind === 'string' && v.value.trim()) return v.value.trim();
+  return null;
+}
+
+function valueText(value: ResolvedValue | undefined): string | null {
+  if (!value) return null;
+  if (value.kind === 'number') return String(roundSmart(value.value));
+  if (value.kind === 'range') {
+    if (Math.abs(value.low - value.high) < 0.5) return String(roundSmart(value.low));
+    return `${roundSmart(value.low)}-${roundSmart(value.high)}`;
+  }
+  if (value.kind === 'string') return value.value;
+  return null;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function formatForReplacedRecord(value: ResolvedValue): string | number {

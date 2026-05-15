@@ -355,6 +355,18 @@ const runReversePyramid: WorkoutTemplate = {
     recoveryDuration: { source: { kind: 'template_default', default: 3, unit: 'minutes' } },
     cooldownDuration: { source: { kind: 'template_default', default: 13, unit: 'minutes' } },
     targetPace: { source: { kind: 'athlete_profile', path: 'athleteProfile.running.intervalPaceSecPerKm', unit: 's/km' } },
+    pyramid1200Pace: {
+      source: { kind: 'derived', from: 'athleteProfile.running.intervalPaceSecPerKm', rule: 'intervalPace + 10..+10 s/km', unit: 's/km' },
+      description: '1200m 段接近 10K 配速，必须慢于 800m 段。',
+    },
+    pyramid800Pace: {
+      source: { kind: 'athlete_profile', path: 'athleteProfile.running.intervalPaceSecPerKm', unit: 's/km' },
+      description: '800m 段接近 5K 配速。',
+    },
+    pyramid400Pace: {
+      source: { kind: 'derived', from: 'athleteProfile.running.intervalPaceSecPerKm', rule: 'intervalPace - 10..-10 s/km', unit: 's/km' },
+      description: '400m 段接近 3K 配速，必须快于 800m 段。',
+    },
     vo2HrCap: { source: { kind: 'athlete_profile', path: 'athleteProfile.heartRate.vo2CapRange', unit: 'bpm' } },
     totalFastDistance: { source: { kind: 'template_default', default: 2400, unit: '米' } },
   },

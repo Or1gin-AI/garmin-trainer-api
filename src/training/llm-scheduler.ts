@@ -636,10 +636,18 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   const requestedTrainingDays = effectiveTrainingDaysPerWeek(args.request);
   const requestedRestDays = 7 - requestedTrainingDays;
   const requestedDoubleDay = requestedDoubleDayIndex(args.request);
+  const allowExtraSlots =
+    args.request.allowDoubleDays === true &&
+    (requestedDoubleDay !== null ||
+      shouldUseDoubleDaysForDurationTarget(
+        args.request,
+        args.requestIntent.weeklyTargetMinutes,
+        requestedTrainingDays,
+      ));
   const protectedTrainingDays = requestedTrainingDayIndexes(args.request);
-  if (args.request.allowDoubleDays === true && requestedDoubleDay !== null) {
+  if (allowExtraSlots) {
     systemParts.push(
-      '- 必须覆盖 7 个 dayIndex (1..7)；用户明确要求同日两练时，days 数组可以超过 7 条，同一 dayIndex 用 slotIndex=1/2 表示上午/下午两课。',
+      '- 必须覆盖 7 个 dayIndex (1..7)；允许为了满足同日多练或平均训练时长目标让 days 数组超过 7 条，同一 dayIndex 用 slotIndex=1/2 表示上午/下午两课。加练优先使用低强度 Z2、有氧、恢复或技术模板。',
     );
   } else {
     systemParts.push('- 必须输出且仅输出 7 条，覆盖 dayIndex 1..7；');
@@ -673,6 +681,14 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
       args.trainingCapacity,
     )} 次；如果用户显式要求超过，只能提示风险，不能删除用户要求。`,
   );
+  if (
+    args.request.maxHardSessionsPerWeek !== null &&
+    args.request.maxHardSessionsPerWeek !== undefined
+  ) {
+    systemParts.push(
+      `- 用户设置的每周高强度上限为 ${args.request.maxHardSessionsPerWeek} 次，这是用户要求；除非用户文字明确点名更多具体高强度课，否则不得超过这个次数。`,
+    );
+  }
   if (args.request.forceRequestedSchedule !== true) {
     systemParts.push(
       '- 若最近 36 小时内有 threshold/vo2max/anaerobic 训练，第 1 天不得安排高强度课；',
@@ -708,7 +724,7 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   );
   if (args.request.dailyPreferredMinutes && args.request.dailyPreferredMinutes > 0) {
     systemParts.push(
-      `- 用户填写的 ${args.request.dailyPreferredMinutes} 分钟是单日可用上限，不是每节课必须凑满的目标；不要为了凑时长拉长阈值/VO2/间歇课。`,
+      `- 用户填写的 ${args.request.dailyPreferredMinutes} 分钟是训练日平均时长参考，不是单节硬上限；整体课表应让训练日平均时长接近该值。低强度 Z2/有氧/长距离课可以超过该值，高级用户的 Z2 骑行通常不应短于 75-90 分钟。不要为了凑时长拉长阈值/VO2/间歇主训练。`,
     );
   }
   if (args.trainingCapacity) {
@@ -857,6 +873,24 @@ function parseTrainingWindow(raw: string): ScheduleEntry['timeOfDay'] | undefine
   if (/下午|afternoon|pm|p\.m\./i.test(value)) return 'afternoon';
   if (/晚|夜|evening|night/i.test(value)) return 'evening';
   return undefined;
+}
+
+function shouldUseDoubleDaysForDurationTarget(
+  request: ScheduleRequest,
+  intentTarget: number | null,
+  trainingDays: number,
+): boolean {
+  const target =
+    intentTarget ??
+    (request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0
+      ? request.dailyPreferredMinutes * trainingDays
+      : null);
+  if (!target || trainingDays <= 0) return false;
+  const daily =
+    request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0
+      ? request.dailyPreferredMinutes
+      : 90;
+  return target / trainingDays > Math.min(95, daily * 0.9);
 }
 
 function filterAthleteProfile(p: AthleteProfile, forceRequestedSchedule: boolean) {

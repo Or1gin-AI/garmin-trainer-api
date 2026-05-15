@@ -165,6 +165,15 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
         }
       }
 
+      const segmentDetails = validateSegmentedWorkout(w);
+      if (segmentDetails) {
+        violations.push({
+          rule: 'segmented_workout_targets',
+          dayIndex,
+          details: segmentDetails,
+        });
+      }
+
       if (
         typeof s.durationCapMinutes === 'number' &&
         Number.isFinite(s.durationCapMinutes) &&
@@ -274,6 +283,51 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
   }
 
   return violations;
+}
+
+function validateSegmentedWorkout(w: ParameterizedWorkout): string | null {
+  const structure = w.workoutStructure ?? '';
+  const targetPace = w.targetPace ?? '';
+  const targetPower = w.targetPower ?? '';
+  const type = w.workoutType;
+
+  if (type === 'reverse_pyramid') {
+    const hasDistances = /1200/.test(structure) && /800/.test(structure) && /400/.test(structure);
+    const paces = uniqueMatches(`${targetPace}\n${structure}`, /\d+:\d{2}\s*\/km/g);
+    if (!hasDistances || paces.length < 3) {
+      return `倒金字塔必须写清 1200/800/400 三段，并给出三个不同目标配速；当前 targetPace="${targetPace}"。`;
+    }
+  }
+
+  if (type === 'progression') {
+    const hasSegments = /第一段/.test(structure) && /第二段/.test(structure) && /第三段/.test(structure);
+    const paces = uniqueMatches(`${targetPace}\n${structure}`, /\d+:\d{2}\s*\/km/g);
+    if (!hasSegments || paces.length < 2) {
+      return `递进跑必须写清至少三段，并体现逐步提速；当前 targetPace="${targetPace}"。`;
+    }
+  }
+
+  if (type === 'over_under') {
+    const powers = uniqueMatches(`${targetPower}\n${structure}`, /\d+\s*W/gi);
+    const hasPctPattern = /95\s*%/.test(structure) && /105\s*%/.test(structure);
+    if (powers.length < 2 && !hasPctPattern) {
+      return `Over-under 必须写清 under/over 两个功率目标；当前 targetPower="${targetPower}"。`;
+    }
+  }
+
+  if (w.templateId === 'swim.sprint.v1') {
+    const hasMain = /x|×/.test(structure) && /米/.test(structure);
+    const hasAux = /辅助|技术游|轻松/.test(structure);
+    if (!hasMain || !hasAux) {
+      return '短冲游必须写清短冲主组、组间休息和辅助轻松技术游。';
+    }
+  }
+
+  return null;
+}
+
+function uniqueMatches(text: string, pattern: RegExp): string[] {
+  return Array.from(new Set((text.match(pattern) ?? []).map((s) => s.replace(/\s+/g, ''))));
 }
 
 function sumActiveTrainingMinutes(plan: PlanForValidation): number {
