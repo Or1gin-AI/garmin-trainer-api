@@ -71,6 +71,7 @@ export class InvalidLlmScheduleError extends Error {
 export interface LlmBuildScheduleArgs {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
+  isColdStart?: boolean;
   recentState: RecentState;
   trainingCapacity?: TrainingCapacity;
   signal?: AbortSignal;
@@ -135,6 +136,7 @@ export async function llmBuildWeeklySchedule(
   }
 
   const { request, athleteProfile, recentState, trainingCapacity } = args;
+  const isColdStart = args.isColdStart ?? false;
   const requestIntent = extractTrainingRequestIntent(request);
   const effectiveHardCap = computeHardCap(
     request,
@@ -209,6 +211,7 @@ export async function llmBuildWeeklySchedule(
   const messages = buildMessages({
     request,
     athleteProfile,
+    isColdStart,
     recentState,
     trainingCapacity,
     requestIntent,
@@ -613,6 +616,7 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
 interface BuildMessagesArgs {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
+  isColdStart: boolean;
   recentState: RecentState;
   trainingCapacity?: TrainingCapacity;
   requestIntent: ReturnType<typeof extractTrainingRequestIntent>;
@@ -727,6 +731,11 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
       `- 用户填写的 ${args.request.dailyPreferredMinutes} 分钟是训练日平均时长参考，不是单节硬上限；整体课表应让训练日平均时长接近该值。低强度 Z2/有氧/长距离课可以超过该值，高级用户的 Z2 骑行通常不应短于 75-90 分钟。不要为了凑时长拉长阈值/VO2/间歇主训练。`,
     );
   }
+  if (args.isColdStart) {
+    systemParts.push(
+      '- 该用户结构化训练历史很少或暂无可用运动能力档案；本周日程必须保守，优先低强度、有氧基础、技术和恢复，不要安排激进配速/功率导向的高风险结构。',
+    );
+  }
   if (args.trainingCapacity) {
     systemParts.push(
       `- 训练容量评估：level=${args.trainingCapacity.overall.level}, readiness=${args.trainingCapacity.overall.readiness}, confidence=${args.trainingCapacity.overall.readinessConfidence}，高强度上限 ${args.trainingCapacity.guardrails.maxHardSessionsPerWeek} 次，高强度分钟占比上限 ${Math.round(args.trainingCapacity.guardrails.maxHighMinutesShare * 100)}%。`,
@@ -794,6 +803,7 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     sportPriorities: args.request.sportPriorities ?? null,
     maxHardSessionsPerWeek: args.request.maxHardSessionsPerWeek,
     targetMetricPreference: args.request.targetMetricPreference,
+    isColdStart: args.isColdStart,
     athleteProfile: {
       experienceLevel: args.athleteProfile.experienceLevel,
       heartRate: args.athleteProfile.heartRate,

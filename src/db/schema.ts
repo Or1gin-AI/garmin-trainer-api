@@ -504,6 +504,180 @@ export const llmConfig = pgTable(
   ],
 );
 
+// ===== Athletic Profile (per-user capability DB) =====
+
+// Per-activity STRUCTURED-ONLY record. We deliberately do NOT store the raw
+// Garmin JSON here (that's what the `activity_cache` ghost table was for).
+// Only the derived fields needed for PR extraction, capability derivation, and
+// LLM context are stored: no GPS, no device IDs, no per-second samples.
+export const activityMetric = pgTable(
+  'activity_metric',
+  {
+    id: text('id').primaryKey(), // userId:region:activityId
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    region: text('region').notNull(), // 'cn' | 'global'
+    activityId: text('activity_id').notNull(),
+
+    sport: text('sport').notNull(), // 'running' | 'swimming' | 'cycling' | 'other'
+    subtype: text('subtype'),
+    startTime: timestamp('start_time').notNull(),
+
+    distanceKm: numeric('distance_km', { precision: 8, scale: 3 }),
+    durationMin: numeric('duration_min', { precision: 8, scale: 2 }),
+    elevationGainM: integer('elevation_gain_m'),
+
+    avgPaceSecPerKm: integer('avg_pace_sec_per_km'),
+    avgPaceSecPer100m: integer('avg_pace_sec_per_100m'),
+    avgPower: integer('avg_power'),
+    normalizedPower: integer('normalized_power'),
+    maxPowerTwentyMinutes: integer('max_power_twenty_minutes'),
+    functionalThresholdPower: integer('functional_threshold_power'),
+    cadenceAvg: integer('cadence_avg'),
+    groundContactTimeMs: numeric('ground_contact_time_ms', { precision: 6, scale: 2 }),
+    verticalOscillationCm: numeric('vertical_oscillation_cm', { precision: 5, scale: 2 }),
+    verticalRatio: numeric('vertical_ratio', { precision: 5, scale: 2 }),
+
+    avgHr: integer('avg_hr'),
+    maxHr: integer('max_hr'),
+    hrZoneSeconds: jsonb('hr_zone_seconds'),
+
+    vo2Max: numeric('vo2_max', { precision: 4, scale: 1 }),
+    lactateThresholdHr: integer('lactate_threshold_hr'),
+    lactateThresholdPaceSecPerKm: integer('lactate_threshold_pace_sec_per_km'),
+    aerobicTrainingEffect: numeric('aerobic_te', { precision: 3, scale: 1 }),
+    anaerobicTrainingEffect: numeric('anaerobic_te', { precision: 3, scale: 1 }),
+    trainingLoad: integer('training_load'),
+    recoveryTimeHours: integer('recovery_time_hours'),
+
+    poolLengthM: integer('pool_length_m'),
+    swimStroke: text('swim_stroke'),
+
+    stimulus: text('stimulus'),
+    qualityConfidence: text('quality_confidence').notNull().default('medium'),
+
+    fetchedAt: timestamp('fetched_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('activity_metric_user_region_act_idx').on(
+      t.userId,
+      t.region,
+      t.activityId,
+    ),
+    index('activity_metric_user_sport_time_idx').on(
+      t.userId,
+      t.sport,
+      t.startTime.desc(),
+    ),
+    check(
+      'activity_metric_sport_chk',
+      sql`${t.sport} IN ('running','swimming','cycling','other')`,
+    ),
+    check(
+      'activity_metric_confidence_chk',
+      sql`${t.qualityConfidence} IN ('low','medium','high')`,
+    ),
+  ],
+);
+
+// One row per (user, sport). `snapshot` is the canonical payload consumed by
+// plan generation; typed columns are for quick lookup/admin tooling.
+export const athleticProfile = pgTable(
+  'athletic_profile',
+  {
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    sport: text('sport').notNull(), // 'running' | 'swimming' | 'cycling'
+    available: boolean('available').notNull().default(false),
+    confidence: text('confidence').notNull().default('low'),
+    primaryMetric: numeric('primary_metric', { precision: 8, scale: 2 }),
+    primaryMetricUnit: text('primary_metric_unit'), // 'vdot' | 's_per_100m' | 'watts'
+    primaryMetricSource: text('primary_metric_source').notNull().default('computed'),
+    snapshot: jsonb('snapshot').notNull(),
+    activityCountUsed: integer('activity_count_used').notNull().default(0),
+    lastActivityAt: timestamp('last_activity_at'),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('athletic_profile_user_sport_idx').on(t.userId, t.sport),
+    check(
+      'athletic_profile_sport_chk',
+      sql`${t.sport} IN ('running','swimming','cycling')`,
+    ),
+    check(
+      'athletic_profile_confidence_chk',
+      sql`${t.confidence} IN ('low','medium','high')`,
+    ),
+    check(
+      'athletic_profile_source_chk',
+      sql`${t.primaryMetricSource} IN ('computed','user_override','tested')`,
+    ),
+  ],
+);
+
+// Per-distance / per-duration personal best. One row per (user, sport, anchor).
+export const performanceRecord = pgTable(
+  'performance_record',
+  {
+    id: text('id').primaryKey(), // userId:anchor
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    sport: text('sport').notNull(),
+    anchor: text('anchor').notNull(),
+    bestValue: numeric('best_value', { precision: 10, scale: 2 }).notNull(),
+    bestUnit: text('best_unit').notNull(), // 'seconds' | 'watts'
+    achievedAt: timestamp('achieved_at').notNull(),
+    sourceActivityId: text('source_activity_id'),
+    sourceRegion: text('source_region'),
+    confidence: text('confidence').notNull().default('medium'),
+    isUserEntered: boolean('is_user_entered').notNull().default(false),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('performance_record_user_anchor_idx').on(t.userId, t.anchor),
+    index('performance_record_user_sport_idx').on(t.userId, t.sport),
+    check(
+      'performance_record_sport_chk',
+      sql`${t.sport} IN ('running','swimming','cycling')`,
+    ),
+    check(
+      'performance_record_unit_chk',
+      sql`${t.bestUnit} IN ('seconds','watts')`,
+    ),
+    check(
+      'performance_record_confidence_chk',
+      sql`${t.confidence} IN ('low','medium','high')`,
+    ),
+  ],
+);
+
+// Future-ready exclusion table. V1 has no UI for setting this, but PR/profile
+// extraction reads it from day one.
+export const userActivityFlag = pgTable(
+  'user_activity_flag',
+  {
+    id: text('id').primaryKey(), // userId:region:activityId
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    region: text('region').notNull(),
+    activityId: text('activity_id').notNull(),
+    excludeFromCapability: boolean('exclude_from_capability').notNull().default(false),
+    note: text('note'),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('user_activity_flag_user_act_idx').on(
+      t.userId,
+      t.region,
+      t.activityId,
+    ),
+  ],
+);
+
 export type User = typeof user.$inferSelect;
 export type Subscription = typeof subscription.$inferSelect;
 export type Referral = typeof referral.$inferSelect;
@@ -519,3 +693,7 @@ export type TrainingEvaluation = typeof trainingEvaluation.$inferSelect;
 export type ChatMessage = typeof chatMessage.$inferSelect;
 export type AiUsage = typeof aiUsage.$inferSelect;
 export type LlmConfig = typeof llmConfig.$inferSelect;
+export type ActivityMetricRow = typeof activityMetric.$inferSelect;
+export type AthleticProfileRow = typeof athleticProfile.$inferSelect;
+export type PerformanceRecordRow = typeof performanceRecord.$inferSelect;
+export type UserActivityFlagRow = typeof userActivityFlag.$inferSelect;

@@ -45,6 +45,7 @@ export interface LlmParameterizeArgs {
   };
   scheduleEntry: ScheduleEntry;
   progression: 'conservative' | 'normal' | 'aggressive';
+  isColdStart?: boolean;
   signal?: AbortSignal;
 }
 
@@ -154,6 +155,7 @@ export async function llmParameterizeWorkout(
     request,
     scheduleEntry,
     progression,
+    isColdStart: args.isColdStart ?? false,
   });
 
   const stream = await streamChat({
@@ -458,6 +460,7 @@ interface BuildMessagesArgs {
   };
   scheduleEntry: ScheduleEntry;
   progression: 'conservative' | 'normal' | 'aggressive';
+  isColdStart: boolean;
 }
 
 function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
@@ -508,6 +511,11 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   if (args.request.availableTime) {
     systemParts.push(`- 用户可用时间说明：${args.request.availableTime}`);
   }
+  if (args.isColdStart) {
+    systemParts.push(
+      '- 该用户结构化训练历史很少；优先使用保守训练量和体感描述，不要强行给激进配速/功率。',
+    );
+  }
 
   const user = {
     template: {
@@ -531,6 +539,7 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
       date: args.scheduleEntry.date,
       dayLabel: args.scheduleEntry.dayLabel,
     },
+    isColdStart: args.isColdStart,
     request: args.request,
     athleteProfileForSport: profileSubsetForSport(args.athleteProfile, sport),
     heartRate: args.athleteProfile.heartRate,

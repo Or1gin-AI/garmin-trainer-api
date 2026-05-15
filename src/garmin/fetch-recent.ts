@@ -10,6 +10,13 @@
 // activities between Garmin regions, not into our DB).
 
 import { authenticate } from './client.js';
+import { sql } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { activityMetric } from '../db/schema.js';
+import { normalizeActivity } from '../training/activity-normalizer.js';
+import { classifyActivityQuality } from '../training/activity-quality.js';
+import { toActivityMetricRow } from '../training/profile/persist-activity.js';
+import { updateUserProfile } from '../training/profile/update.js';
 import {
   activitySignature,
   mapActivity,
@@ -325,12 +332,85 @@ export async function fetchRecentRawActivities(
     filtered.push(a);
   }
 
+  try {
+    await persistMetrics(userId, filtered);
+  } catch (err) {
+    console.error('[fetch-recent] activity_metric persist failed', err);
+  }
+
+  try {
+    await updateUserProfile(userId, cnRes.physiology);
+  } catch (err) {
+    console.error('[fetch-recent] profile recompute failed', err);
+  }
+
   return {
     activities: filtered,
     physiology: cnRes.physiology,
     cn: { count: cnRes.list.length, error: cnRes.error },
     global: { count: globalRes.list.length, error: globalRes.error },
   };
+}
+
+async function persistMetrics(
+  userId: string,
+  activities: MappedActivity[],
+): Promise<void> {
+  const rows = [];
+  for (const raw of activities) {
+    const normalized = normalizeActivity(raw);
+    if (!normalized) continue;
+    let quality;
+    try {
+      quality = classifyActivityQuality(normalized);
+    } catch {
+      quality = undefined;
+    }
+    const row = toActivityMetricRow(userId, normalized, quality);
+    if (row) rows.push(row);
+  }
+
+  if (rows.length === 0) return;
+
+  await db
+    .insert(activityMetric)
+    .values(rows)
+    .onConflictDoUpdate({
+      target: activityMetric.id,
+      set: {
+        sport: sql`EXCLUDED.sport`,
+        subtype: sql`EXCLUDED.subtype`,
+        startTime: sql`EXCLUDED.start_time`,
+        distanceKm: sql`EXCLUDED.distance_km`,
+        durationMin: sql`EXCLUDED.duration_min`,
+        elevationGainM: sql`EXCLUDED.elevation_gain_m`,
+        avgPaceSecPerKm: sql`EXCLUDED.avg_pace_sec_per_km`,
+        avgPaceSecPer100m: sql`EXCLUDED.avg_pace_sec_per_100m`,
+        avgPower: sql`EXCLUDED.avg_power`,
+        normalizedPower: sql`EXCLUDED.normalized_power`,
+        maxPowerTwentyMinutes: sql`EXCLUDED.max_power_twenty_minutes`,
+        functionalThresholdPower: sql`EXCLUDED.functional_threshold_power`,
+        cadenceAvg: sql`EXCLUDED.cadence_avg`,
+        groundContactTimeMs: sql`EXCLUDED.ground_contact_time_ms`,
+        verticalOscillationCm: sql`EXCLUDED.vertical_oscillation_cm`,
+        verticalRatio: sql`EXCLUDED.vertical_ratio`,
+        avgHr: sql`EXCLUDED.avg_hr`,
+        maxHr: sql`EXCLUDED.max_hr`,
+        hrZoneSeconds: sql`EXCLUDED.hr_zone_seconds`,
+        vo2Max: sql`EXCLUDED.vo2_max`,
+        lactateThresholdHr: sql`EXCLUDED.lactate_threshold_hr`,
+        lactateThresholdPaceSecPerKm: sql`EXCLUDED.lactate_threshold_pace_sec_per_km`,
+        aerobicTrainingEffect: sql`EXCLUDED.aerobic_te`,
+        anaerobicTrainingEffect: sql`EXCLUDED.anaerobic_te`,
+        trainingLoad: sql`EXCLUDED.training_load`,
+        recoveryTimeHours: sql`EXCLUDED.recovery_time_hours`,
+        poolLengthM: sql`EXCLUDED.pool_length_m`,
+        swimStroke: sql`EXCLUDED.swim_stroke`,
+        stimulus: sql`EXCLUDED.stimulus`,
+        qualityConfidence: sql`EXCLUDED.quality_confidence`,
+        fetchedAt: sql`EXCLUDED.fetched_at`,
+      },
+    });
 }
 
 export async function fetchCalendarActivities(

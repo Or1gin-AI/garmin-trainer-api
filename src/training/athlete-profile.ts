@@ -959,13 +959,16 @@ function deriveSwimming(
     return profile;
   }
 
+  // Wakayoshi et al. 1992 CSS pace zones: use percentage-of-CSS rather than
+  // fixed second offsets, so fast swimmers are not over-prescribed slow paces.
+  // See docs/sports-science-algorithms.md.
   profile.cssPaceSecPer100m = Math.round(css);
   if (cssSource) profile.cssSource = cssSource;
-  profile.easyPaceSecPer100m = Math.round(css + 18);
-  profile.aerobicPaceSecPer100m = Math.round(css + 12);
-  profile.endurancePaceSecPer100m = Math.round(css + 14);
-  profile.vo2PaceSecPer100m = Math.round(css - 5);
-  profile.sprintPaceSecPer100m = Math.round(css - 14);
+  profile.easyPaceSecPer100m = Math.round(css * 1.18);
+  profile.aerobicPaceSecPer100m = Math.round(css * 1.08);
+  profile.endurancePaceSecPer100m = Math.round(css * 1.1);
+  profile.vo2PaceSecPer100m = Math.round(css * 0.92);
+  profile.sprintPaceSecPer100m = Math.round(css * 0.85);
 
   return profile;
 }

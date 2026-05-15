@@ -57,7 +57,8 @@ import { classifyActivityQuality } from '../training/activity-quality.js';
 import type { QualityContext, QualityResult } from '../training/activity-quality.js';
 import { evaluateTrainingDay, type TrainingEvaluationResult } from '../training/evaluation.js';
 import { deriveRecentTrainingState } from '../training/recent-state.js';
-import { buildAthleteProfile } from '../training/athlete-profile.js';
+import type { AthleteProfile } from '../training/athlete-profile.js';
+import { loadAthleteProfileFromDb } from '../training/profile/load.js';
 import { deriveTrainingCapacity } from '../training/training-capacity.js';
 import { expandMultiSessionSchedule, generatePlan } from '../training/orchestrator.js';
 import { buildWeeklySchedule, MAX_WEEKLY_TRAINING_MINUTES } from '../training/scheduler.js';
@@ -163,7 +164,8 @@ const MAX_TRAINING_PLANS_PER_USER = 10;
 
 interface DerivedContext {
   request: ScheduleRequest;
-  athleteProfile: ReturnType<typeof buildAthleteProfile>;
+  athleteProfile: AthleteProfile;
+  isColdStart: boolean;
   recentState: ReturnType<typeof deriveRecentTrainingState>;
   trainingCapacity: ReturnType<typeof deriveTrainingCapacity>;
   qualities: Map<string, QualityResult>;
@@ -264,21 +266,13 @@ async function loadDerivedContext(
     qualities,
     asOf: new Date(),
   });
-  const athleteProfile = buildAthleteProfile({
-    activities,
-    qualities,
-    physiology: fetched.physiology,
-    request: {
-      injuries: request.injuries,
-      raceDate: request.raceDate ?? null,
-      goalDistance: request.goalDistance ?? null,
-    },
-  });
   const trainingCapacity = deriveTrainingCapacity({
     activities,
     qualities,
     asOf: new Date(),
   });
+  const { profile: athleteProfile, isColdStart } =
+    await loadAthleteProfileFromDb(userId, parseInjuries(request.injuries));
 
   emitFn({
     id: profileId,
@@ -289,11 +283,19 @@ async function loadDerivedContext(
     durationMs: Date.now() - profileStart,
   });
 
-  return { request, athleteProfile, recentState, trainingCapacity, qualities, activities };
+  return {
+    request,
+    athleteProfile,
+    isColdStart,
+    recentState,
+    trainingCapacity,
+    qualities,
+    activities,
+  };
 }
 
 function summarizeProfileShort(
-  profile: ReturnType<typeof buildAthleteProfile>,
+  profile: AthleteProfile,
   state: ReturnType<typeof deriveRecentTrainingState>,
 ): string {
   const fatigueZh: Record<string, string> = {
@@ -310,6 +312,18 @@ function summarizeProfileShort(
     unknown: '未知',
   };
   return `${expZh[exp] ?? exp} · 疲劳：${fatigueZh[state.fatigue] ?? state.fatigue}`;
+}
+
+function parseInjuries(text: string | undefined): string[] {
+  if (!text) return [];
+  return Array.from(
+    new Set(
+      text
+        .split(/[,，;；\n]+/)
+        .map((part) => part.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
 }
 
 function toScheduleRequest(parsed: z.infer<typeof planRequestSchema>): ScheduleRequest {
@@ -1043,6 +1057,7 @@ trainingRouter.post(
           cycling: ctx.athleteProfile.cycling,
           swimming: ctx.athleteProfile.swimming,
         },
+        isColdStart: ctx.isColdStart,
         trainingCapacity: {
           overall: ctx.trainingCapacity.overall,
           load: ctx.trainingCapacity.load,
@@ -1062,6 +1077,7 @@ trainingRouter.post(
         userId,
         request,
         athleteProfile: ctx.athleteProfile,
+        isColdStart: ctx.isColdStart,
         recentState: ctx.recentState,
         trainingCapacity: ctx.trainingCapacity,
         onSummaryDelta: (delta) => {
@@ -1099,6 +1115,7 @@ trainingRouter.post(
               adjustmentRules: plan.adjustmentRules,
               athleteProfileSnapshot: {
                 athleteProfile: ctx.athleteProfile,
+                isColdStart: ctx.isColdStart,
                 recentState: {
                   fatigue: ctx.recentState.fatigue,
                   latestStimulus: ctx.recentState.latestStimulus,
@@ -2420,6 +2437,7 @@ async function dispatchChatToolCall(
           },
           scheduleEntry: entry,
           progression,
+          isColdStart: ctx.isColdStart,
           signal,
         });
         parameterized = {
@@ -2715,7 +2733,7 @@ function chooseSecondWorkoutTemplate(args: {
   requestedSport?: 'running' | 'cycling' | 'swimming' | 'mobility';
   requestedTemplateId?: string;
   dayWorkouts: Workout[];
-  athleteProfile: ReturnType<typeof buildAthleteProfile>;
+  athleteProfile: AthleteProfile;
 }): string {
   if (args.requestedTemplateId) {
     return args.requestedTemplateId;

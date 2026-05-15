@@ -78,6 +78,20 @@
       "when": 1779177600000,
       "tag": "0010_garmin_bind_log",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1779264000000,
+      "tag": "0011_athletic_profile",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1779350400000,
+      "tag": "0012_fresh_mordo",
+      "breakpoints": true
     }
   ]
 }

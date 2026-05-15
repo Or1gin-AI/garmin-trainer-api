@@ -68,6 +68,7 @@ export interface GeneratePlanInput {
   userId: string;
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
+  isColdStart?: boolean;
   recentState: RecentState;
   trainingCapacity?: TrainingCapacity;
   signal?: AbortSignal;
@@ -111,7 +112,15 @@ const DETERMINISTIC_MODEL = 'v1';
 // ---------------------------------------------------------------------------
 
 export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedPlan> {
-  const { request, athleteProfile, recentState, trainingCapacity, signal, onToolEvent } = input;
+  const {
+    request,
+    athleteProfile,
+    isColdStart = false,
+    recentState,
+    trainingCapacity,
+    signal,
+    onToolEvent,
+  } = input;
   const emit = onToolEvent ?? (() => {});
   const requestIntent = extractTrainingRequestIntent(request);
 
@@ -119,6 +128,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
   const stageOne = await runScheduleStage({
     request,
     athleteProfile,
+    isColdStart,
     recentState,
     trainingCapacity,
     signal,
@@ -212,6 +222,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
         },
         scheduleEntry: entry,
         progression,
+        isColdStart,
         signal,
       });
       const w = {
@@ -1250,12 +1261,21 @@ interface ScheduleStageResult {
 async function runScheduleStage(args: {
   request: ScheduleRequest;
   athleteProfile: AthleteProfile;
+  isColdStart?: boolean;
   recentState: RecentState;
   trainingCapacity?: TrainingCapacity;
   signal?: AbortSignal;
   emit: (e: ToolEventPayload) => void;
 }): Promise<ScheduleStageResult> {
-  const { request, athleteProfile, recentState, trainingCapacity, signal, emit } = args;
+  const {
+    request,
+    athleteProfile,
+    isColdStart = false,
+    recentState,
+    trainingCapacity,
+    signal,
+    emit,
+  } = args;
 
   const scheduleId = crypto.randomUUID();
   const scheduleStart = Date.now();
@@ -1293,6 +1313,7 @@ async function runScheduleStage(args: {
       const res = await llmBuildWeeklySchedule({
         request,
         athleteProfile,
+        isColdStart,
         recentState,
         trainingCapacity,
         signal,

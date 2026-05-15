@@ -11,6 +11,7 @@ import { adminRouter } from './routes/admin.js';
 import { adminAiRouter } from './routes/admin-ai.js';
 import { referralRouter } from './routes/referral.js';
 import { trainingRouter } from './routes/training.js';
+import { profileRouter } from './routes/profile.js';
 
 const app = express();
 
@@ -45,6 +46,7 @@ app.use('/api/referral', referralRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/admin', adminAiRouter);
 app.use('/api/training', trainingRouter);
+app.use('/api/profile', profileRouter);
 
 // 404
 app.use((_req, res) => {
