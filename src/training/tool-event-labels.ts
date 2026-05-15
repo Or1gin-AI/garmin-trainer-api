@@ -7,7 +7,7 @@ import type { Violation } from './validation.js';
 
 export const TOOL_DISPLAY: Record<string, string> = {
   // Plan-generation pseudo tools.
-  load_recent_activities: '查询近 60 天 Garmin 训练记录',
+  load_recent_activities: '查询近 56 天国区 Garmin 训练记录',
   load_athlete_profile: '分析跑者画像与近期状态',
   llm_build_schedule: '编排本周训练日程',
   llm_parameterize_workout: '配置训练课参数',

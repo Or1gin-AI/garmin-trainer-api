@@ -10,7 +10,11 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from 'openai/resources/chat/completions';
-import { streamChat } from '../lib/llm.js';
+import {
+  streamChat,
+  getActiveLlmConfig,
+  shouldBypassStreamingToolCalls,
+} from '../lib/llm.js';
 import type { AthleteProfile } from './athlete-profile.js';
 import type { RecentState } from './recent-state.js';
 import { MAX_WEEKLY_TRAINING_MINUTES, type ScheduleEntry } from './scheduler.js';
@@ -92,6 +96,14 @@ export async function llmParameterizeWorkout(
   if (requiresDeterministicParameterization(template)) {
     return {
       workout: deterministicGuardWorkout(args),
+      meta: { inputTokens: 0, outputTokens: 0 },
+    };
+  }
+
+  const config = await getActiveLlmConfig();
+  if (shouldBypassStreamingToolCalls(config)) {
+    return {
+      workout: deterministicGuardWorkout(args, 'streaming_tool_call_bypass'),
       meta: { inputTokens: 0, outputTokens: 0 },
     };
   }
@@ -232,7 +244,10 @@ function requiresDeterministicParameterization(template: WorkoutTemplate): boole
   return DETERMINISTIC_PARAMETERIZATION_TEMPLATE_IDS.has(template.id);
 }
 
-function deterministicGuardWorkout(args: LlmParameterizeArgs): ParameterizedWorkout {
+function deterministicGuardWorkout(
+  args: LlmParameterizeArgs,
+  source = 'deterministic_parameterization_guard',
+): ParameterizedWorkout {
   const workout = parameterizeWorkout({
     template: args.template,
     athleteProfile: args.athleteProfile,
@@ -247,7 +262,7 @@ function deterministicGuardWorkout(args: LlmParameterizeArgs): ParameterizedWork
       ...workout.parameterSource,
       replacedVariables: {
         ...workout.parameterSource.replacedVariables,
-        __source: 'deterministic_parameterization_guard',
+        __source: source,
       },
     },
   };

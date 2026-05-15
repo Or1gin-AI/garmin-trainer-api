@@ -13,7 +13,11 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from 'openai/resources/chat/completions';
-import { streamChat, getActiveLlmConfig } from '../lib/llm.js';
+import {
+  streamChat,
+  getActiveLlmConfig,
+  shouldBypassStreamingToolCalls,
+} from '../lib/llm.js';
 import {
   filterAllowedTemplates,
   getCatalogForPrompt,
@@ -133,6 +137,11 @@ export async function llmBuildWeeklySchedule(
     config = await getActiveLlmConfig();
   } catch (err) {
     throw new LlmNotConfiguredError((err as Error).message);
+  }
+  if (shouldBypassStreamingToolCalls(config)) {
+    throw new LlmNotConfiguredError(
+      `LLM config "${config.name}" does not provide reliable streaming tool calls; using deterministic scheduler`,
+    );
   }
 
   const { request, athleteProfile, recentState, trainingCapacity } = args;

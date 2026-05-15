@@ -838,7 +838,7 @@ async function loadRawActivityMap(
   const rows = await db
     .select()
     .from(activityCache)
-    .where(eq(activityCache.userId, userId));
+    .where(and(eq(activityCache.userId, userId), eq(activityCache.region, 'cn')));
 
   for (const row of rows) {
     const raw = readObject(row.data)
@@ -852,7 +852,7 @@ async function loadRawActivityMap(
   }
 
   const live = await fetchCalendarActivities(userId, {
-    days: Math.max(daysBetweenInclusive(from, to) + 2, 62),
+    days: ACTIVITY_LOOKBACK_DAYS,
     limit: 160,
   });
   for (const raw of live.activities) {

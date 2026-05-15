@@ -22,6 +22,19 @@ export interface ActiveLlmConfig {
   apiKey: string;
 }
 
+export function shouldBypassStreamingToolCalls(
+  config: Pick<ActiveLlmConfig, 'name' | 'baseUrl' | 'model'>,
+): boolean {
+  const name = config.name.toLowerCase();
+  const baseUrl = config.baseUrl.toLowerCase();
+  const model = config.model.toLowerCase();
+  return (
+    name.includes('xiaomi') ||
+    baseUrl.includes('xiaomimimo.com') ||
+    model.startsWith('mimo-')
+  );
+}
+
 const CACHE_TTL_MS = 60_000;
 
 let cached: { config: ActiveLlmConfig; expiresAt: number } | null = null;

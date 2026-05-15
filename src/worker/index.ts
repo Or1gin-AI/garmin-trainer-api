@@ -212,11 +212,11 @@ async function autoSyncTick() {
 
     // Skip if Garmin accounts not configured for both regions
     const accs = await db
-      .select({ region: garminAccount.region })
+      .select({ region: garminAccount.region, sessionEnc: garminAccount.sessionEnc })
       .from(garminAccount)
       .where(eq(garminAccount.userId, c.userId));
-    const regions = new Set(accs.map((a) => a.region));
-    if (!regions.has('cn') || !regions.has('global')) continue;
+    const sessionsByRegion = new Map(accs.map((a) => [a.region, a.sessionEnc]));
+    if (!sessionsByRegion.get('cn') || !sessionsByRegion.get('global')) continue;
 
     const id = crypto.randomUUID();
     await db.insert(syncJob).values({

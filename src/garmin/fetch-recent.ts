@@ -421,14 +421,15 @@ export async function fetchCalendarActivities(
   const limit = options.limit ?? DEFAULT_LIMIT;
   const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
 
-  const [cnRes, globalRes] = await Promise.all([
-    fetchRegion(userId, 'cn', limit),
-    fetchRegion(userId, 'global', limit),
-  ]);
+  const cnRes = await fetchRegion(userId, 'cn', limit);
+  const globalRes = {
+    list: [] as RawActivity[],
+    physiology: null as GarminPhysiologyMetrics | null,
+    error: null as string | null,
+  };
 
   const seen = new Map<string, MappedActivity>();
   for (const a of cnRes.list) seen.set(activitySignature(a), mapActivity(a, 'cn'));
-  for (const a of globalRes.list) seen.set(activitySignature(a), mapActivity(a, 'global'));
 
   const filtered: MappedActivity[] = [];
   for (const a of seen.values()) {
