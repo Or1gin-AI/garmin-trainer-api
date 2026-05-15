@@ -12,8 +12,9 @@ import type {
 } from 'openai/resources/chat/completions';
 import {
   streamChat,
+  completeChat,
   getActiveLlmConfig,
-  shouldBypassStreamingToolCalls,
+  shouldUseNonStreamingToolCalls,
 } from '../lib/llm.js';
 import type { AthleteProfile } from './athlete-profile.js';
 import type { RecentState } from './recent-state.js';
@@ -100,14 +101,6 @@ export async function llmParameterizeWorkout(
     };
   }
 
-  const config = await getActiveLlmConfig();
-  if (shouldBypassStreamingToolCalls(config)) {
-    return {
-      workout: deterministicGuardWorkout(args, 'streaming_tool_call_bypass'),
-      meta: { inputTokens: 0, outputTokens: 0 },
-    };
-  }
-
   const tools: ChatCompletionTool[] = [
     {
       type: 'function',
@@ -169,6 +162,50 @@ export async function llmParameterizeWorkout(
     progression,
     isColdStart: args.isColdStart ?? false,
   });
+
+  const config = await getActiveLlmConfig();
+  if (shouldUseNonStreamingToolCalls(config)) {
+    const completion = await completeChat({
+      messages,
+      tools,
+      toolChoice: { type: 'function', function: { name: TOOL_NAME } },
+      temperature: 0.5,
+      signal: args.signal,
+    });
+    const toolCall = completion.choices?.[0]?.message?.tool_calls?.find(
+      (tc) =>
+        tc.type === 'function' &&
+        'function' in tc &&
+        tc.function?.name === TOOL_NAME,
+    ) as { function?: { arguments?: string } } | undefined;
+    const argsBuffer = toolCall?.function?.arguments ?? '';
+    if (argsBuffer.length === 0) {
+      throw new InvalidLlmWorkoutError(['model did not emit tool call']);
+    }
+
+    let parsed: LlmWorkoutPayload;
+    try {
+      parsed = JSON.parse(argsBuffer) as LlmWorkoutPayload;
+    } catch (err) {
+      throw new InvalidLlmWorkoutError([
+        `JSON parse failed: ${(err as Error).message}`,
+      ]);
+    }
+
+    return {
+      workout: validateAndBuild({
+        parsed,
+        template,
+        request,
+        scheduleEntry,
+        progression,
+      }),
+      meta: {
+        inputTokens: completion.usage?.prompt_tokens ?? 0,
+        outputTokens: completion.usage?.completion_tokens ?? 0,
+      },
+    };
+  }
 
   const stream = await streamChat({
     messages,

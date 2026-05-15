@@ -1,7 +1,9 @@
 import { eq } from 'drizzle-orm';
 import OpenAI from 'openai';
 import type {
+  ChatCompletion,
   ChatCompletionChunk,
+  ChatCompletionCreateParamsNonStreaming,
   ChatCompletionCreateParamsStreaming,
   ChatCompletionMessageParam,
   ChatCompletionTool,
@@ -22,7 +24,7 @@ export interface ActiveLlmConfig {
   apiKey: string;
 }
 
-export function shouldBypassStreamingToolCalls(
+export function shouldUseNonStreamingToolCalls(
   config: Pick<ActiveLlmConfig, 'name' | 'baseUrl' | 'model'>,
 ): boolean {
   const name = config.name.toLowerCase();
@@ -110,6 +112,10 @@ export interface StreamChatArgs {
   responseFormat?: ChatCompletionCreateParamsStreaming['response_format'];
 }
 
+export interface CompleteChatArgs extends Omit<StreamChatArgs, 'responseFormat'> {
+  responseFormat?: ChatCompletionCreateParamsNonStreaming['response_format'];
+}
+
 /**
  * Issue a streamed chat completion via the active config. Returns the raw
  * SDK stream — caller iterates and decides how to surface deltas / tool
@@ -135,6 +141,39 @@ export async function streamChat(
     temperature: args.temperature ?? 0.7,
     max_tokens: maxTokens,
     stream: true,
+  };
+  if (args.tools && args.tools.length > 0) {
+    body.tools = args.tools;
+    if (args.toolChoice !== undefined) {
+      body.tool_choice = args.toolChoice;
+    }
+  }
+  if (args.responseFormat) {
+    body.response_format = args.responseFormat;
+  }
+
+  return client.chat.completions.create(body, {
+    signal: args.signal,
+  });
+}
+
+export async function completeChat(
+  args: CompleteChatArgs,
+): Promise<ChatCompletion> {
+  const { client, config } = await getLlmClient();
+
+  const requestedMax = args.maxTokens ?? config.maxOutputTokens;
+  const maxTokens = Math.max(
+    1,
+    Math.min(config.maxOutputTokens, Math.floor(requestedMax)),
+  );
+
+  const body: ChatCompletionCreateParamsNonStreaming = {
+    model: config.model,
+    messages: args.messages,
+    temperature: args.temperature ?? 0.7,
+    max_tokens: maxTokens,
+    stream: false,
   };
   if (args.tools && args.tools.length > 0) {
     body.tools = args.tools;

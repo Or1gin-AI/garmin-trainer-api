@@ -15,8 +15,9 @@ import type {
 } from 'openai/resources/chat/completions';
 import {
   streamChat,
+  completeChat,
   getActiveLlmConfig,
-  shouldBypassStreamingToolCalls,
+  shouldUseNonStreamingToolCalls,
 } from '../lib/llm.js';
 import {
   filterAllowedTemplates,
@@ -137,11 +138,6 @@ export async function llmBuildWeeklySchedule(
     config = await getActiveLlmConfig();
   } catch (err) {
     throw new LlmNotConfiguredError((err as Error).message);
-  }
-  if (shouldBypassStreamingToolCalls(config)) {
-    throw new LlmNotConfiguredError(
-      `LLM config "${config.name}" does not provide reliable streaming tool calls; using deterministic scheduler`,
-    );
   }
 
   const { request, athleteProfile, recentState, trainingCapacity } = args;
@@ -282,6 +278,54 @@ export async function llmBuildWeeklySchedule(
       },
     },
   ];
+
+  if (shouldUseNonStreamingToolCalls(config)) {
+    const completion = await completeChat({
+      messages,
+      tools,
+      toolChoice: { type: 'function', function: { name: TOOL_NAME } },
+      temperature: 0.4,
+      signal: args.signal,
+    });
+    const toolCall = completion.choices?.[0]?.message?.tool_calls?.find(
+      (tc) =>
+        tc.type === 'function' &&
+        'function' in tc &&
+        tc.function?.name === TOOL_NAME,
+    ) as { function?: { arguments?: string } } | undefined;
+    const argsBuffer = toolCall?.function?.arguments ?? '';
+    if (argsBuffer.length === 0) {
+      throw new InvalidLlmScheduleError(['model did not emit tool call']);
+    }
+
+    let parsed: LlmToolPayload;
+    try {
+      parsed = JSON.parse(argsBuffer) as LlmToolPayload;
+    } catch (err) {
+      throw new InvalidLlmScheduleError([
+        `JSON parse failed: ${(err as Error).message}`,
+      ]);
+    }
+
+    const validated = validateAndBuildResult({
+      parsed,
+      request,
+      allowedIds,
+      athleteProfile,
+      recentState,
+      trainingCapacity,
+    });
+
+    return {
+      schedule: validated,
+      meta: {
+        provider: config.name,
+        model: config.model,
+        inputTokens: completion.usage?.prompt_tokens ?? 0,
+        outputTokens: completion.usage?.completion_tokens ?? 0,
+      },
+    };
+  }
 
   // Stream + accumulate tool-call argument deltas. Most OpenAI-compatible
   // providers emit the tool args as a series of `delta.tool_calls[i].function
