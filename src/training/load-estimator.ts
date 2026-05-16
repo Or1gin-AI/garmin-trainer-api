@@ -31,6 +31,18 @@ const SPORT_FACTOR: Record<string, number> = {
   swimming: 1.2,
 };
 
+// Calibrated from real Garmin activity rows with training_load > 50.
+// Plain aerobic running is materially lower than the mixed running average:
+// combined easy/long proxy median ~= 1.34 load/min and P75 ~= 1.66 load/min
+// across the local + Porrima samples, while tempo/threshold samples remain
+// much higher. Keep this as a tag-specific override so hard running workouts
+// still use the broader running factor.
+const SPORT_TAG_FACTOR: Partial<Record<string, Partial<Record<TrainingLoadTag, number>>>> = {
+  running: {
+    easy: 1.6,
+  },
+};
+
 const TAG_COEFFICIENT: Record<TrainingLoadTag, number> = {
   recovery: 0.82,
   easy: 1.0,
@@ -68,7 +80,7 @@ export function estimateWorkoutTrainingLoad(workout: ParameterizedWorkout): Work
 
   const tag = classifyWorkoutLoadTag(workout);
   const structure = inferStructureMinutes(workout, tag, minutes);
-  const sportFactor = SPORT_FACTOR[workout.sport] ?? 1.5;
+  const sportFactor = SPORT_TAG_FACTOR[workout.sport]?.[tag] ?? SPORT_FACTOR[workout.sport] ?? 1.5;
   const hardCoeff = TAG_COEFFICIENT[tag] ?? 1.4;
   const raw =
     structure.easyMinutes * 1.0 +
