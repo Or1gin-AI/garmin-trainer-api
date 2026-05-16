@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, gte, sql } from 'drizzle-orm';
 import { db } from '../../db/index.js';
 import {
   activityMetric,
@@ -9,7 +9,11 @@ import {
 } from '../../db/schema.js';
 import type { NormalizedActivity, NormalizedSport } from '../activity-normalizer.js';
 import { buildAthleteProfile } from '../athlete-profile.js';
-import type { QualityResult } from '../activity-quality.js';
+import {
+  classifyActivityQuality,
+  type QualityContext,
+  type QualityResult,
+} from '../activity-quality.js';
 import type { GarminPhysiologyMetrics } from '../../garmin/fetch-recent.js';
 import {
   extractPrCandidates,
@@ -18,6 +22,9 @@ import {
   type PrCandidate,
 } from './extract-prs.js';
 import { deriveCycling, deriveRunning, deriveSwimming } from './derive-zones.js';
+
+const PROFILE_LOOKBACK_DAYS = 56;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function rowSport(row: ActivityMetricRow): NormalizedSport {
   if (
@@ -97,13 +104,48 @@ function rowToNormalized(row: ActivityMetricRow): NormalizedActivity {
   };
 }
 
-function rowToQuality(row: ActivityMetricRow): QualityResult {
+function buildQualityContext(activities: NormalizedActivity[]): QualityContext {
+  const bySport = (sport: NormalizedSport) =>
+    activities.filter((activity) => activity.sport === sport);
+
+  const sportMedianDistanceKm: Partial<Record<NormalizedSport, number>> = {};
+  const sportP90DistanceKm: Partial<Record<NormalizedSport, number>> = {};
+  const sportMedianDurationMin: Partial<Record<NormalizedSport, number>> = {};
+  const sportP90DurationMin: Partial<Record<NormalizedSport, number>> = {};
+  const sportMedianTrainingLoad: Partial<Record<NormalizedSport, number>> = {};
+
+  for (const sport of ['running', 'cycling', 'swimming'] as const) {
+    const list = bySport(sport);
+    const distances = list.map((a) => a.distanceKm).filter(validMetric);
+    const durations = list.map((a) => a.durationMin).filter(validMetric);
+    const loads = list.map((a) => a.trainingLoad).filter(validMetric);
+    const distMedian = medianNumber(distances);
+    const distP90 = percentileNumber(distances, 0.9);
+    const durationMedian = medianNumber(durations);
+    const durationP90 = percentileNumber(durations, 0.9);
+    const loadMedian = medianNumber(loads);
+    if (distMedian !== null) sportMedianDistanceKm[sport] = distMedian;
+    if (distP90 !== null) sportP90DistanceKm[sport] = distP90;
+    if (durationMedian !== null) sportMedianDurationMin[sport] = durationMedian;
+    if (durationP90 !== null) sportP90DurationMin[sport] = durationP90;
+    if (loadMedian !== null) sportMedianTrainingLoad[sport] = loadMedian;
+  }
+
   return {
-    confidence:
-      row.qualityConfidence === 'high' || row.qualityConfidence === 'low'
-        ? row.qualityConfidence
-        : 'medium',
-    flags: [],
+    cyclingMedianSpeedMps: medianNumber(
+      bySport('cycling').map((a) => a.averageSpeed).filter(validMetric),
+    ),
+    runningMedianPaceSecPerKm: medianNumber(
+      bySport('running').map((a) => a.averagePaceSecPerKm).filter(validMetric),
+    ),
+    runningMedianPowerWatts: medianNumber(
+      bySport('running').map((a) => a.averagePower).filter(validMetric),
+    ),
+    sportMedianDistanceKm,
+    sportP90DistanceKm,
+    sportMedianDurationMin,
+    sportP90DurationMin,
+    sportMedianTrainingLoad,
   };
 }
 
@@ -111,8 +153,18 @@ export async function updateUserProfile(
   userId: string,
   physiology?: GarminPhysiologyMetrics | null,
 ): Promise<void> {
+  const cutoff = new Date(Date.now() - PROFILE_LOOKBACK_DAYS * DAY_MS);
   const [metricRows, flagRows] = await Promise.all([
-    db.select().from(activityMetric).where(eq(activityMetric.userId, userId)),
+    db
+      .select()
+      .from(activityMetric)
+      .where(
+        and(
+          eq(activityMetric.userId, userId),
+          eq(activityMetric.region, 'cn'),
+          gte(activityMetric.startTime, cutoff),
+        ),
+      ),
     db
       .select()
       .from(userActivityFlag)
@@ -152,11 +204,15 @@ export async function updateUserProfile(
     activity: rowToNormalized(row),
   }));
   const activities = activityRows.map(({ activity }) => activity);
+  const qualityContext = buildQualityContext(activities);
   const qualities = new Map<string, QualityResult>(
-    activityRows.map(({ row, activity }) => [activity.id, rowToQuality(row)]),
+    activities.map((activity) => [
+      activity.id,
+      classifyActivityQuality(activity, qualityContext),
+    ]),
   );
   const prActivities = activityRows
-    .filter(({ row }) => row.qualityConfidence !== 'low')
+    .filter(({ activity }) => qualities.get(activity.id)?.confidence !== 'low')
     .map(({ activity }) => activity);
 
   const bestPrs = pickBestPerAnchor(
@@ -180,7 +236,7 @@ export async function updateUserProfile(
     fullProfile.swimming.cssPaceSecPer100m ?? null,
   );
   const cycling = deriveCycling(bestPrs, fullProfile.cycling.ftpWatts ?? null);
-  const lastActivityAt = latestActivityAt(activities);
+  const lastActivityAt = latestActivityAt(activities, qualities);
 
   // Snapshot merge priority: fullProfile (Garmin direct + activity-sample
   // statistics) wins over derive-zones (PR-based estimation). derive-zones
@@ -240,7 +296,7 @@ export async function updateUserProfile(
       snapshot: runningSnapshot,
       primaryMetricUnit: 'vdot',
       primaryMetric: running.vdot,
-      activityCountUsed: activityCountForSport(activities, 'running'),
+      activityCountUsed: activityCountForSport(activities, 'running', qualities),
       lastActivityAt,
     }),
     upsertSport({
@@ -249,7 +305,7 @@ export async function updateUserProfile(
       snapshot: swimmingSnapshot,
       primaryMetricUnit: 's_per_100m',
       primaryMetric: swimmingCss,
-      activityCountUsed: activityCountForSport(activities, 'swimming'),
+      activityCountUsed: activityCountForSport(activities, 'swimming', qualities),
       lastActivityAt,
     }),
     upsertSport({
@@ -258,7 +314,7 @@ export async function updateUserProfile(
       snapshot: cyclingSnapshot,
       primaryMetricUnit: 'watts',
       primaryMetric: cyclingFtp,
-      activityCountUsed: activityCountForSport(activities, 'cycling'),
+      activityCountUsed: activityCountForSport(activities, 'cycling', qualities),
       lastActivityAt,
     }),
   ]);
@@ -303,9 +359,13 @@ function anchorSport(anchor: Anchor): 'running' | 'swimming' | 'cycling' {
   return 'cycling';
 }
 
-function latestActivityAt(activities: NormalizedActivity[]): Date | null {
+function latestActivityAt(
+  activities: NormalizedActivity[],
+  qualities: Map<string, QualityResult>,
+): Date | null {
   let latest: Date | null = null;
   for (const activity of activities) {
+    if (qualities.get(activity.id)?.confidence === 'low') continue;
     const date = activity.startTimeLocal;
     if (date && !Number.isNaN(date.getTime()) && (!latest || date > latest)) {
       latest = date;
@@ -317,8 +377,36 @@ function latestActivityAt(activities: NormalizedActivity[]): Date | null {
 function activityCountForSport(
   activities: NormalizedActivity[],
   sport: 'running' | 'swimming' | 'cycling',
+  qualities: Map<string, QualityResult>,
 ): number {
-  return activities.filter((activity) => activity.sport === sport).length;
+  return activities.filter(
+    (activity) =>
+      activity.sport === sport &&
+      qualities.get(activity.id)?.confidence !== 'low',
+  ).length;
+}
+
+function validMetric(value: number | null | undefined): value is number {
+  return value !== null && value !== undefined && Number.isFinite(value) && value > 0;
+}
+
+function medianNumber(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+function percentileNumber(values: number[], q: number): number | null {
+  if (values.length === 0) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const idx = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.round((sorted.length - 1) * q)),
+  );
+  return sorted[idx];
 }
 
 async function upsertSport(args: {

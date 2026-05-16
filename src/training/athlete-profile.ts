@@ -509,19 +509,13 @@ function deriveRunning(
     0.65,
   );
 
-  // Tempo: spec says +15-30 s/km off threshold, or labelled tempo runs.
-  const tempoPool = byStim.get('tempo') ?? [];
-  let tempoMedian = median(tempoPool);
-  if (tempoMedian === null && thresholdMedian !== null) {
-    tempoMedian = thresholdMedian + 22;
-  }
-
-  // VO2: from labelled vo2max efforts, or threshold - 35.
-  const vo2Pool = byStim.get('vo2max') ?? [];
-  let vo2Median = median(vo2Pool);
-  if (vo2Median === null && thresholdMedian !== null) {
-    vo2Median = thresholdMedian - 35;
-  }
+  // Tempo / VO2 are prescribed from the resolved threshold pace. Activity-level
+  // Garmin stimulus labels describe the whole workout, so labelled tempo/VO2
+  // averages are fallback evidence only when threshold is unavailable.
+  const tempoMedian =
+    thresholdMedian !== null ? thresholdMedian + 22 : median(byStim.get('tempo') ?? []);
+  const vo2Median =
+    thresholdMedian !== null ? thresholdMedian - 35 : median(byStim.get('vo2max') ?? []);
 
   // Easy fallback and Firstbeat-inspired sanity: easy pace must be clearly
   // slower than threshold. If Garmin-labelled "aerobic" samples are too close
