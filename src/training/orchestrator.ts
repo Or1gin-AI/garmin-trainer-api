@@ -59,6 +59,10 @@ import {
   summarizeSchedule,
 } from './tool-event-labels.js';
 import type { ToolEventPayload } from '../lib/sse.js';
+import {
+  estimateWeeklyTrainingLoad,
+  estimateWorkoutTrainingLoad,
+} from './load-estimator.js';
 import crypto from 'node:crypto';
 
 // ---------------------------------------------------------------------------
@@ -92,6 +96,9 @@ export interface ModelMeta {
   parameterizerLlmCount: number;
   parameterizerFallbackCount: number;
   summarySource: 'llm' | 'deterministic';
+  estimatedTrainingLoad?: {
+    estimated: number;
+  };
 }
 
 export interface GeneratedPlan {
@@ -158,6 +165,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
   );
   schedule = applyExplicitWorkoutRequirements(schedule, request, requestIntent, trainingCapacity);
   schedule = normalizeDoubleDayVariety(schedule, request, athleteProfile, trainingCapacity);
+  schedule = normalizeStandaloneDoubleThreshold(schedule);
   schedule = enforceUserHardWorkoutLayout(schedule, request, requestIntent);
   schedule = appendForcedScheduleRiskNotes(schedule, request, recentState, trainingCapacity);
 
@@ -207,6 +215,10 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
     recentState,
   );
   enforceWeeklyDurationLimit(schedule, workouts, request);
+  let loadTargetMeta = annotateWeeklyLoadEstimate({
+    schedule,
+    workouts,
+  });
 
   // Stage 3: validate + retry-with-downgrade.
   const baseCap = computeBaseCap(request, athleteProfile, recentState, trainingCapacity);
@@ -280,6 +292,11 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
       llmParamCount = Math.max(0, llmParamCount - 1);
     }
     if (mutated) {
+      enforceWeeklyDurationLimit(schedule, workouts, request);
+      loadTargetMeta = annotateWeeklyLoadEstimate({
+        schedule,
+        workouts,
+      });
       violations = validatePlan({
         schedule: schedule.days,
         workouts,
@@ -340,6 +357,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
       parameterizerLlmCount: llmParamCount,
       parameterizerFallbackCount: fallbackParamCount,
       summarySource: summaryStage.source,
+      estimatedTrainingLoad: loadTargetMeta,
     },
   };
 }
@@ -621,9 +639,14 @@ function shouldAutoScheduleDoubleThreshold(args: {
   const { request, athleteProfile, recentState, trainingCapacity, forceRequestedSchedule } = args;
   if (!request.sports.running) return false;
   if (request.allowAdvancedWorkouts !== true || request.allowDoubleDays !== true) return false;
-  if (request.maxHardSessionsPerWeek === 0) return false;
+  const hardCap =
+    request.maxHardSessionsPerWeek ??
+    trainingCapacity?.guardrails.maxHardSessionsPerWeek ??
+    2;
+  if (hardCap < 3) return false;
+  if (request.daysPerWeek < 6) return false;
   if (!hasLongSameDayTrainingWindow(request)) return false;
-  if (forceRequestedSchedule) return true;
+  if (forceRequestedSchedule && hasExplicitDoubleThresholdRequest(request)) return true;
   if (athleteProfile.experienceLevel !== 'advanced') return false;
   if (recentState.fatigue !== 'fresh' && recentState.fatigue !== 'normal') return false;
   if (trainingCapacity) {
@@ -845,6 +868,42 @@ function normalizeDoubleDayVariety(
     }
   }
 
+  return changed ? { days: sortScheduleEntries(days), notes } : schedule;
+}
+
+function normalizeStandaloneDoubleThreshold(schedule: ScheduleResult): ScheduleResult {
+  const days = schedule.days.slice();
+  const notes = schedule.notes.slice();
+  const doubleDays = new Map<number, Set<string>>();
+  let changed = false;
+
+  for (const entry of days) {
+    if (!isDoubleThresholdTemplate(entry.templateId)) continue;
+    const set = doubleDays.get(entry.dayIndex) ?? new Set<string>();
+    set.add(entry.templateId);
+    doubleDays.set(entry.dayIndex, set);
+  }
+
+  for (let index = 0; index < days.length; index += 1) {
+    const entry = days[index];
+    if (!isDoubleThresholdTemplate(entry.templateId)) continue;
+    const set = doubleDays.get(entry.dayIndex);
+    const paired =
+      set?.has('run.double_threshold_am.v1') === true &&
+      set?.has('run.double_threshold_pm.v1') === true;
+    if (paired) continue;
+    days[index] = {
+      ...entry,
+      sport: 'running',
+      templateId: 'run.threshold.v1',
+      reason: `${entry.reason ?? ''} 双阈值模板需要上午/下午成对出现，已改为单次阈值课。`.trim(),
+    };
+    changed = true;
+  }
+
+  if (changed) {
+    notes.push('检测到孤立双阈值模板，已改为普通阈值课，避免生成语义不完整的训练。');
+  }
   return changed ? { days: sortScheduleEntries(days), notes } : schedule;
 }
 
@@ -1678,6 +1737,38 @@ function decideProgression(
     return 'aggressive';
   }
   return 'normal';
+}
+
+interface WeeklyLoadEstimateMeta {
+  estimated: number;
+}
+
+function annotateWeeklyLoadEstimate(args: {
+  schedule: ScheduleResult;
+  workouts: ParameterizedWorkout[];
+}): WeeklyLoadEstimateMeta {
+  const { schedule, workouts } = args;
+  annotateEstimatedWorkoutLoads(workouts);
+  const estimate = estimateWeeklyTrainingLoad(workouts).trainingLoad;
+  schedule.notes.push(`预计 Garmin 周训练负荷约 ${estimate}。`);
+  return { estimated: estimate };
+}
+
+function annotateEstimatedWorkoutLoads(workouts: ParameterizedWorkout[]): void {
+  for (let i = 0; i < workouts.length; i += 1) {
+    const estimate = estimateWorkoutTrainingLoad(workouts[i]);
+    workouts[i] = {
+      ...workouts[i],
+      parameterSource: {
+        ...workouts[i].parameterSource,
+        replacedVariables: {
+          ...workouts[i].parameterSource.replacedVariables,
+          __estimated_training_load: estimate.trainingLoad,
+          __estimated_load_tag: estimate.tag,
+        },
+      },
+    };
+  }
 }
 
 function enforceWeeklyDurationLimit(

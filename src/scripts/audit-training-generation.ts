@@ -120,7 +120,6 @@ function makeRequest(overrides: Partial<ScheduleRequest>): ScheduleRequest {
     preferredTrainingWindows: [],
     dailyPreferredMinutes: 60,
     weeklyMaxMinutes: 420,
-    expectedLoad: null,
     allowAdvancedWorkouts: false,
     allowDoubleDays: false,
     forceRequestedSchedule: true,
@@ -554,6 +553,10 @@ function scenarioRequests(): Array<{ name: string; request: ScheduleRequest; rec
 
 function auditGeneratedPlan(name: string, plan: GeneratedPlan, request: ScheduleRequest): string[] {
   const failures: string[] = [];
+  const estimatedLoad = plan.modelMeta.estimatedTrainingLoad?.estimated;
+  if (!Number.isFinite(estimatedLoad) || estimatedLoad === undefined || estimatedLoad <= 0) {
+    failures.push(`${name}: missing estimated weekly training load`);
+  }
   const activeMinutes = plan.workouts.reduce((sum, workout, index) => {
     const sport = plan.schedule.days[index]?.sport;
     return sport === 'rest' || sport === 'mobility' ? sum : sum + workout.durationMinutes;
@@ -584,6 +587,14 @@ function auditGeneratedPlan(name: string, plan: GeneratedPlan, request: Schedule
     }
     if (day.sport !== 'rest' && day.sport !== 'mobility' && !enabled.has(day.sport as ActiveSport)) {
       failures.push(`${name}: scheduled disabled sport ${day.sport}`);
+    }
+  }
+  for (const workout of plan.workouts) {
+    const load = workout.parameterSource.replacedVariables.__estimated_training_load;
+    if (workout.sport !== 'rest' && workout.sport !== 'mobility') {
+      if (typeof load !== 'number' || !Number.isFinite(load) || load <= 0) {
+        failures.push(`${name}: ${workout.templateId} missing per-workout estimated load`);
+      }
     }
   }
 

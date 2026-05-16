@@ -63,7 +63,6 @@ export interface ScheduleRequest {
   preferredTrainingWindows?: string[];
   dailyPreferredMinutes?: number | null;
   weeklyMaxMinutes?: number | null;
-  expectedLoad?: number | null;
   allowAdvancedWorkouts?: boolean;
   allowDoubleDays?: boolean;
   forceRequestedSchedule?: boolean;
