@@ -1,4 +1,6 @@
 import type { ParameterizedWorkout } from './parameterizer.js';
+import type { NormalizedActivity } from './activity-normalizer.js';
+import type { QualityResult } from './activity-quality.js';
 
 export type TrainingLoadTag =
   | 'recovery'
@@ -8,6 +10,16 @@ export type TrainingLoadTag =
   | 'threshold'
   | 'vo2'
   | 'anaerobic';
+
+const TRAINING_LOAD_TAGS: readonly TrainingLoadTag[] = [
+  'recovery',
+  'easy',
+  'long',
+  'tempo',
+  'threshold',
+  'vo2',
+  'anaerobic',
+];
 
 export interface WorkoutLoadEstimate {
   trainingLoad: number;
@@ -25,6 +37,18 @@ export interface WeeklyLoadEstimate {
   workouts: WorkoutLoadEstimate[];
 }
 
+export interface TrainingLoadCalibrationEntry {
+  samples: number;
+  medianLoad: number;
+  medianMinutes: number;
+  medianLoadPerMinute: number;
+  source: 'direct' | 'sport_low' | 'sport_high' | 'sport_all';
+}
+
+export type TrainingLoadCalibration = Partial<
+  Record<string, Partial<Record<TrainingLoadTag, TrainingLoadCalibrationEntry>>>
+>;
+
 const SPORT_FACTOR: Record<string, number> = {
   running: 1.95,
   cycling: 1.55,
@@ -39,7 +63,13 @@ const SPORT_TAG_FACTOR: Partial<Record<string, Partial<Record<TrainingLoadTag, n
     // race-effort proxies of similar total duration.
     recovery: 1.5,
     easy: 1.6,
+    long: 1.45,
     threshold: 1.65,
+  },
+  cycling: {
+    recovery: 1.0,
+    easy: 1.05,
+    long: 0.95,
   },
 };
 
@@ -53,17 +83,33 @@ const TAG_COEFFICIENT: Record<TrainingLoadTag, number> = {
   anaerobic: 2.75,
 };
 
+const TAG_STIMULI: Record<TrainingLoadTag, readonly string[]> = {
+  recovery: ['recovery'],
+  easy: ['aerobic'],
+  long: ['long_endurance', 'aerobic'],
+  tempo: ['tempo'],
+  threshold: ['threshold'],
+  vo2: ['vo2max'],
+  anaerobic: ['anaerobic', 'sprint'],
+};
+
 export function estimateWeeklyTrainingLoad(
   workouts: readonly ParameterizedWorkout[],
+  calibration?: TrainingLoadCalibration,
 ): WeeklyLoadEstimate {
-  const estimates = workouts.map(estimateWorkoutTrainingLoad);
+  const estimates = workouts.map((workout) =>
+    estimateWorkoutTrainingLoad(workout, calibration),
+  );
   return {
     trainingLoad: roundLoad(estimates.reduce((sum, e) => sum + e.trainingLoad, 0)),
     workouts: estimates,
   };
 }
 
-export function estimateWorkoutTrainingLoad(workout: ParameterizedWorkout): WorkoutLoadEstimate {
+export function estimateWorkoutTrainingLoad(
+  workout: ParameterizedWorkout,
+  calibration?: TrainingLoadCalibration,
+): WorkoutLoadEstimate {
   const minutes = positiveNumber(workout.durationMinutes);
   if (minutes <= 0 || workout.sport === 'rest' || workout.sport === 'mobility') {
     return {
@@ -92,7 +138,10 @@ export function estimateWorkoutTrainingLoad(workout: ParameterizedWorkout): Work
     tag === 'threshold' ? 1.08 :
     tag === 'vo2' ? 1.03 :
     1;
-  const trainingLoad = roundLoad(raw * sportFactor * continuity);
+  const baseLoad = raw * sportFactor * continuity;
+  const trainingLoad = roundLoad(
+    applyTrainingLoadCalibration(baseLoad, workout.sport, tag, minutes, calibration),
+  );
   return {
     trainingLoad,
     tag,
@@ -100,6 +149,74 @@ export function estimateWorkoutTrainingLoad(workout: ParameterizedWorkout): Work
     ...structure,
     loadPerMinute: minutes > 0 ? trainingLoad / minutes : 0,
   };
+}
+
+export function buildTrainingLoadCalibration(
+  activities: readonly NormalizedActivity[],
+  qualities?: ReadonlyMap<string, QualityResult>,
+): TrainingLoadCalibration {
+  const rows = activities
+    .filter((activity) => {
+      if (
+        !activity.sport ||
+        (activity.sport !== 'running' && activity.sport !== 'cycling' && activity.sport !== 'swimming')
+      ) {
+        return false;
+      }
+      if (!Number.isFinite(activity.durationMin) || activity.durationMin < 10) return false;
+      if (activity.trainingLoad === null || !Number.isFinite(activity.trainingLoad) || activity.trainingLoad < 50) return false;
+      const quality = qualities?.get(activity.id);
+      return quality?.confidence !== 'low';
+    })
+    .map((activity) => ({
+      sport: activity.sport,
+      stimulus: normalizeStimulus(activity),
+      minutes: activity.durationMin,
+      load: activity.trainingLoad as number,
+    }));
+
+  const out: TrainingLoadCalibration = {};
+  for (const sport of ['running', 'cycling', 'swimming'] as const) {
+    const sportRows = rows.filter((row) => row.sport === sport);
+    if (sportRows.length === 0) continue;
+    out[sport] = {};
+    for (const tag of TRAINING_LOAD_TAGS) {
+      const direct = sportRows.filter((row) => stimulusMatchesTag(row, tag));
+      const low = sportRows.filter((row) => isLowStimulus(row.stimulus));
+      const high = sportRows.filter((row) => isHighStimulus(row.stimulus));
+      const pool =
+        direct.length >= 2
+          ? direct
+          : isLowTag(tag) && low.length >= 2
+            ? low
+            : isHighTag(tag) && high.length >= 2
+              ? high
+              : sportRows.length >= 2
+                ? sportRows
+                : direct;
+      if (pool.length < 2) continue;
+      const source: TrainingLoadCalibrationEntry['source'] =
+        pool === direct ? 'direct' :
+        pool === low ? 'sport_low' :
+        pool === high ? 'sport_high' :
+        'sport_all';
+      const loads = pool.map((row) => row.load);
+      const minutes = pool.map((row) => row.minutes);
+      const lpms = pool.map((row) => row.load / row.minutes).filter(Number.isFinite);
+      const medianLoad = median(loads);
+      const medianMinutes = median(minutes);
+      const medianLoadPerMinute = median(lpms);
+      if (medianLoad === null || medianMinutes === null || medianLoadPerMinute === null) continue;
+      out[sport][tag] = {
+        samples: pool.length,
+        medianLoad: roundTo(medianLoad, 1),
+        medianMinutes: roundTo(medianMinutes, 1),
+        medianLoadPerMinute: roundTo(medianLoadPerMinute, 3),
+        source,
+      };
+    }
+  }
+  return out;
 }
 
 export function classifyWorkoutLoadTag(workout: ParameterizedWorkout): TrainingLoadTag {
@@ -125,6 +242,98 @@ export function classifyWorkoutLoadTag(workout: ParameterizedWorkout): TrainingL
   if (workout.intensity === 'low') return 'easy';
   if (workout.intensity === 'medium') return 'tempo';
   return 'threshold';
+}
+
+function applyTrainingLoadCalibration(
+  baseLoad: number,
+  sport: string,
+  tag: TrainingLoadTag,
+  minutes: number,
+  calibration?: TrainingLoadCalibration,
+): number {
+  const entry = calibration?.[sport]?.[tag];
+  if (!entry || entry.samples < 2 || entry.medianLoad <= 0 || entry.medianMinutes <= 0) {
+    return baseLoad;
+  }
+
+  const target = isLowTag(tag)
+    ? entry.medianLoadPerMinute * minutes
+    : highIntensityCalibrationTarget(entry, minutes);
+  if (!Number.isFinite(target) || target <= 0) return baseLoad;
+
+  const direct = entry.source === 'direct';
+  const sampleWeight = isLowTag(tag)
+    ? Math.min(1, 0.55 + entry.samples / 12)
+    : Math.min(1, Math.max(0, entry.samples / 6));
+  const weight = isLowTag(tag)
+    ? (direct ? 0.72 : 0.5) * sampleWeight
+    : (direct ? 0.36 : 0.26) * sampleWeight;
+  const blended = baseLoad * (1 - weight) + target * weight;
+  const minFactor = isLowTag(tag) ? 0.55 : 0.75;
+  const maxFactor = isLowTag(tag) ? 1.8 : 1.35;
+  return clamp(blended, baseLoad * minFactor, baseLoad * maxFactor);
+}
+
+function highIntensityCalibrationTarget(
+  entry: TrainingLoadCalibrationEntry,
+  minutes: number,
+): number {
+  const ratio = minutes / entry.medianMinutes;
+  if (!Number.isFinite(ratio) || ratio <= 0) return entry.medianLoad;
+  // Garmin's load response for quality sessions is not linear in total
+  // duration: warmup/cooldown and recoveries grow with the workout. Scale
+  // recent hard-session load sub-linearly so short intense samples do not
+  // explode longer planned threshold/VO2 sessions.
+  return entry.medianLoad * Math.sqrt(ratio);
+}
+
+function normalizeStimulus(activity: NormalizedActivity): string {
+  const label = `${activity.trainingEffectLabel ?? ''} ${activity.primaryBenefit ?? ''}`.toLowerCase();
+  if (label.includes('recovery')) return 'recovery';
+  if (label.includes('long')) return 'long_endurance';
+  if (label.includes('anaerobic')) return 'anaerobic';
+  if (label.includes('sprint')) return 'sprint';
+  if (label.includes('vo2')) return 'vo2max';
+  if (label.includes('threshold') || label.includes('lactate')) return 'threshold';
+  if (label.includes('tempo')) return 'tempo';
+  if (label.includes('aerobic') || label.includes('base')) return 'aerobic';
+  const aer = activity.aerobicTrainingEffect ?? 0;
+  const ana = activity.anaerobicTrainingEffect ?? 0;
+  if (ana >= 2.5) return 'anaerobic';
+  if (aer >= 4.2) return 'vo2max';
+  if (aer >= 3.5) return 'threshold';
+  if (aer >= 3.0) return 'tempo';
+  if (aer > 0 && aer < 2.2) return 'recovery';
+  return 'aerobic';
+}
+
+function stimulusMatchesTag(
+  row: { stimulus: string; minutes: number },
+  tag: TrainingLoadTag,
+): boolean {
+  if (tag === 'long') {
+    return (
+      row.stimulus === 'long_endurance' ||
+      (row.stimulus === 'aerobic' && row.minutes >= 75)
+    );
+  }
+  return TAG_STIMULI[tag].includes(row.stimulus);
+}
+
+function isLowTag(tag: TrainingLoadTag): boolean {
+  return tag === 'recovery' || tag === 'easy' || tag === 'long';
+}
+
+function isHighTag(tag: TrainingLoadTag): boolean {
+  return !isLowTag(tag);
+}
+
+function isLowStimulus(stimulus: string): boolean {
+  return stimulus === 'recovery' || stimulus === 'aerobic' || stimulus === 'long_endurance';
+}
+
+function isHighStimulus(stimulus: string): boolean {
+  return stimulus === 'tempo' || stimulus === 'threshold' || stimulus === 'vo2max' || stimulus === 'anaerobic' || stimulus === 'sprint';
 }
 
 function inferStructureMinutes(
@@ -258,6 +467,23 @@ function positiveNumber(value: unknown): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function median(values: readonly number[]): number | null {
+  const sorted = values
+    .filter((value) => Number.isFinite(value))
+    .slice()
+    .sort((a, b) => a - b);
+  if (sorted.length === 0) return null;
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[mid]
+    : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function roundTo(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
 }
 
 function roundLoad(value: number): number {

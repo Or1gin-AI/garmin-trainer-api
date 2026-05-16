@@ -77,6 +77,7 @@ import {
   InvalidLlmWorkoutError,
 } from '../training/llm-parameterizer.js';
 import { renderIntervalsIcu } from '../training/intervals-icu.js';
+import { buildTrainingLoadCalibration } from '../training/load-estimator.js';
 
 export const trainingRouter = Router();
 
@@ -272,8 +273,12 @@ async function loadDerivedContext(
     qualities,
     asOf: new Date(),
   });
-  const { profile: athleteProfile, isColdStart } =
+  const { profile: loadedProfile, isColdStart } =
     await loadAthleteProfileFromDb(userId, parseInjuries(request.injuries));
+  const athleteProfile: AthleteProfile = {
+    ...loadedProfile,
+    trainingLoadCalibration: buildTrainingLoadCalibration(activities, qualities),
+  };
 
   emitFn({
     id: profileId,

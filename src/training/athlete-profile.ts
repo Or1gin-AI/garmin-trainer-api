@@ -10,6 +10,7 @@
 import type { NormalizedActivity, NormalizedSport } from './activity-normalizer.js';
 import type { QualityResult } from './activity-quality.js';
 import { classifyStimulus } from './recent-state.js';
+import type { TrainingLoadCalibration } from './load-estimator.js';
 import type {
   GarminHeartRateZoneSet,
   GarminPhysiologyMetrics,
@@ -86,6 +87,7 @@ export interface AthleteProfile {
   running: AthleteProfileRunning;
   cycling: AthleteProfileCycling;
   swimming: AthleteProfileSwimming;
+  trainingLoadCalibration?: TrainingLoadCalibration;
   injuries: string[];
   experienceLevel: 'beginner' | 'intermediate' | 'advanced';
 }

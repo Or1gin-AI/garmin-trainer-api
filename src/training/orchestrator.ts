@@ -218,6 +218,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
   let loadTargetMeta = annotateWeeklyLoadEstimate({
     schedule,
     workouts,
+    athleteProfile,
   });
 
   // Stage 3: validate + retry-with-downgrade.
@@ -296,6 +297,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
       loadTargetMeta = annotateWeeklyLoadEstimate({
         schedule,
         workouts,
+        athleteProfile,
       });
       violations = validatePlan({
         schedule: schedule.days,
@@ -1933,17 +1935,27 @@ interface WeeklyLoadEstimateMeta {
 function annotateWeeklyLoadEstimate(args: {
   schedule: ScheduleResult;
   workouts: ParameterizedWorkout[];
+  athleteProfile: AthleteProfile;
 }): WeeklyLoadEstimateMeta {
-  const { schedule, workouts } = args;
-  annotateEstimatedWorkoutLoads(workouts);
-  const estimate = estimateWeeklyTrainingLoad(workouts).trainingLoad;
+  const { schedule, workouts, athleteProfile } = args;
+  annotateEstimatedWorkoutLoads(workouts, athleteProfile);
+  const estimate = estimateWeeklyTrainingLoad(
+    workouts,
+    athleteProfile.trainingLoadCalibration,
+  ).trainingLoad;
   schedule.notes.push(`预计 Garmin 周训练负荷约 ${estimate}。`);
   return { estimated: estimate };
 }
 
-function annotateEstimatedWorkoutLoads(workouts: ParameterizedWorkout[]): void {
+function annotateEstimatedWorkoutLoads(
+  workouts: ParameterizedWorkout[],
+  athleteProfile: AthleteProfile,
+): void {
   for (let i = 0; i < workouts.length; i += 1) {
-    const estimate = estimateWorkoutTrainingLoad(workouts[i]);
+    const estimate = estimateWorkoutTrainingLoad(
+      workouts[i],
+      athleteProfile.trainingLoadCalibration,
+    );
     workouts[i] = {
       ...workouts[i],
       parameterSource: {
