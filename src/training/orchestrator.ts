@@ -2031,8 +2031,11 @@ function adjustWorkoutDuration(
     mode === 'target'
       ? `总时长 ${durationMinutes} 分钟（已按周目标 ${weeklyLimit} 分钟分配）`
       : `总时长 ${durationMinutes} 分钟（已按周上限 ${weeklyLimit} 分钟控制）`,
-    ...(workout.targets ?? []).filter((t) => !/^总时长\s*\d+\s*分钟/.test(t)),
+    ...(workout.targets ?? []).filter((t) => !/^总时长\s*\d+\s*分钟/.test(t) && !/^参考距离/.test(t)),
   ];
+  if (distanceKm !== null && distanceKm > 0) {
+    targets.splice(1, 0, `参考距离 ${distanceKm.toFixed(1)} 公里`);
+  }
   return {
     ...workout,
     durationMinutes,

@@ -338,11 +338,11 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
     scheduleEntry.durationCapMinutes ?? null,
   );
 
-  // Distance.
-  const distanceKm =
+  const parsedDistanceKm =
     typeof parsed.distanceKm === 'number' && Number.isFinite(parsed.distanceKm)
       ? Math.round(parsed.distanceKm * 100) / 100
       : null;
+  const distanceKm = sanitizeLlmDistanceKm(template, parsedDistanceKm);
 
   // Strings — coerce undefined to NA / empty, then format-validate.
   const targetHeartRate = typeof parsed.targetHeartRate === 'string' && parsed.targetHeartRate.trim()
@@ -361,8 +361,11 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
     ? parsed.adaptation.trim()
     : (template.fixed.notes ?? '');
   const targets: string[] = Array.isArray(parsed.targets)
-    ? parsed.targets.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+    ? parsed.targets.filter((t): t is string => isUsefulTarget(t))
     : [];
+  if (distanceKm !== null && distanceKm > 0 && !targets.some((t) => /^参考距离/.test(t))) {
+    targets.splice(1, 0, `参考距离 ${distanceKm.toFixed(1)} 公里`);
+  }
 
   const isRest = sport === 'rest' || sport === 'mobility';
 
@@ -455,6 +458,21 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
     },
     adaptation,
   };
+}
+
+function sanitizeLlmDistanceKm(template: WorkoutTemplate, distanceKm: number | null): number | null {
+  if (distanceKm === null || distanceKm <= 0) return null;
+  if (template.fixed.sport !== 'running') return distanceKm;
+  if (template.fixed.workoutType === 'recovery') return null;
+  if (template.fixed.primaryMetric !== 'pace') return null;
+  return distanceKm;
+}
+
+function isUsefulTarget(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  if (!text) return false;
+  return !/^参考距离/.test(text);
 }
 
 function pickValidTargetMetric(

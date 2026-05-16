@@ -31,14 +31,12 @@ const SPORT_FACTOR: Record<string, number> = {
   swimming: 1.2,
 };
 
-// Calibrated from real Garmin activity rows with training_load > 50.
-// Plain aerobic running is materially lower than the mixed running average:
-// combined easy/long proxy median ~= 1.34 load/min and P75 ~= 1.66 load/min
-// across the local + Porrima samples, while tempo/threshold samples remain
-// much higher. Keep this as a tag-specific override so hard running workouts
-// still use the broader running factor.
 const SPORT_TAG_FACTOR: Partial<Record<string, Partial<Record<TrainingLoadTag, number>>>> = {
   running: {
+    // User-specific calibration should eventually supersede this global prior.
+    // This prior intentionally covers only low-intensity running; hard running
+    // workouts still use the broader running factor and interval structure.
+    recovery: 1.5,
     easy: 1.6,
   },
 };
@@ -142,7 +140,8 @@ function inferStructureMinutes(
   let recoveryMinutes = 0;
 
   if (mainDuration > 0) {
-    if (tag === 'tempo') hardMinutes = mainDuration * 0.62;
+    if (tag === 'recovery') recoveryMinutes = minutes * 0.75;
+    else if (tag === 'tempo') hardMinutes = mainDuration * 0.62;
     else if (tag === 'threshold') hardMinutes = mainDuration * 0.72;
     else if (tag === 'vo2') {
       hardMinutes = mainDuration * 0.48;

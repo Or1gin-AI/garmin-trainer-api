@@ -951,13 +951,15 @@ function estimateDistanceKm(
     if (totalMeters > 0) return Math.round(totalMeters) / 1000;
     return null;
   }
-  // Running: estimate from easyPace + duration (rough).
+  // Running: only show a reference distance when it is a real planned volume.
+  // Recovery pace caps and structured intervals are execution constraints, not
+  // a reliable total distance estimate.
   if (template.fixed.sport === 'running') {
+    if (template.fixed.workoutType === 'recovery') return null;
     const pace =
       resolved.get('targetPace') ??
       resolved.get('easyPace') ??
-      resolved.get('longPaceCap') ??
-      resolved.get('targetPaceCap');
+      resolved.get('longPaceCap');
     let secPerKm: number | null = null;
     if (pace && pace.kind === 'number' && (pace.unit === 's/km' || pace.unit === 's/km_upper' || pace.unit === undefined)) {
       secPerKm = pace.value;
