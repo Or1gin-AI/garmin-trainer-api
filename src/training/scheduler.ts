@@ -124,6 +124,8 @@ const NEGATED_REST_INTENT_RE = /(不|别|不要|不能|不可|no|not|don'?t)\s*(
 
 const HARD_STIMULI: ReadonlySet<string> = new Set(['threshold', 'vo2max', 'anaerobic']);
 export const MAX_WEEKLY_TRAINING_MINUTES = 1200;
+const MIN_MEANINGFUL_LONG_RUN_MINUTES = 70;
+const MIN_MEANINGFUL_LONG_RIDE_MINUTES = 90;
 
 // Default rest-day arrangement (1-indexed) for each daysPerWeek.
 // Spec: rest day is preferred on Monday (recovery from weekend) and Sunday
@@ -586,6 +588,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
     !input.longRunScheduled &&
     (!input.prevIntensityHigh || input.forceRequestedSchedule) &&
     allowedIds.has('run.lsd.v1') &&
+    hasMeaningfulLongSessionTime(input, 'run.lsd.v1') &&
     // Mid/late week is a better LSD slot than day 1.
     input.dayIndex >= 4 &&
     (!recentHardCooldown || input.forceRequestedSchedule)
@@ -601,6 +604,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
     !input.longRideScheduled &&
     (!input.prevIntensityHigh || input.forceRequestedSchedule) &&
     allowedIds.has('bike.long_ride.v1') &&
+    hasMeaningfulLongSessionTime(input, 'bike.long_ride.v1') &&
     input.dayIndex >= 4 &&
     (!recentHardCooldown || input.forceRequestedSchedule)
   ) {
@@ -648,6 +652,22 @@ function pickTemplateForDay(input: PickInput): PickOutput {
 
   // Fallback: aerobic for the sport, otherwise recovery.
   return forceAerobic(input.sport, allowedIds, '默认有氧。');
+}
+
+function hasMeaningfulLongSessionTime(input: PickInput, templateId: string): boolean {
+  const preferred = input.request.dailyPreferredMinutes;
+  if (preferred === null || preferred === undefined || !Number.isFinite(preferred) || preferred <= 0) {
+    return true;
+  }
+  const tpl = getTemplate(templateId);
+  const fallback =
+    templateId === 'run.lsd.v1'
+      ? MIN_MEANINGFUL_LONG_RUN_MINUTES
+      : templateId === 'bike.long_ride.v1'
+        ? MIN_MEANINGFUL_LONG_RIDE_MINUTES
+        : tpl?.fixed.minDurationMinutes ?? 0;
+  const minimum = Math.max(0, tpl?.fixed.minDurationMinutes ?? fallback, fallback);
+  return preferred >= minimum;
 }
 
 // Rotation order tries a balanced mix; harder templates are surfaced on

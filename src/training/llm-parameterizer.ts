@@ -331,12 +331,7 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
   const parsedDurationMinutes = Number.isFinite(parsed.durationMinutes)
     ? Math.max(0, Math.round(parsed.durationMinutes ?? 0))
     : 0;
-  const durationMinutes = applyPreferredDuration(
-    template,
-    parsedDurationMinutes,
-    request.dailyPreferredMinutes ?? null,
-    scheduleEntry.durationCapMinutes ?? null,
-  );
+  const durationMinutes = parsedDurationMinutes;
 
   const parsedDistanceKm =
     typeof parsed.distanceKm === 'number' && Number.isFinite(parsed.distanceKm)
@@ -484,39 +479,6 @@ function pickValidTargetMetric(
     if (template.fixed.allowedMetrics.includes(cast)) return cast;
   }
   return template.fixed.primaryMetric;
-}
-
-function applyPreferredDuration(
-  template: WorkoutTemplate,
-  durationMinutes: number,
-  preferredMinutes: number | null,
-  capacityCapMinutes: number | null,
-): number {
-  if (
-    template.fixed.sport === 'rest' ||
-    template.fixed.sport === 'mobility' ||
-    durationMinutes <= 0
-  ) {
-    return durationMinutes;
-  }
-  let resolved = durationMinutes;
-  if (
-    preferredMinutes !== null &&
-    Number.isFinite(preferredMinutes) &&
-    preferredMinutes > 0
-  ) {
-    resolved = Math.min(resolved, Math.round(preferredMinutes));
-  }
-  if (
-    capacityCapMinutes !== null &&
-    Number.isFinite(capacityCapMinutes) &&
-    capacityCapMinutes > 0
-  ) {
-    resolved = Math.min(resolved, Math.round(capacityCapMinutes));
-  }
-  const lower = Math.max(15, Math.min(template.fixed.minDurationMinutes, resolved));
-  const upper = Math.max(lower, template.fixed.maxDurationMinutes);
-  return Math.min(upper, Math.max(lower, resolved));
 }
 
 // ---------------------------------------------------------------------------

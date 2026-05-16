@@ -550,6 +550,43 @@ function validateAndBuildResult(args: ValidateArgs): ScheduleResult {
   const requestedTrainingDays = effectiveTrainingDaysPerWeek(request);
   const protectedTrainingDays = requestedTrainingDayIndexes(request);
   const enabledSports = collectEnabledSports(request);
+  const preferredMinutes =
+    request.dailyPreferredMinutes !== null &&
+    request.dailyPreferredMinutes !== undefined &&
+    Number.isFinite(request.dailyPreferredMinutes)
+      ? request.dailyPreferredMinutes
+      : null;
+  if (preferredMinutes !== null && preferredMinutes < 70) {
+    for (const entry of sortedEntries) {
+      if (entry.templateId === 'run.lsd.v1') {
+        violations.push(`day ${entry.dayIndex}: run.lsd.v1 requires at least 70 minutes; use run.aerobic.v1/recovery under ${preferredMinutes} minutes`);
+      }
+    }
+  }
+  if (preferredMinutes !== null && preferredMinutes < 25) {
+    for (const entry of sortedEntries) {
+      if (entry.templateId.startsWith('run.') && entry.templateId !== 'run.recovery.v1') {
+        violations.push(`day ${entry.dayIndex}: short running window should use run.recovery.v1, not ${entry.templateId}`);
+      }
+    }
+  }
+  if (preferredMinutes !== null && preferredMinutes < 30) {
+    for (const entry of sortedEntries) {
+      if (entry.templateId.startsWith('swim.') && entry.templateId !== 'swim.recovery.v1') {
+        violations.push(`day ${entry.dayIndex}: short swim window should use swim.recovery.v1, not ${entry.templateId}`);
+      }
+      if (entry.templateId.startsWith('bike.') && entry.templateId !== 'bike.recovery_spin.v1') {
+        violations.push(`day ${entry.dayIndex}: short bike window should use bike.recovery_spin.v1, not ${entry.templateId}`);
+      }
+    }
+  }
+  if (preferredMinutes !== null && preferredMinutes < 90) {
+    for (const entry of sortedEntries) {
+      if (entry.templateId === 'bike.long_ride.v1') {
+        violations.push(`day ${entry.dayIndex}: bike.long_ride.v1 requires at least 90 minutes; use bike.endurance.v1/recovery under ${preferredMinutes} minutes`);
+      }
+    }
+  }
   const activeTrainingCount = new Set(
     sortedEntries
       .filter((e) => !isRestLikeSport(e.sport))
@@ -814,6 +851,14 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     systemParts.push(
       `- 用户填写的 ${args.request.dailyPreferredMinutes} 分钟是训练日平均时长参考，不是单节硬上限；整体课表应让训练日平均时长接近该值。低强度 Z2/有氧/长距离课可以超过该值，高级用户的 Z2 骑行通常不应短于 75-90 分钟。不要为了凑时长拉长阈值/VO2/间歇主训练。`,
     );
+    systemParts.push(
+      '- 如果该时长低于长距离模板的最低可执行时长，不要把普通有氧课标成 long/LSD：跑步 run.lsd.v1 至少需要 70 分钟，骑行 bike.long_ride.v1 至少需要 90 分钟；更短时使用 aerobic/endurance/recovery 模板。',
+    );
+    if (args.request.dailyPreferredMinutes < 30) {
+      systemParts.push(
+        '- 用户单日时长非常短：优先使用 recovery/technique 模板，不要安排常规有氧、长距离或复杂质量课来硬塞进短窗口。',
+      );
+    }
   }
   if (args.isColdStart) {
     systemParts.push(

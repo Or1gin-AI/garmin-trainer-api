@@ -1825,12 +1825,14 @@ function enforceWeeklyDurationLimit(
       minSessionMinutes,
       candidate.minutes - Math.min(5, adjustedTotal - limit),
     );
-    workouts[candidate.index] = adjustWorkoutDuration(
+    const adjusted = adjustWorkoutDuration(
       workouts[candidate.index],
       nextMinutes,
       limit,
       'limit',
     );
+    if (adjusted.durationMinutes === workouts[candidate.index].durationMinutes) break;
+    workouts[candidate.index] = adjusted;
     adjustedTotal = activeWeeklyMinutes(schedule, workouts);
   }
 
@@ -1995,12 +1997,14 @@ function growExistingSessionsTowardsTarget(args: {
         const rounded = Math.max(current + 1, roundToFive(next));
         const nextMinutes = Math.min(cap, rounded, current + Math.max(5, target - total));
         if (nextMinutes <= current) continue;
-        workouts[item.index] = adjustWorkoutDuration(
+        const adjusted = adjustWorkoutDuration(
           workouts[item.index],
           nextMinutes,
           target,
           'target',
         );
+        if (adjusted.durationMinutes <= current) continue;
+        workouts[item.index] = adjusted;
         total = activeWeeklyMinutes(schedule, workouts);
         progressed = true;
         changed = true;
@@ -2019,9 +2023,14 @@ function adjustWorkoutDuration(
   const current = workout.durationMinutes;
   const durationMinutes = Math.max(0, Math.round(nextMinutes));
   if (durationMinutes === current) return workout;
+  const synced = workout.sport === 'swimming'
+    ? { ...workout, durationMinutes }
+    : syncSimpleMainDuration(workout, durationMinutes);
+  if (!synced) return workout;
+  const syncedDurationMinutes = synced.durationMinutes;
   const scale =
     current > 0 && workout.distanceKm !== null && workout.sport !== 'swimming'
-      ? durationMinutes / current
+      ? syncedDurationMinutes / current
       : null;
   const distanceKm =
     scale && Number.isFinite(scale)
@@ -2029,22 +2038,22 @@ function adjustWorkoutDuration(
       : workout.distanceKm;
   const targets = [
     mode === 'target'
-      ? `总时长 ${durationMinutes} 分钟（已按周目标 ${weeklyLimit} 分钟分配）`
-      : `总时长 ${durationMinutes} 分钟（已按周上限 ${weeklyLimit} 分钟控制）`,
+      ? `总时长 ${syncedDurationMinutes} 分钟（已按周目标 ${weeklyLimit} 分钟分配）`
+      : `总时长 ${syncedDurationMinutes} 分钟（已按周上限 ${weeklyLimit} 分钟控制）`,
     ...(workout.targets ?? []).filter((t) => !/^总时长\s*\d+\s*分钟/.test(t) && !/^参考距离/.test(t)),
   ];
   if (distanceKm !== null && distanceKm > 0) {
     targets.splice(1, 0, `参考距离 ${distanceKm.toFixed(1)} 公里`);
   }
   return {
-    ...workout,
-    durationMinutes,
+    ...synced,
+    durationMinutes: syncedDurationMinutes,
     distanceKm,
     targets,
     parameterSource: {
       ...workout.parameterSource,
       replacedVariables: {
-        ...workout.parameterSource.replacedVariables,
+        ...synced.parameterSource.replacedVariables,
         ...(mode === 'target'
           ? { __weekly_duration_target: weeklyLimit }
           : { __weekly_duration_limit: weeklyLimit }),
@@ -2052,6 +2061,70 @@ function adjustWorkoutDuration(
       },
     },
   };
+}
+
+function syncSimpleMainDuration(
+  workout: ParameterizedWorkout,
+  durationMinutes: number,
+): ParameterizedWorkout | null {
+  const template = getTemplate(workout.templateId);
+  const vars = workout.parameterSource.replacedVariables;
+  const currentMain = Number(vars.mainDuration);
+  if (
+    !template ||
+    !Number.isFinite(currentMain) ||
+    currentMain <= 0 ||
+    !template.fixed.phases.some(
+      (phase) => phase.name === 'main' && phase.duration?.trim() === '$mainDuration',
+    )
+  ) {
+    return null;
+  }
+
+  const fixedMinutes = workout.durationMinutes - currentMain;
+  const requestedMain = durationMinutes - fixedMinutes;
+  const nextMain =
+    requestedMain < 5 && durationMinutes < workout.durationMinutes
+      ? 5
+      : requestedMain;
+  if (!Number.isFinite(nextMain) || nextMain < 5) return null;
+
+  const roundedMain = Math.max(5, Math.round(nextMain));
+  const syncedDurationMinutes = Math.max(0, Math.round(fixedMinutes + roundedMain));
+  return {
+    ...workout,
+    durationMinutes: syncedDurationMinutes,
+    workoutStructure: replacePhaseDurationText(
+      workout.workoutStructure,
+      '主训练',
+      currentMain,
+      roundedMain,
+    ),
+    parameterSource: {
+      ...workout.parameterSource,
+      replacedVariables: {
+        ...vars,
+        mainDuration: roundedMain,
+      },
+    },
+  };
+}
+
+function replacePhaseDurationText(
+  structure: string,
+  phaseLabel: string,
+  oldMinutes: number,
+  newMinutes: number,
+): string {
+  const oldRounded = Math.round(oldMinutes);
+  const exact = new RegExp(`(${escapeRegExp(phaseLabel)}\\s+)${oldRounded}(\\s*分钟)`);
+  if (exact.test(structure)) return structure.replace(exact, `$1${newMinutes}$2`);
+  const fallback = new RegExp(`(${escapeRegExp(phaseLabel)}\\s+)\\d+(\\s*分钟)`);
+  return structure.replace(fallback, `$1${newMinutes}$2`);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function durationGrowthTier(workout: ParameterizedWorkout): 'low' | 'medium' | 'high' {

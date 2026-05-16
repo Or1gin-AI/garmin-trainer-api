@@ -108,11 +108,18 @@ export function parameterizeWorkout(args: ParameterizeArgs): ParameterizedWorkou
   // Compute durationMinutes by summing minute-quantified phases (and minute-
   // valued variables they reference) using the resolved values.
   const computedDurationMinutes = computeDurationMinutes(template, resolved, tuning);
-  const durationMinutes = applyPreferredDuration(
+  const preferredDurationMinutes = applyPreferredDuration(
     template,
     computedDurationMinutes,
     request.dailyPreferredMinutes ?? null,
     scheduleEntry.durationCapMinutes ?? null,
+  );
+  const durationMinutes = reconcilePreferredDuration(
+    template,
+    resolved,
+    replaced,
+    computedDurationMinutes,
+    preferredDurationMinutes,
   );
 
   // Build target strings.
@@ -894,6 +901,53 @@ function applyPreferredDuration(
   const lower = Math.max(15, Math.min(template.fixed.minDurationMinutes, resolved));
   const upper = Math.max(lower, template.fixed.maxDurationMinutes);
   return clamp(resolved, lower, upper);
+}
+
+function reconcilePreferredDuration(
+  template: WorkoutTemplate,
+  resolved: Map<string, ResolvedValue>,
+  replaced: Record<string, string | number>,
+  computedDurationMinutes: number,
+  preferredDurationMinutes: number,
+): number {
+  if (
+    preferredDurationMinutes === computedDurationMinutes ||
+    template.fixed.sport === 'rest' ||
+    template.fixed.sport === 'mobility'
+  ) {
+    return computedDurationMinutes;
+  }
+
+  const main = resolved.get('mainDuration');
+  if (!main || main.kind !== 'number' || main.unit !== 'minutes') {
+    return computedDurationMinutes;
+  }
+
+  const usesSimpleMainPhase = template.fixed.phases.some(
+    (phase) => phase.name === 'main' && phase.duration?.trim() === '$mainDuration',
+  );
+  if (!usesSimpleMainPhase) {
+    return computedDurationMinutes;
+  }
+
+  const fixedMinutes = computedDurationMinutes - main.value;
+  const requestedMain = preferredDurationMinutes - fixedMinutes;
+  const nextMain =
+    requestedMain < 5 && preferredDurationMinutes < computedDurationMinutes
+      ? 5
+      : requestedMain;
+  if (!Number.isFinite(nextMain) || nextMain < 5) {
+    return computedDurationMinutes;
+  }
+
+  const adjustedMain = roundSmart(nextMain);
+  resolved.set('mainDuration', {
+    kind: 'number',
+    value: adjustedMain,
+    unit: 'minutes',
+  });
+  replaced.mainDuration = adjustedMain;
+  return Math.max(0, Math.round(fixedMinutes + adjustedMain));
 }
 
 function resolvePhaseMinutes(
