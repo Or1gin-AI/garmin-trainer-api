@@ -261,7 +261,9 @@ export async function runChatTurn(
   }
 
   return {
-    assistantContent: assistantText,
+    assistantContent: assistantText.trim().length > 0
+      ? assistantText
+      : buildFallbackCoachReply(input, accumulatedToolCalls.length > 0),
     toolCalls: accumulatedToolCalls,
     meta: {
       provider: config.name,
@@ -270,6 +272,39 @@ export async function runChatTurn(
       outputTokens,
     },
   };
+}
+
+function buildFallbackCoachReply(input: ChatTurnInput, usedTools: boolean): string {
+  const text = input.userMessage.trim();
+  const asksLoad =
+    /负荷/.test(text) &&
+    /(为什么|为何|怎么|不一样|不同|差异|差这么多|差距)/.test(text);
+
+  if (asksLoad) {
+    const loadRows = input.workouts
+      .map((w) => {
+        const vars = w.parameterSource?.replacedVariables as
+          | Record<string, string | number>
+          | undefined;
+        const load = Number(vars?.__estimated_training_load);
+        return Number.isFinite(load) && load > 0
+          ? `第 ${w.dayIndex} 天 ${w.title}：${Math.round(load)}`
+          : null;
+      })
+      .filter((row): row is string => Boolean(row));
+    const loadText = loadRows.length > 0
+      ? `\n\n当前计划中可见的预估负荷是：${loadRows.join('；')}。`
+      : '';
+    return [
+      '训练负荷不只看标题或卡片时长，而是按这节课的总时长、训练类型、结构里的强度时间，以及你的心率/配速画像一起估计。',
+      '所以同样是 Zone 2，LSD 如果主训练更长，会比普通有氧跑更高；阈值、VO2、间歇则会因为高强度分钟占比更高而显著增加。',
+      '如果你看到两节课结构和时长几乎一样但负荷不同，那就是计划生成一致性问题，应该修计划本身，而不是解释成合理差异。',
+    ].join('\n\n') + loadText;
+  }
+
+  return usedTools
+    ? '我已经完成了必要的数据查询，但模型这轮没有返回文字。请再发一次你的问题，我会基于刚加载的画像和计划继续回答。'
+    : '这轮模型没有返回有效文字。请再发一次你的问题，我会继续基于当前训练计划回答。';
 }
 
 // ---------------------------------------------------------------------------

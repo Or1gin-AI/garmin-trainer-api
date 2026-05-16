@@ -1286,7 +1286,7 @@ trainingRouter.get('/plans', requireUser, async (req, res) => {
     .select()
     .from(trainingPlan)
     .where(eq(trainingPlan.userId, userId))
-    .orderBy(desc(trainingPlan.weekStartDate))
+    .orderBy(desc(trainingPlan.createdAt), desc(trainingPlan.id))
     .limit(20);
   res.json({ plans: rows.map(toPlanSummary) });
 });
