@@ -102,22 +102,22 @@ export function estimateWorkoutTrainingLoad(workout: ParameterizedWorkout): Work
 
 export function classifyWorkoutLoadTag(workout: ParameterizedWorkout): TrainingLoadTag {
   const key = `${workout.templateId} ${workout.workoutType} ${workout.title}`.toLowerCase();
-  if (key.includes('recovery') || key.includes('mobility') || key.includes('walk')) {
+  if (key.includes('recovery') || key.includes('mobility') || key.includes('walk') || key.includes('恢复')) {
     return 'recovery';
   }
-  if (key.includes('long') || key.includes('lsd') || key.includes('endurance')) {
+  if (key.includes('long') || key.includes('lsd') || key.includes('endurance') || key.includes('长距离')) {
     return 'long';
   }
-  if (key.includes('anaerobic') || key.includes('sprint') || key.includes('hill')) {
+  if (key.includes('anaerobic') || key.includes('sprint') || key.includes('hill') || key.includes('无氧') || key.includes('短冲') || key.includes('坡')) {
     return 'anaerobic';
   }
-  if (key.includes('vo2') || key.includes('interval') || key.includes('pyramid')) {
+  if (key.includes('vo2') || key.includes('interval') || key.includes('pyramid') || key.includes('间歇') || key.includes('金字塔')) {
     return 'vo2';
   }
-  if (key.includes('threshold') || key.includes('css') || key.includes('over_under')) {
+  if (key.includes('threshold') || key.includes('css') || key.includes('over_under') || key.includes('阈值')) {
     return 'threshold';
   }
-  if (key.includes('tempo') || key.includes('sweet_spot') || key.includes('race_pace') || key.includes('progression')) {
+  if (key.includes('tempo') || key.includes('sweet_spot') || key.includes('race_pace') || key.includes('progression') || key.includes('节奏') || key.includes('甜区') || key.includes('比赛配速') || key.includes('递进')) {
     return 'tempo';
   }
   if (workout.intensity === 'low') return 'easy';
@@ -140,19 +140,22 @@ function inferStructureMinutes(
   let recoveryMinutes = 0;
 
   if (mainDuration > 0) {
-    if (tag === 'recovery') recoveryMinutes = minutes * 0.75;
-    else if (tag === 'tempo') hardMinutes = mainDuration * 0.62;
-    else if (tag === 'threshold') hardMinutes = mainDuration * 0.72;
-    else if (tag === 'vo2') {
-      hardMinutes = mainDuration * 0.48;
-      veryHardMinutes = mainDuration * 0.15;
-    } else if (tag === 'anaerobic') {
-      hardMinutes = mainDuration * 0.25;
-      veryHardMinutes = mainDuration * 0.35;
-    } else if (tag === 'long') {
-      hardMinutes = mainDuration * 0.08;
+    if (tag === 'recovery') {
+      recoveryMinutes = minutes * 0.75;
+    } else {
+      if (tag === 'tempo') hardMinutes = mainDuration * 0.62;
+      else if (tag === 'threshold') hardMinutes = mainDuration * 0.72;
+      else if (tag === 'vo2') {
+        hardMinutes = mainDuration * 0.48;
+        veryHardMinutes = mainDuration * 0.15;
+      } else if (tag === 'anaerobic') {
+        hardMinutes = mainDuration * 0.25;
+        veryHardMinutes = mainDuration * 0.35;
+      } else if (tag === 'long') {
+        hardMinutes = mainDuration * 0.08;
+      }
+      recoveryMinutes = Math.max(0, mainDuration - hardMinutes - veryHardMinutes) * recoveryShare(tag);
     }
-    recoveryMinutes = Math.max(0, mainDuration - hardMinutes - veryHardMinutes) * recoveryShare(tag);
   } else if (tag === 'tempo') {
     hardMinutes = minutes * 0.42;
   } else if (tag === 'threshold') {
