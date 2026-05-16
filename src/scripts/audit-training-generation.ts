@@ -211,8 +211,69 @@ function auditAllTemplates(): string[] {
     if (violations.length > 0) {
       failures.push(`${templateId}: ${violations.map((v) => v.rule).join(', ')}`);
     }
+    failures.push(...auditWorkoutPresentation(templateId, workout));
   }
   return failures;
+}
+
+function auditWorkoutPresentation(scope: string, workout: ParameterizedWorkout): string[] {
+  const failures: string[] = [];
+  const referenceDistanceTargets = (workout.targets ?? []).filter((target) =>
+    /^参考距离/.test(target),
+  );
+
+  if (workout.sport === 'running') {
+    if (workout.distanceKm !== null) {
+      failures.push(`${scope}: running workout must not expose card distance`);
+    }
+    if (referenceDistanceTargets.length > 0) {
+      failures.push(`${scope}: running workout must not expose reference distance target`);
+    }
+  }
+
+  if (workout.distanceKm === null && referenceDistanceTargets.length > 0) {
+    failures.push(`${scope}: reference distance target exists while distanceKm is null`);
+  }
+  if (workout.distanceKm !== null && workout.distanceKm > 0) {
+    const expected = Number(workout.distanceKm.toFixed(1));
+    const found = referenceDistanceTargets
+      .map((target) => /参考距离\s*(\d+(?:\.\d+)?)\s*公里/.exec(target)?.[1])
+      .filter((value): value is string => Boolean(value))
+      .map(Number);
+    if (found.length > 0 && !found.some((value) => Math.abs(value - expected) < 0.05)) {
+      failures.push(`${scope}: reference distance target does not match distanceKm`);
+    }
+  }
+
+  if (workout.sport === 'swimming') {
+    const structureMeters = sumSwimMetersFromVars(workout.parameterSource.replacedVariables ?? {});
+    if (structureMeters !== null && structureMeters > 0) {
+      const shownMeters = workout.distanceKm === null ? 0 : Math.round(workout.distanceKm * 1000);
+      if (Math.abs(shownMeters - structureMeters) > 25) {
+        failures.push(`${scope}: swim distance ${shownMeters}m mismatches structure ${structureMeters}m`);
+      }
+    }
+  }
+
+  return failures;
+}
+
+function sumSwimMetersFromVars(vars: Record<string, string | number>): number | null {
+  const total = [
+    'warmupMeters',
+    'mainTotalMeters',
+    'drillTotalMeters',
+    'cooldownMeters',
+    'auxTotalMeters',
+  ].reduce((sum, key) => sum + positiveNumber(vars[key]), 0);
+  if (total > 0) return total;
+  const declared = positiveNumber(vars.totalMeters);
+  return declared > 0 ? declared : null;
+}
+
+function positiveNumber(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 function enabledSports(request: ScheduleRequest): ActiveSport[] {
@@ -596,6 +657,7 @@ function auditGeneratedPlan(name: string, plan: GeneratedPlan, request: Schedule
         failures.push(`${name}: ${workout.templateId} missing per-workout estimated load`);
       }
     }
+    failures.push(...auditWorkoutPresentation(`${name}:${workout.templateId}`, workout));
   }
 
   const byDay = new Map<number, ScheduleEntry[]>();

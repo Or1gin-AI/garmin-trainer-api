@@ -2020,7 +2020,7 @@ function adjustWorkoutDuration(
   const durationMinutes = Math.max(0, Math.round(nextMinutes));
   if (durationMinutes === current) return workout;
   const scale =
-    current > 0 && workout.distanceKm !== null
+    current > 0 && workout.distanceKm !== null && workout.sport !== 'swimming'
       ? durationMinutes / current
       : null;
   const distanceKm =

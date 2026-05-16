@@ -932,11 +932,6 @@ function estimateDistanceKm(
   // Swimming: prefer template totalMeters when present. It is the intended
   // total volume, while phase meter variables are the detailed breakdown.
   if (template.fixed.sport === 'swimming') {
-    const declaredTotal = resolved.get('totalMeters');
-    if (declaredTotal?.kind === 'number' && declaredTotal.value > 0) {
-      return Math.round(declaredTotal.value) / 1000;
-    }
-
     let totalMeters = 0;
     for (const key of [
       'warmupMeters',
@@ -949,27 +944,19 @@ function estimateDistanceKm(
       if (v && v.kind === 'number') totalMeters += v.value;
     }
     if (totalMeters > 0) return Math.round(totalMeters) / 1000;
+
+    const declaredTotal = resolved.get('totalMeters');
+    if (declaredTotal?.kind === 'number' && declaredTotal.value > 0) {
+      return Math.round(declaredTotal.value) / 1000;
+    }
     return null;
   }
-  // Running: only show a reference distance when it is a real planned volume.
-  // Recovery pace caps and structured intervals are execution constraints, not
-  // a reliable total distance estimate.
+  // Running: do not show a total reference distance from planned workouts.
+  // Running paces here usually describe the main set, a cap, or an intensity
+  // target rather than the full-session average including warmup, recoveries,
+  // and cooldown. Showing a total distance would create a second, conflicting
+  // prescription beside the workout structure.
   if (template.fixed.sport === 'running') {
-    if (template.fixed.workoutType === 'recovery') return null;
-    const pace =
-      resolved.get('targetPace') ??
-      resolved.get('easyPace') ??
-      resolved.get('longPaceCap');
-    let secPerKm: number | null = null;
-    if (pace && pace.kind === 'number' && (pace.unit === 's/km' || pace.unit === 's/km_upper' || pace.unit === undefined)) {
-      secPerKm = pace.value;
-    } else if (pace && pace.kind === 'range' && pace.unit === 's/km') {
-      secPerKm = (pace.low + pace.high) / 2;
-    }
-    if (secPerKm && secPerKm > 0 && durationMinutes > 0) {
-      const km = (durationMinutes * 60) / secPerKm;
-      return Math.round(km * 10) / 10;
-    }
     return null;
   }
   return null;

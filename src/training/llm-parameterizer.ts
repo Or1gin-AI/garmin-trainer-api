@@ -463,9 +463,7 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
 function sanitizeLlmDistanceKm(template: WorkoutTemplate, distanceKm: number | null): number | null {
   if (distanceKm === null || distanceKm <= 0) return null;
   if (template.fixed.sport !== 'running') return distanceKm;
-  if (template.fixed.workoutType === 'recovery') return null;
-  if (template.fixed.primaryMetric !== 'pace') return null;
-  return distanceKm;
+  return null;
 }
 
 function isUsefulTarget(value: unknown): value is string {
