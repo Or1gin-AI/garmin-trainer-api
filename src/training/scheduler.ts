@@ -855,7 +855,7 @@ function enforceExplicitHardSessionTarget(
 
   const target = Math.min(hardCap, activeEntries.length);
   const currentHard = activeEntries.filter(({ entry }) => templateIntensity(entry.templateId) === 'high');
-  if (currentHard.length >= target) return;
+  if (currentHard.length >= target && consecutiveHighPairs(days).length === 0) return;
 
   const selected = new Set(currentHard.map(({ entry }) => entry.dayIndex));
   for (const item of lowToHighCandidates(activeEntries, selected)) {
@@ -879,7 +879,7 @@ function enforceExplicitHardSessionTarget(
     selected.add(item.entry.dayIndex);
   }
 
-  if (selected.size < target) {
+  if (selected.size < target || consecutiveHighPairs(days).length > 0) {
     const targetDayIndexes = evenlySpacedDayIndexes(activeEntries, target);
     let hardOrdinal = 0;
     for (const item of activeEntries) {
@@ -917,6 +917,22 @@ function enforceExplicitHardSessionTarget(
   if (finalHardCount >= target) {
     notes.push(`用户明确选择 ${hardCap} 次高强度，本周已按目标安排 ${finalHardCount} 次。`);
   }
+}
+
+function consecutiveHighPairs(days: Array<ScheduleEntry | null>): Array<[number, number]> {
+  const hardDays = Array.from(
+    new Set(
+      days
+        .filter((entry): entry is ScheduleEntry => Boolean(entry))
+        .filter((entry) => templateIntensity(entry.templateId) === 'high')
+        .map((entry) => entry.dayIndex),
+    ),
+  ).sort((a, b) => a - b);
+  const pairs: Array<[number, number]> = [];
+  for (let i = 1; i < hardDays.length; i += 1) {
+    if (hardDays[i] === hardDays[i - 1] + 1) pairs.push([hardDays[i - 1], hardDays[i]]);
+  }
+  return pairs;
 }
 
 function lowToHighCandidates(

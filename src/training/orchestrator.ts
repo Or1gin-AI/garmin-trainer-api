@@ -1223,7 +1223,12 @@ function ensureRequestedHardEntries(
 ): ScheduleEntry[] {
   const active = activeTrainingEntries(days);
   const target = Math.min(cap, active.length);
-  if (countHighScheduleEntries(days) >= target) return days;
+  if (
+    countHighScheduleEntries(days) >= target &&
+    consecutiveHardDayPairs(hardDayIndexesFromSchedule(days)).length === 0
+  ) {
+    return days;
+  }
 
   let next = days.slice();
   const selectedHardDays = new Set(
@@ -1249,7 +1254,12 @@ function ensureRequestedHardEntries(
     selectedHardDays.add(candidate.entry.dayIndex);
   }
 
-  if (countHighScheduleEntries(next) >= target) return next;
+  if (
+    countHighScheduleEntries(next) >= target &&
+    consecutiveHardDayPairs(hardDayIndexesFromSchedule(next)).length === 0
+  ) {
+    return next;
+  }
 
   const targetDays = evenlySpacedScheduleDays(active, target);
   let ordinal = 0;
