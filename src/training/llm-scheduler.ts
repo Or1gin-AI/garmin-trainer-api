@@ -810,9 +810,10 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     args.request.maxHardSessionsPerWeek !== null &&
     args.request.maxHardSessionsPerWeek !== undefined
   ) {
-    systemParts.push(
-      `- 用户设置的每周高强度上限为 ${args.request.maxHardSessionsPerWeek} 次，这是用户要求；除非用户文字明确点名更多具体高强度课，否则不得超过这个次数。`,
-    );
+    const hardLine = args.request.forceRequestedSchedule === true
+      ? `- 用户选择每周 ${args.request.maxHardSessionsPerWeek} 次高强度，这是严格模式下的目标次数；训练天数足够且允许高级训练时，应安排到这个次数。除非用户文字明确点名更多具体高强度课，否则不得超过这个次数。`
+      : `- 用户设置的每周高强度上限为 ${args.request.maxHardSessionsPerWeek} 次，这是用户要求；除非用户文字明确点名更多具体高强度课，否则不得超过这个次数。`;
+    systemParts.push(hardLine);
   }
   if (args.request.forceRequestedSchedule !== true) {
     systemParts.push(

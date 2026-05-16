@@ -33,11 +33,13 @@ const SPORT_FACTOR: Record<string, number> = {
 
 const SPORT_TAG_FACTOR: Partial<Record<string, Partial<Record<TrainingLoadTag, number>>>> = {
   running: {
-    // User-specific calibration should eventually supersede this global prior.
-    // This prior intentionally covers only low-intensity running; hard running
-    // workouts still use the broader running factor and interval structure.
+    // Garmin load calibration from recent activity samples:
+    // low-intensity running clusters around 1.1-1.6 load/min, while structured
+    // threshold sessions with recoveries should sit below continuous threshold
+    // race-effort proxies of similar total duration.
     recovery: 1.5,
     easy: 1.6,
+    threshold: 1.65,
   },
 };
 

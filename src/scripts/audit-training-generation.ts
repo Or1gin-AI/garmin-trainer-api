@@ -639,6 +639,21 @@ function scenarioRequests(): Array<{ name: string; request: ScheduleRequest; rec
     }
   }
   out.push({
+    name: 'force-four-high-running',
+    request: makeRequest({
+      sports: { running: true, cycling: false, swimming: false },
+      daysPerWeek: 7,
+      dailyPreferredMinutes: 119,
+      weeklyMaxMinutes: 1200,
+      allowAdvancedWorkouts: true,
+      allowDoubleDays: true,
+      maxHardSessionsPerWeek: 4,
+      forceRequestedSchedule: true,
+      notes: '用户明确选择 4 次高强度；应生成 4 次质量课，而不是只把它当作上限。',
+    }),
+    recentState: normalRecentState,
+  });
+  out.push({
     name: 'extreme-daily200-weekly270',
     request: makeRequest({
       sports: { running: true, cycling: true, swimming: true },
@@ -708,6 +723,23 @@ function auditGeneratedPlan(name: string, plan: GeneratedPlan, request: Schedule
   );
   if (activeDays.size !== request.daysPerWeek) {
     failures.push(`${name}: active day count ${activeDays.size} != request ${request.daysPerWeek}`);
+  }
+
+  const highSessions = plan.schedule.days.filter((day) => {
+    const tpl = getTemplate(day.templateId);
+    return tpl?.fixed.intensity === 'high';
+  }).length;
+  if (
+    request.forceRequestedSchedule === true &&
+    request.maxHardSessionsPerWeek !== null &&
+    request.maxHardSessionsPerWeek !== undefined &&
+    request.maxHardSessionsPerWeek >= 3 &&
+    request.allowAdvancedWorkouts === true &&
+    canHonorRequestedHardTargetWithinTimeBudget(request) &&
+    request.daysPerWeek >= request.maxHardSessionsPerWeek &&
+    highSessions < request.maxHardSessionsPerWeek
+  ) {
+    failures.push(`${name}: high sessions ${highSessions} < requested ${request.maxHardSessionsPerWeek}`);
   }
 
   const enabled = new Set(enabledSports(request));
@@ -787,6 +819,19 @@ function auditGeneratedPlan(name: string, plan: GeneratedPlan, request: Schedule
     failures.push(`${name}: validation ${relevantValidation.map((v) => v.rule).join(', ')}`);
   }
   return failures;
+}
+
+function canHonorRequestedHardTargetWithinTimeBudget(request: ScheduleRequest): boolean {
+  const cap = request.maxHardSessionsPerWeek ?? 0;
+  if (cap <= 0) return false;
+  const daily = request.dailyPreferredMinutes;
+  if (Number.isFinite(daily ?? NaN) && (daily ?? 0) < 75) return false;
+  const activeDays = Math.max(1, Math.min(7, request.daysPerWeek));
+  const weeklyMax = request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES;
+  const estimatedMinimum =
+    Math.min(cap, activeDays) * 60 +
+    Math.max(0, activeDays - cap) * 30;
+  return weeklyMax >= estimatedMinimum;
 }
 
 async function auditGeneratedScenarios(): Promise<string[]> {

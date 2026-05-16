@@ -166,7 +166,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
   schedule = applyExplicitWorkoutRequirements(schedule, request, requestIntent, trainingCapacity);
   schedule = normalizeDoubleDayVariety(schedule, request, athleteProfile, trainingCapacity);
   schedule = normalizeStandaloneDoubleThreshold(schedule);
-  schedule = enforceUserHardWorkoutLayout(schedule, request, requestIntent);
+  schedule = enforceUserHardWorkoutLayout(schedule, request, requestIntent, trainingCapacity);
   schedule = appendForcedScheduleRiskNotes(schedule, request, recentState, trainingCapacity);
 
   let totalInputTokens = stageOne.meta?.inputTokens ?? 0;
@@ -1153,19 +1153,40 @@ function enforceUserHardWorkoutLayout(
   schedule: ScheduleResult,
   request: ScheduleRequest,
   intent: TrainingRequestIntent,
+  trainingCapacity?: TrainingCapacity,
 ): ScheduleResult {
   if (request.maxHardSessionsPerWeek === null || request.maxHardSessionsPerWeek === undefined) {
     return schedule;
   }
   const cap = Math.max(0, Math.min(7, request.maxHardSessionsPerWeek));
   const requiredIds = new Set(intent.requiredWorkouts.map((r) => r.templateId));
-  const days = schedule.days.slice();
+  let days = schedule.days.slice();
   const notes = schedule.notes.slice();
+
+  if (
+    request.forceRequestedSchedule === true &&
+    cap > 0 &&
+    request.allowAdvancedWorkouts === true &&
+    canHonorRequestedHardTargetWithinTimeBudget(request)
+  ) {
+    const beforeHard = countHighScheduleEntries(days);
+    days = ensureRequestedHardEntries(days, request, cap, trainingCapacity);
+    const afterHard = countHighScheduleEntries(days);
+    if (afterHard > beforeHard && afterHard >= Math.min(cap, activeTrainingEntries(days).length)) {
+      notes.push(`用户明确选择 ${cap} 次高强度，已按目标安排 ${afterHard} 次质量课。`);
+    }
+  }
 
   for (let guard = 0; guard < 7; guard += 1) {
     const hardDays = hardDayIndexesFromSchedule(days);
     const consecutive = consecutiveHardDayPairs(hardDays);
-    if (hardDays.length <= cap && consecutive.length === 0) break;
+    if (
+      request.forceRequestedSchedule === true
+        ? hardDays.length <= cap
+        : hardDays.length <= cap && consecutive.length === 0
+    ) {
+      break;
+    }
 
     const idx = chooseHardLayoutDowngradeIndex(days, requiredIds, hardDays);
     if (idx < 0) {
@@ -1192,6 +1213,162 @@ function enforceUserHardWorkoutLayout(
   }
 
   return { days: sortScheduleEntries(days), notes };
+}
+
+function ensureRequestedHardEntries(
+  days: ScheduleEntry[],
+  request: ScheduleRequest,
+  cap: number,
+  trainingCapacity?: TrainingCapacity,
+): ScheduleEntry[] {
+  const active = activeTrainingEntries(days);
+  const target = Math.min(cap, active.length);
+  if (countHighScheduleEntries(days) >= target) return days;
+
+  let next = days.slice();
+  const selectedHardDays = new Set(
+    next
+      .filter((day) => getTemplate(day.templateId)?.fixed.intensity === 'high')
+      .map((day) => day.dayIndex),
+  );
+
+  for (const candidate of lowToHighScheduleCandidates(next, selectedHardDays)) {
+    if (countHighScheduleEntries(next) >= target) break;
+    if (selectedHardDays.has(candidate.entry.dayIndex - 1) || selectedHardDays.has(candidate.entry.dayIndex + 1)) {
+      continue;
+    }
+    const replacementId = chooseHardTemplateForSport(candidate.entry.sport, countHighScheduleEntries(next), request);
+    if (!replacementId) continue;
+    next[candidate.index] = replaceEntryTemplate(
+      candidate.entry,
+      replacementId,
+      `用户明确要求 ${cap} 次高强度；补足质量课目标。`,
+      request,
+      trainingCapacity,
+    );
+    selectedHardDays.add(candidate.entry.dayIndex);
+  }
+
+  if (countHighScheduleEntries(next) >= target) return next;
+
+  const targetDays = evenlySpacedScheduleDays(active, target);
+  let ordinal = 0;
+  next = next.map((entry) => {
+    if (entry.sport === 'rest' || entry.sport === 'mobility') return entry;
+    const shouldBeHard = targetDays.has(entry.dayIndex) && (entry.slotIndex ?? 1) === 1;
+    if (shouldBeHard) {
+      const replacementId = chooseHardTemplateForSport(entry.sport, ordinal, request);
+      if (!replacementId) return entry;
+      ordinal += 1;
+      return replaceEntryTemplate(
+        entry,
+        replacementId,
+        `用户明确要求 ${cap} 次高强度；按一周内均匀间隔重排质量课。`,
+        request,
+        trainingCapacity,
+      );
+    }
+    if (getTemplate(entry.templateId)?.fixed.intensity === 'high') {
+      const replacementId = lowTemplateForScheduleSport(entry.sport);
+      if (!replacementId) return entry;
+      return replaceEntryTemplate(
+        entry,
+        replacementId,
+        '为满足用户高强度次数并保持间隔，改为低强度补量。',
+        request,
+        trainingCapacity,
+      );
+    }
+    return entry;
+  });
+  return next;
+}
+
+function activeTrainingEntries(days: readonly ScheduleEntry[]): ScheduleEntry[] {
+  return days.filter((day) => day.sport !== 'rest' && day.sport !== 'mobility');
+}
+
+function countHighScheduleEntries(days: readonly ScheduleEntry[]): number {
+  return days.filter((day) => getTemplate(day.templateId)?.fixed.intensity === 'high').length;
+}
+
+function lowToHighScheduleCandidates(
+  days: readonly ScheduleEntry[],
+  selectedHardDays: ReadonlySet<number>,
+): Array<{ entry: ScheduleEntry; index: number }> {
+  return days
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => entry.sport !== 'rest' && entry.sport !== 'mobility')
+    .filter(({ entry }) => getTemplate(entry.templateId)?.fixed.intensity !== 'high')
+    .filter(({ entry }) => !selectedHardDays.has(entry.dayIndex - 1) && !selectedHardDays.has(entry.dayIndex + 1))
+    .sort((a, b) => {
+      const aLong = isLongScheduleTemplate(a.entry.templateId) ? 1 : 0;
+      const bLong = isLongScheduleTemplate(b.entry.templateId) ? 1 : 0;
+      if (aLong !== bLong) return aLong - bLong;
+      return Math.abs(a.entry.dayIndex - 4) - Math.abs(b.entry.dayIndex - 4);
+    });
+}
+
+function isLongScheduleTemplate(templateId: string): boolean {
+  const type = getTemplate(templateId)?.fixed.workoutType;
+  return type === 'lsd' || type === 'long_ride' || type === 'endurance';
+}
+
+function evenlySpacedScheduleDays(active: readonly ScheduleEntry[], target: number): Set<number> {
+  const primaryByDay = new Map<number, ScheduleEntry>();
+  for (const entry of sortScheduleEntries(active.slice())) {
+    if (primaryByDay.has(entry.dayIndex)) continue;
+    primaryByDay.set(entry.dayIndex, entry);
+  }
+  const sorted = Array.from(primaryByDay.values()).sort((a, b) => a.dayIndex - b.dayIndex);
+  if (target <= 1) return new Set(sorted[0] ? [sorted[0].dayIndex] : []);
+  const out = new Set<number>();
+  for (let i = 0; i < target; i += 1) {
+    const idx = Math.round((i * (sorted.length - 1)) / (target - 1));
+    const dayIndex = sorted[idx]?.dayIndex;
+    if (dayIndex !== undefined) out.add(dayIndex);
+  }
+  return out;
+}
+
+function chooseHardTemplateForSport(
+  sport: ScheduleEntry['sport'],
+  ordinal: number,
+  request: ScheduleRequest,
+): string | null {
+  const ids =
+    sport === 'running'
+      ? ['run.threshold.v1', 'run.reverse_pyramid.v1', 'run.vo2max.v1', 'run.interval.v1', 'run.hill.v1']
+      : sport === 'cycling'
+        ? ['bike.threshold.v1', 'bike.over_under.v1', 'bike.vo2max.v1', 'bike.anaerobic.v1', 'bike.climb.v1']
+        : sport === 'swimming'
+          ? ['swim.css_threshold.v1', 'swim.vo2max.v1', 'swim.sprint.v1']
+          : [];
+  const enabled = ids.filter((id) => isTemplateEnabledByRequest(id, request));
+  if (enabled.length === 0) return null;
+  return enabled[ordinal % enabled.length] ?? null;
+}
+
+function lowTemplateForScheduleSport(sport: ScheduleEntry['sport']): string | null {
+  if (sport === 'running') return 'run.aerobic.v1';
+  if (sport === 'cycling') return 'bike.endurance.v1';
+  if (sport === 'swimming') return 'swim.aerobic.v1';
+  return null;
+}
+
+function canHonorRequestedHardTargetWithinTimeBudget(request: ScheduleRequest): boolean {
+  const cap = request.maxHardSessionsPerWeek ?? 0;
+  if (cap <= 0) return false;
+  const daily = request.dailyPreferredMinutes;
+  if (Number.isFinite(daily ?? NaN) && (daily ?? 0) < 75) return false;
+  const activeDays = Math.max(1, Math.min(7, request.daysPerWeek));
+  const weeklyMax = normalizeWeeklyMaxMinutes(request.weeklyMaxMinutes);
+  const hardSessionFloor = 60;
+  const lowSessionFloor = 30;
+  const estimatedMinimum =
+    Math.min(cap, activeDays) * hardSessionFloor +
+    Math.max(0, activeDays - cap) * lowSessionFloor;
+  return weeklyMax >= estimatedMinimum;
 }
 
 function chooseHardLayoutDowngradeIndex(
