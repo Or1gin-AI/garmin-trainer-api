@@ -5,7 +5,7 @@ import { and, asc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from 'drizz
 import { db } from '../db/index.js';
 import { subscription, syncJob, garminAccount } from '../db/schema.js';
 import { runBidirectionalSync, type SyncProgress } from '../garmin/sync.js';
-import { markAutoSync } from '../lib/plan.js';
+import { markAutoSync, PROMO_FREE_MAX_END } from '../lib/plan.js';
 
 const POLL_INTERVAL_MS = 3000;
 const AUTO_SYNC_INTERVAL_HOURS = 2;
@@ -172,6 +172,12 @@ async function autoSyncTick() {
   const now = new Date();
   const cutoff = new Date(now.getTime() - AUTO_SYNC_INTERVAL_HOURS * 3600_000);
 
+  // 活动期内（< PROMO_FREE_MAX_END）所有 free 用户也享受自动同步；活动结束后自动回退到只覆盖付费用户。
+  const promoActive = now < PROMO_FREE_MAX_END;
+  const planFilter = promoActive
+    ? inArray(subscription.plan, ['free', 'pro', 'max'])
+    : inArray(subscription.plan, ['pro', 'max']);
+
   const candidates = await db
     .select({
       userId: subscription.userId,
@@ -180,7 +186,7 @@ async function autoSyncTick() {
     .from(subscription)
     .where(
       and(
-        inArray(subscription.plan, ['pro', 'max']),
+        planFilter,
         eq(subscription.autoSyncEnabled, true),
         or(
           isNull(subscription.expiresAt),

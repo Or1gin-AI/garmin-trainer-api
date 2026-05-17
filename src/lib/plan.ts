@@ -6,6 +6,10 @@ import { subscription } from '../db/schema.js';
 export type SubscriptionPlan = 'free' | 'pro' | 'max';
 export type PaidSubscriptionPlan = Exclude<SubscriptionPlan, 'free'>;
 
+// 限时活动：活动期内所有用户免费享受 Max，到期日统一为 PROMO_FREE_MAX_END。
+// 活动结束后自动回退到用户真实的订阅状态。不写库以保证幂等且活动自然失效。
+export const PROMO_FREE_MAX_END = new Date('2026-06-15T23:59:59Z');
+
 export interface UserPlanInfo {
   plan: SubscriptionPlan;
   expiresAt: Date | null;
@@ -17,6 +21,7 @@ export interface UserPlanInfo {
   autoSyncEnabled: boolean;
   lastAutoSyncAt: Date | null;
   referralCode: string;
+  promoFreeMaxUntil: string | null;
 }
 
 function generateReferralCode(): string {
@@ -34,6 +39,49 @@ function higherPaidPlan(
   return current === 'max' || next === 'max' ? 'max' : 'pro';
 }
 
+function applyPromo(params: {
+  storedPlan: SubscriptionPlan;
+  storedExpiresAt: Date | null;
+  autoSyncEnabled: boolean;
+  lastAutoSyncAt: Date | null;
+  referralCode: string;
+  now: Date;
+}): UserPlanInfo {
+  const {
+    storedPlan, storedExpiresAt, autoSyncEnabled, lastAutoSyncAt, referralCode, now,
+  } = params;
+
+  const storedActive =
+    storedPlan !== 'free' && (!storedExpiresAt || storedExpiresAt > now);
+  let activePlan: SubscriptionPlan = storedActive ? storedPlan : 'free';
+  let activeExpiresAt = storedActive ? storedExpiresAt : null;
+
+  const promoActive = now < PROMO_FREE_MAX_END;
+  if (promoActive) {
+    const realMaxUntil = activePlan === 'max' ? activeExpiresAt : null;
+    if (!realMaxUntil || realMaxUntil < PROMO_FREE_MAX_END) {
+      activePlan = 'max';
+      activeExpiresAt = PROMO_FREE_MAX_END;
+    }
+  }
+
+  const isPaidActive = activePlan !== 'free';
+  const isMaxActive = activePlan === 'max';
+  return {
+    plan: activePlan,
+    expiresAt: activeExpiresAt,
+    isPaidActive,
+    isProActive: isPaidActive,
+    isMaxActive,
+    canAutoSync: isPaidActive,
+    canUseAi: isMaxActive,
+    autoSyncEnabled,
+    lastAutoSyncAt,
+    referralCode,
+    promoFreeMaxUntil: promoActive ? PROMO_FREE_MAX_END.toISOString() : null,
+  };
+}
+
 export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
   const rows = await db
     .select()
@@ -41,8 +89,8 @@ export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
     .where(eq(subscription.userId, userId))
     .limit(1);
   const row = rows[0];
+  const now = new Date();
   if (!row) {
-    const now = new Date();
     const referralCode = generateReferralCode();
     await db.insert(subscription).values({
       userId,
@@ -52,18 +100,14 @@ export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
       createdAt: now,
       updatedAt: now,
     });
-    return {
-      plan: 'free',
-      expiresAt: null,
-      isPaidActive: false,
-      isProActive: false,
-      isMaxActive: false,
-      canAutoSync: false,
-      canUseAi: false,
+    return applyPromo({
+      storedPlan: 'free',
+      storedExpiresAt: null,
       autoSyncEnabled: true,
       lastAutoSyncAt: null,
       referralCode,
-    };
+      now,
+    });
   }
   let referralCode = row.referralCode;
   if (!referralCode) {
@@ -73,23 +117,14 @@ export async function getUserPlan(userId: string): Promise<UserPlanInfo> {
       .set({ referralCode, updatedAt: new Date() })
       .where(eq(subscription.userId, userId));
   }
-  const now = new Date();
-  const storedPlan = normalizePlan(row.plan);
-  const isPaidActive =
-    storedPlan !== 'free' && (!row.expiresAt || row.expiresAt > now);
-  const activePlan = isPaidActive ? storedPlan : 'free';
-  return {
-    plan: activePlan,
-    expiresAt: row.expiresAt,
-    isPaidActive,
-    isProActive: isPaidActive,
-    isMaxActive: activePlan === 'max',
-    canAutoSync: activePlan === 'pro' || activePlan === 'max',
-    canUseAi: activePlan === 'max',
+  return applyPromo({
+    storedPlan: normalizePlan(row.plan),
+    storedExpiresAt: row.expiresAt,
     autoSyncEnabled: row.autoSyncEnabled,
     lastAutoSyncAt: row.lastAutoSyncAt,
     referralCode,
-  };
+    now,
+  });
 }
 
 export async function extendPlanSubscription(
