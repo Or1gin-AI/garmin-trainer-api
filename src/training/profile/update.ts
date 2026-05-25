@@ -236,7 +236,6 @@ export async function updateUserProfile(
     fullProfile.swimming.cssPaceSecPer100m ?? null,
   );
   const cycling = deriveCycling(bestPrs, fullProfile.cycling.ftpWatts ?? null);
-  const lastActivityAt = latestActivityAt(activities, qualities);
 
   // Snapshot merge priority: fullProfile (Garmin direct + activity-sample
   // statistics) wins over derive-zones (PR-based estimation). derive-zones
@@ -297,7 +296,7 @@ export async function updateUserProfile(
       primaryMetricUnit: 'vdot',
       primaryMetric: running.vdot,
       activityCountUsed: activityCountForSport(activities, 'running', qualities),
-      lastActivityAt,
+      lastActivityAt: latestActivityAt(activities, 'running', qualities),
     }),
     upsertSport({
       userId,
@@ -306,7 +305,7 @@ export async function updateUserProfile(
       primaryMetricUnit: 's_per_100m',
       primaryMetric: swimmingCss,
       activityCountUsed: activityCountForSport(activities, 'swimming', qualities),
-      lastActivityAt,
+      lastActivityAt: latestActivityAt(activities, 'swimming', qualities),
     }),
     upsertSport({
       userId,
@@ -315,7 +314,7 @@ export async function updateUserProfile(
       primaryMetricUnit: 'watts',
       primaryMetric: cyclingFtp,
       activityCountUsed: activityCountForSport(activities, 'cycling', qualities),
-      lastActivityAt,
+      lastActivityAt: latestActivityAt(activities, 'cycling', qualities),
     }),
   ]);
 }
@@ -361,10 +360,12 @@ function anchorSport(anchor: Anchor): 'running' | 'swimming' | 'cycling' {
 
 function latestActivityAt(
   activities: NormalizedActivity[],
+  sport: 'running' | 'swimming' | 'cycling',
   qualities: Map<string, QualityResult>,
 ): Date | null {
   let latest: Date | null = null;
   for (const activity of activities) {
+    if (activity.sport !== sport) continue;
     if (qualities.get(activity.id)?.confidence === 'low') continue;
     const date = activity.startTimeLocal;
     if (date && !Number.isNaN(date.getTime()) && (!latest || date > latest)) {

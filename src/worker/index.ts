@@ -4,12 +4,15 @@ import crypto from 'node:crypto';
 import { and, asc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { subscription, syncJob, garminAccount } from '../db/schema.js';
+import { fetchRecentRawActivities } from '../garmin/fetch-recent.js';
 import { runBidirectionalSync, type SyncProgress } from '../garmin/sync.js';
 import { markAutoSync, PROMO_FREE_MAX_END } from '../lib/plan.js';
 
 const POLL_INTERVAL_MS = 3000;
 const AUTO_SYNC_INTERVAL_HOURS = 2;
 const PROGRESS_LOG_CAP = 200;
+const PROFILE_REFRESH_DAYS = 56;
+const PROFILE_REFRESH_LIMIT = 100;
 
 let stopped = false;
 
@@ -101,6 +104,7 @@ async function processJob(job: { id: string; userId: string }) {
       },
     });
     const partial = result.failedCount > 0;
+    await refreshAthleteProfileAfterSync(id, userId);
     await db
       .update(syncJob)
       .set({
@@ -145,6 +149,25 @@ async function processJob(job: { id: string; userId: string }) {
       .where(eq(syncJob.id, id));
     await appendLog(id, 'error', msg);
     console.error(`[worker] ${id} failed:`, msg);
+  }
+}
+
+async function refreshAthleteProfileAfterSync(jobId: string, userId: string) {
+  await appendLog(jobId, 'info', '刷新近期活动指标与运动能力画像');
+  try {
+    const fetched = await fetchRecentRawActivities(userId, {
+      days: PROFILE_REFRESH_DAYS,
+      limit: PROFILE_REFRESH_LIMIT,
+    });
+    await appendLog(
+      jobId,
+      'info',
+      `运动能力画像已刷新：中国区读取 ${fetched.cn.count} 条，纳入 ${fetched.activities.length} 条近期活动`,
+    );
+  } catch (error) {
+    const msg = (error as Error).message || String(error);
+    await appendLog(jobId, 'warn', `运动能力画像刷新失败：${msg}`);
+    console.warn(`[worker] ${jobId} profile refresh failed:`, msg);
   }
 }
 
