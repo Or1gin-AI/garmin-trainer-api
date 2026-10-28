@@ -18,7 +18,7 @@ syncRouter.post('/jobs', requireUser, async (req, res) => {
       res.status(402).json({
         error: 'plus_required',
         message:
-          'Garmin 同步是 Plus / Max 会员功能。当前账号没有可用的 Plus 权益，升级或兑换后即可手动触发同步并开启自动同步。',
+          'Garmin sync is a Plus / Max feature. Your account does not have an active Plus plan. Upgrade or redeem a code to run manual syncs and enable auto-sync.',
         requiredPlan: 'plus',
         currentPlan: plan.plan,
         expiresAt: plan.expiresAt,
@@ -39,7 +39,7 @@ syncRouter.post('/jobs', requireUser, async (req, res) => {
     if (active[0]) {
       res.status(409).json({
         error: 'sync_job_active',
-        message: '已经有一个同步任务在排队或运行，请等它完成后再触发新的同步。',
+        message: 'A sync job is already queued or running. Please wait for it to finish before starting a new one.',
         jobId: active[0].id,
         status: active[0].status,
       });
@@ -58,9 +58,9 @@ syncRouter.post('/jobs', requireUser, async (req, res) => {
     if (missingRegions.length > 0) {
       res.status(400).json({
         error: 'garmin_accounts_missing',
-        message: `请先在「Garmin 账号」页面重新连接${missingRegions
-          .map((r) => (r === 'cn' ? '国区' : '国际区'))
-          .join('和')}账号，再开始同步。`,
+        message: `Please reconnect your ${missingRegions
+          .map((r) => (r === 'cn' ? 'China region' : 'Global region'))
+          .join(' and ')} Garmin account on the "Garmin Accounts" page before syncing.`,
         missingRegions,
       });
       return;
@@ -87,7 +87,7 @@ syncRouter.post('/jobs', requireUser, async (req, res) => {
     console.error('[sync] enqueue failed:', err);
     res.status(500).json({
       error: 'sync_enqueue_failed',
-      message: '同步任务创建失败，请稍后再试。',
+      message: 'Failed to create the sync job. Please try again later.',
     });
   }
 });

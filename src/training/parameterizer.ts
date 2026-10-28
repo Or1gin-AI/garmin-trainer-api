@@ -18,6 +18,7 @@ import type {
 import type { AthleteProfile } from './athlete-profile.js';
 import type { RecentState } from './recent-state.js';
 import type { ScheduleEntry } from './scheduler.js';
+import { NOT_APPLICABLE } from './not-applicable.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -59,7 +60,17 @@ export interface ParameterizeArgs {
   progression: 'conservative' | 'normal' | 'aggressive';
 }
 
-const NA = '不适用';
+const NA = NOT_APPLICABLE;
+
+// Distance units/suffixes. Templates now use 'meters' / '$var m'; the legacy
+// Chinese '米' is still accepted so older template data keeps working.
+function isMetersUnit(unit: string | undefined): boolean {
+  return unit === 'meters' || unit === 'm' || unit === '米';
+}
+
+function isMetersSuffix(suffix: string): boolean {
+  return /^m\b/.test(suffix) || suffix.includes('米');
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -438,9 +449,9 @@ function parsePaceOffset(rule: string, from: string): PaceOffsetParse | null {
   //                              athleteProfile.running.<x>SecPerKm typically)
   //   'easyPace + 10..30 s/km' -> base = athleteProfile.running.easyPaceSecPerKm
   //   'easyPace - 10..25 s/km' -> faster-than-easy progression finish
-  //   'cssPace 到 cssPace + 5 s/100m' -> CSS threshold range
-  //   '+20 s/km (上限，可选)'   -> singleOffset = 20
-  //   '+5..15 s/100m (上限)'   -> swimming offset
+  //   'cssPace to cssPace + 5 s/100m' -> CSS threshold range (legacy: '到')
+  //   '+20 s/km (upper cap, optional)'   -> singleOffset = 20
+  //   '+5..15 s/100m (upper cap)'   -> swimming offset
   const baseMap: Record<string, string> = {
     easyPace: 'athleteProfile.running.easyPaceSecPerKm',
     longPace: 'athleteProfile.running.longPaceSecPerKm',
@@ -491,7 +502,7 @@ function parsePaceOffset(rule: string, from: string): PaceOffsetParse | null {
   }
 
   const toRangeMatch = rule.match(
-    /(\w+)\s*到\s*(\w+)\s*([+-])\s*(\d+)\s*s\/(km|100m)/,
+    /(\w+)\s*(?:到|to)\s*(\w+)\s*([+-])\s*(\d+)\s*s\/(km|100m)/,
   );
   const toRangeBasePath = toRangeMatch ? baseMap[toRangeMatch[1]] : null;
   const toRangeEndPath = toRangeMatch ? baseMap[toRangeMatch[2]] : null;
@@ -654,7 +665,7 @@ function durationFromDistanceAndPace(
   }
   if (pace.seconds <= 0) return null;
   if (pace.unit === 's/km') {
-    const km = distance.unit === '米' ? distance.value / 1000 : distance.value;
+    const km = isMetersUnit(distance.unit) ? distance.value / 1000 : distance.value;
     return (km * pace.seconds) / 60;
   }
   const meters = distance.unit === 'km' ? distance.value * 1000 : distance.value;
@@ -754,7 +765,7 @@ function buildPaceString(
         key === 'targetPaceCap' ||
         key === 'easyPaceCap';
       if (v.unit === 's/km_upper' || v.unit === 's/100m_upper' || isUpperCap) {
-        return `不快于 ${formatSeconds(v.value)}${unit}`;
+        return `no faster than ${formatSeconds(v.value)}${unit}`;
       }
       if (v.unit === 's/km' || v.unit === 's/100m') {
         return `${formatSeconds(v.value)}${unit}`;
@@ -957,7 +968,7 @@ function resolvePhaseMinutes(
   if (!phase.duration) return null;
   // Phase duration string formats:
   //   '$varName' (variable reference, var can be minutes or seconds)
-  //   '$varName 米'
+  //   '$varName m' (legacy: '$varName 米')
   //   '0' (rest)
   const trimmed = phase.duration.trim();
   if (trimmed === '0') return 0;
@@ -968,7 +979,7 @@ function resolvePhaseMinutes(
   const v = resolved.get(varName);
   if (!v || v.kind !== 'number') return null;
 
-  if (suffix.includes('米')) {
+  if (isMetersSuffix(suffix)) {
     // Distance phases (swim) — not counted toward minutes, return 0.
     return 0;
   }
@@ -1030,9 +1041,9 @@ function buildWorkoutStructure(
     if (segment) parts.push(segment);
   }
   if (parts.length === 0) {
-    return `${template.fixed.title}：完全休息。`;
+    return `${template.fixed.title}: full rest.`;
   }
-  return parts.join('；') + '。';
+  return parts.join('; ') + '.';
 }
 
 function buildSegmentWorkoutStructure(
@@ -1049,10 +1060,10 @@ function buildSegmentWorkoutStructure(
     const pace400 = paceText(resolved, 'pyramid400Pace', '/km');
     if (pace1200 && pace800 && pace400) {
       return [
-        `热身 ${warmup} 分钟（动态拉伸、跑姿练习、4 x 20 秒加速）`,
-        `主训练 1200 米 @ ${pace1200}（约 10K 强度）+ 800 米 @ ${pace800}（约 5K 强度）+ 400 米 @ ${pace400}（约 3K 强度），组间慢跑恢复 ${recovery} 分钟`,
-        `放松 ${cooldown} 分钟`,
-      ].join('；') + '。';
+        `Warm-up ${warmup} min (dynamic stretching, running drills, 4 x 20 s strides)`,
+        `Main set 1200 m @ ${pace1200} (~10K effort) + 800 m @ ${pace800} (~5K effort) + 400 m @ ${pace400} (~3K effort), ${recovery} min easy jog between reps`,
+        `Cool-down ${cooldown} min`,
+      ].join('; ') + '.';
     }
   }
 
@@ -1065,12 +1076,12 @@ function buildSegmentWorkoutStructure(
     const finish = paceText(resolved, 'targetPace', '/km');
     if (easy && mid && finish) {
       return [
-        `热身 ${warmup} 分钟`,
-        `第一段 ${segment} 分钟 @ ${easy}，保持 Zone 2 下沿`,
-        `第二段 ${segment} 分钟 @ ${mid}，进入稳定有氧`,
-        `第三段 ${segment} 分钟 @ ${finish}，只到 Tempo 下沿，不进入阈值`,
-        `放松 ${cooldown} 分钟`,
-      ].join('；') + '。';
+        `Warm-up ${warmup} min`,
+        `Segment 1 ${segment} min @ ${easy}, low end of Zone 2`,
+        `Segment 2 ${segment} min @ ${mid}, steady aerobic`,
+        `Segment 3 ${segment} min @ ${finish}, up to the bottom of Tempo only, not threshold`,
+        `Cool-down ${cooldown} min`,
+      ].join('; ') + '.';
     }
   }
 
@@ -1085,10 +1096,10 @@ function buildSegmentWorkoutStructure(
     if (under && over) {
       const rounds = Math.max(1, Math.round(blockDuration / 3));
       return [
-        `热身 ${warmup} 分钟`,
-        `主训练 ${blocks} x ${blockDuration} 分钟，每组内 ${rounds} 轮（2 分钟 ${under} + 1 分钟 ${over}），组间轻松骑 ${recovery} 分钟`,
-        `放松 ${cooldown} 分钟`,
-      ].join('；') + '。';
+        `Warm-up ${warmup} min`,
+        `Main set ${blocks} x ${blockDuration} min, each block ${rounds} rounds of (2 min ${under} + 1 min ${over}), ${recovery} min easy spin between blocks`,
+        `Cool-down ${cooldown} min`,
+      ].join('; ') + '.';
     }
   }
 
@@ -1103,11 +1114,11 @@ function buildSegmentWorkoutStructure(
     const easyPace = paceText(resolved, 'easyPace', '/100m');
     if (sprintPace && easyPace) {
       return [
-        `热身 ${warmup} 米（含 4 x 25 米渐进加速）`,
-        `主训练 ${reps} x ${distance} 米 @ ${sprintPace}，组间休息 ${rest} 秒`,
-        `辅助 ${aux} x 50 米轻松技术游 @ ${easyPace}，组间休息 20 秒`,
-        `放松 ${cooldown} 米`,
-      ].join('；') + '。';
+        `Warm-up ${warmup} m (incl. 4 x 25 m build-ups)`,
+        `Main set ${reps} x ${distance} m @ ${sprintPace}, ${rest} s rest between reps`,
+        `Aux set ${aux} x 50 m easy technique swim @ ${easyPace}, 20 s rest between reps`,
+        `Cool-down ${cooldown} m`,
+      ].join('; ') + '.';
     }
   }
 
@@ -1120,10 +1131,10 @@ function buildSegmentWorkoutStructure(
     const high = stringValue(resolved, 'cadenceHighRange') ?? '100-110 rpm';
     const normal = stringValue(resolved, 'cadenceNormalRange') ?? '85-90 rpm';
     return [
-      `热身 ${warmup} 分钟`,
-      `主训练 ${reps} x ${duration} 分钟高踏频 ${high}，组间 ${recovery} 分钟 ${normal}`,
-      `放松 ${cooldown} 分钟`,
-    ].join('；') + '。';
+      `Warm-up ${warmup} min`,
+      `Main set ${reps} x ${duration} min high cadence ${high}, ${recovery} min at ${normal} between reps`,
+      `Cool-down ${cooldown} min`,
+    ].join('; ') + '.';
   }
 
   return null;
@@ -1138,7 +1149,7 @@ function describePhase(
     return phase.label;
   }
   const trimmed = phase.duration.trim();
-  if (trimmed === '0') return `${phase.label}：不安排训练`;
+  if (trimmed === '0') return `${phase.label}: no training`;
 
   const match = trimmed.match(/^\$(\w+)(.*)$/);
   if (!match) return `${phase.label} ${trimmed}`;
@@ -1148,32 +1159,39 @@ function describePhase(
 
   let durationLabel = '';
   if (v && v.kind === 'number') {
-    if (suffix.includes('米')) {
-      durationLabel = `${Math.round(v.value)} 米`;
+    if (isMetersSuffix(suffix)) {
+      durationLabel = `${Math.round(v.value)} m`;
     } else if (v.unit === 'seconds') {
       durationLabel = v.value >= 60
-        ? `${Math.round(v.value / 60)} 分钟`
-        : `${Math.round(v.value)} 秒`;
+        ? `${Math.round(v.value / 60)} min`
+        : `${Math.round(v.value)} s`;
     } else {
-      durationLabel = `${Math.round(v.value)} 分钟`;
+      durationLabel = `${Math.round(v.value)} min`;
     }
   }
 
-  const pieces = [phase.label];
-  if (durationLabel) pieces.push(durationLabel);
+  const head = durationLabel ? `${phase.label} ${durationLabel}` : phase.label;
+  const details: string[] = [];
   const detail = formatPhaseDescription(phase.description, resolved, targets);
-  if (detail) pieces.push(detail);
+  if (detail) details.push(lowercaseLeadingWord(detail));
 
   // Add target hints for the main phase.
   if (phase.name === 'main') {
     const extras: string[] = [];
-    if (targets.targetPace !== NA) extras.push(`配速 ${targets.targetPace}`);
-    if (targets.targetHeartRate !== NA) extras.push(`心率 ${targets.targetHeartRate}`);
-    if (targets.targetPower !== NA) extras.push(`功率 ${targets.targetPower}`);
-    if (extras.length > 0) pieces.push(extras.join('，'));
+    if (targets.targetPace !== NA) extras.push(`pace ${targets.targetPace}`);
+    if (targets.targetHeartRate !== NA) extras.push(`HR ${targets.targetHeartRate}`);
+    if (targets.targetPower !== NA) extras.push(`power ${targets.targetPower}`);
+    if (extras.length > 0) details.push(extras.join(', '));
   }
 
-  return pieces.join(' ');
+  return details.length > 0 ? `${head}: ${details.join(', ')}` : head;
+}
+
+// "Hold HR.zone2" -> "hold HR.zone2", but leave acronyms such as "CSS" or
+// "HR" untouched.
+function lowercaseLeadingWord(text: string): string {
+  if (/^[A-Z][a-z]/.test(text)) return text.charAt(0).toLowerCase() + text.slice(1);
+  return text;
 }
 
 function formatPhaseDescription(
@@ -1220,30 +1238,30 @@ function buildTargetsArray(args: {
   const { template, targetHeartRate, targetPace, targetPower, durationMinutes, distanceKm, preferredDurationMinutes, resolved } = args;
   const out: string[] = [];
 
-  if (durationMinutes > 0) out.push(`总时长 ${durationMinutes} 分钟`);
-  else out.push('总时长 不适用');
+  if (durationMinutes > 0) out.push(`Total duration ${durationMinutes} min`);
+  else out.push(`Total duration ${NA}`);
   if (
     preferredDurationMinutes !== null &&
     Number.isFinite(preferredDurationMinutes) &&
     durationMinutes > 0 &&
     Math.round(preferredDurationMinutes) === durationMinutes
   ) {
-    out.push(`已按单日可用时长上限 ${durationMinutes} 分钟安排`);
+    out.push(`Fitted to your daily time limit of ${durationMinutes} min`);
   }
 
   if (distanceKm !== null && distanceKm > 0) {
-    out.push(`参考距离 ${distanceKm.toFixed(1)} 公里`);
+    out.push(`Est. distance ${distanceKm.toFixed(1)} km`);
   }
 
-  if (targetHeartRate !== NA) out.push(`目标心率 ${targetHeartRate}`);
-  if (targetPace !== NA) out.push(`目标配速 ${targetPace}`);
-  if (targetPower !== NA) out.push(`目标功率 ${targetPower}`);
+  if (targetHeartRate !== NA) out.push(`Target HR ${targetHeartRate}`);
+  if (targetPace !== NA) out.push(`Target pace ${targetPace}`);
+  if (targetPower !== NA) out.push(`Target power ${targetPower}`);
   out.push(...buildSegmentTargets(template, resolved));
   const fueling = fuelingGuidance(template, durationMinutes);
   if (fueling) out.push(fueling);
 
   // Ensure at least one number-bearing bullet for non-rest workouts.
-  if (out.length === 0) out.push('参考强度 不适用');
+  if (out.length === 0) out.push(`Reference intensity ${NA}`);
   return out;
 }
 
@@ -1256,9 +1274,9 @@ function buildSegmentTargets(
     const pace800 = paceText(resolved, 'pyramid800Pace', '/km');
     const pace400 = paceText(resolved, 'pyramid400Pace', '/km');
     return [
-      pace1200 ? `1200 米目标配速 ${pace1200}（约 10K 强度）` : null,
-      pace800 ? `800 米目标配速 ${pace800}（约 5K 强度）` : null,
-      pace400 ? `400 米目标配速 ${pace400}（约 3K 强度）` : null,
+      pace1200 ? `1200 m target pace ${pace1200} (~10K effort)` : null,
+      pace800 ? `800 m target pace ${pace800} (~5K effort)` : null,
+      pace400 ? `400 m target pace ${pace400} (~3K effort)` : null,
     ].filter((v): v is string => Boolean(v));
   }
 
@@ -1268,9 +1286,9 @@ function buildSegmentTargets(
     const mid = paceText(resolved, 'progressionMidPace', '/km');
     const finish = paceText(resolved, 'targetPace', '/km');
     return [
-      easy ? `递进第 1 段 ${segment} 分钟 ${easy}` : null,
-      mid ? `递进第 2 段 ${segment} 分钟 ${mid}` : null,
-      finish ? `递进第 3 段 ${segment} 分钟 ${finish}` : null,
+      easy ? `Progression segment 1: ${segment} min ${easy}` : null,
+      mid ? `Progression segment 2: ${segment} min ${mid}` : null,
+      finish ? `Progression segment 3: ${segment} min ${finish}` : null,
     ].filter((v): v is string => Boolean(v));
   }
 
@@ -1278,8 +1296,8 @@ function buildSegmentTargets(
     const under = powerText(resolved, 'underPower');
     const over = powerText(resolved, 'overPower');
     return [
-      under ? `Under 段 2 分钟 ${under}（95% FTP）` : null,
-      over ? `Over 段 1 分钟 ${over}（105% FTP）` : null,
+      under ? `Under: 2 min ${under} (95% FTP)` : null,
+      over ? `Over: 1 min ${over} (105% FTP)` : null,
     ].filter((v): v is string => Boolean(v));
   }
 
@@ -1289,8 +1307,8 @@ function buildSegmentTargets(
     const sprintPace = paceText(resolved, 'sprintPace', '/100m');
     const easyPace = paceText(resolved, 'easyPace', '/100m');
     return [
-      sprintPace ? `短冲 ${reps} x ${distance} 米目标配速 ${sprintPace}` : null,
-      easyPace ? `辅助轻松技术游 ${easyPace}` : null,
+      sprintPace ? `Sprints ${reps} x ${distance} m target pace ${sprintPace}` : null,
+      easyPace ? `Aux easy technique swim ${easyPace}` : null,
     ].filter((v): v is string => Boolean(v));
   }
 
@@ -1307,13 +1325,13 @@ function fuelingGuidance(template: WorkoutTemplate, durationMinutes: number): st
     durationMinutes >= 90;
   if (!isLong) return null;
   if (template.fixed.sport === 'running') {
-    return '长课补给：超过 75 分钟时，每小时 30-60g 碳水，按天气补水和电解质';
+    return 'Long-session fueling: beyond 75 min, take 30-60 g carbs per hour; hydrate and add electrolytes for the weather';
   }
   if (template.fixed.sport === 'cycling') {
-    return '长课补给：每小时 30-60g 碳水，90 分钟以上可逐步接近 60-90g，并每 15-20 分钟补水';
+    return 'Long-session fueling: 30-60 g carbs per hour, building toward 60-90 g beyond 90 min; drink every 15-20 min';
   }
   if (template.fixed.sport === 'swimming') {
-    return '长课补给：下水前补足碳水和水分，训练间隙准备饮水';
+    return 'Long-session fueling: top up carbs and fluids before the swim; keep a bottle poolside for breaks';
   }
   return null;
 }
@@ -1322,9 +1340,9 @@ function buildAdaptation(template: WorkoutTemplate, durationMinutes: number): st
   if (template.fixed.notes && template.fixed.notes.length > 0) {
     return template.fixed.notes;
   }
-  if (durationMinutes <= 0) return '完全休息日，专注睡眠和补水。';
+  if (durationMinutes <= 0) return 'Full rest day: focus on sleep and hydration.';
   const shortened = Math.max(15, Math.round(durationMinutes * 0.7));
-  return `如果腿酸或睡眠差，将主训练缩短至 ${shortened} 分钟。`;
+  return `If your legs are sore or you slept poorly, shorten the session to ${shortened} min.`;
 }
 
 function inferDowngradeReason(
@@ -1332,7 +1350,7 @@ function inferDowngradeReason(
   scheduleEntry: ScheduleEntry,
 ): string | undefined {
   if (template.id === scheduleEntry.templateId) return undefined;
-  return `调度阶段已将 ${scheduleEntry.templateId} 替换为 ${template.id}。`;
+  return `Scheduler replaced ${scheduleEntry.templateId} with ${template.id}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,7 +1407,7 @@ function paceText(
   if (!v) return null;
   if (v.kind === 'number') {
     if (v.unit === 's/km_upper' || v.unit === 's/100m_upper') {
-      return `不快于 ${formatSeconds(v.value)}${suffix}`;
+      return `no faster than ${formatSeconds(v.value)}${suffix}`;
     }
     if (v.unit === 's/km' || v.unit === 's/100m' || !v.unit) {
       return `${formatSeconds(v.value)}${suffix}`;

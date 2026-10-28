@@ -14,12 +14,12 @@ export const QUOTA_DEFAULTS: Record<QuotaKind, number> = {
 };
 
 const QUOTA_FEATURE_LABELS: Record<QuotaKind, string> = {
-  plan_generation: 'AI 训练计划生成（包含高级训练计划）',
-  chat_message: 'AI 教练对话',
+  plan_generation: 'AI training plan generation (including advanced plans)',
+  chat_message: 'AI coach chat',
 };
 
 function maxRequiredMessage(kind: QuotaKind): string {
-  return `${QUOTA_FEATURE_LABELS[kind]}是 Max 会员功能。当前账号是免费版、Plus，或 Max 已过期，所以暂时不能使用；升级或兑换 Max 后即可解锁。`;
+  return `${QUOTA_FEATURE_LABELS[kind]} is a Max feature. Your account is on the Free or Plus plan, or your Max plan has expired. Upgrade or redeem a Max code to unlock it.`;
 }
 
 /**

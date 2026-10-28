@@ -117,7 +117,7 @@ interface LlmToolPayload {
 // ---------------------------------------------------------------------------
 
 const DAY_LABELS: readonly string[] = [
-  '周一', '周二', '周三', '周四', '周五', '周六', '周日',
+  'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun',
 ];
 
 const ALLOWED_SPORTS: ReadonlySet<string> = new Set([
@@ -232,7 +232,7 @@ export async function llmBuildWeeklySchedule(
       function: {
         name: TOOL_NAME,
         description:
-          '从允许的模板列表中为本周训练日程选择 templateId，并附中文 reason。默认每个 dayIndex 1 个；用户明确要求一天两练时，可为同一 dayIndex 返回 slotIndex=1/2 两条。',
+          'Pick a templateId from the allowed template list for each day of this week\'s schedule, with a one-line English reason. One entry per dayIndex by default; when the user explicitly asks for two sessions in one day, return two entries for that dayIndex with slotIndex=1/2.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -252,11 +252,11 @@ export async function llmBuildWeeklySchedule(
                     type: 'integer',
                     minimum: 1,
                     maximum: 3,
-                    description: '同一天多课时的课次编号；单练可省略或填 1',
+                    description: 'Session number when a day has several sessions; omit or use 1 for a single session',
                   },
                   sessionLabel: {
                     type: 'string',
-                    description: '例如 上午 / 下午；单练可省略',
+                    description: 'In English, e.g. "AM" / "PM"; omit for a single session',
                   },
                   timeOfDay: {
                     type: 'string',
@@ -267,13 +267,14 @@ export async function llmBuildWeeklySchedule(
                     enum: ['running', 'cycling', 'swimming', 'rest', 'mobility', 'strength'],
                   },
                   templateId: { type: 'string' },
-                  reason: { type: 'string', description: '中文一行说明' },
+                  reason: { type: 'string', description: 'One-line explanation in English' },
                 },
               },
             },
             notes: {
               type: 'array',
               items: { type: 'string' },
+              description: 'Risk notes and remarks, each written in English',
             },
           },
         },
@@ -745,15 +746,18 @@ interface BuildMessagesArgs {
 function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   const systemParts: string[] = [];
   systemParts.push(
-    '你是一位专业的运动教练，正在为用户安排 7 天训练计划。所有训练动作只能从下列允许的模板中选择 templateId，不允许编造模板 id 或参数。',
+    'You are a professional endurance coach planning a 7-day training week for the user. Every session must use a templateId from the allowed template list below; never invent template ids or parameters.',
   );
   systemParts.push(
-    '最高优先级：用户明确写出的训练类型、训练天数、同日多练和周目标时长优先于健康保护规则；如果存在风险，只能在 notes 中提醒，不要擅自删除或替换用户明确要求的训练。',
+    'Language: write every natural-language field (reason, sessionLabel, notes) in English, even if the user\'s goal or notes are written in another language.',
   );
-  systemParts.push('用户显式意图：');
+  systemParts.push(
+    'Top priority: workout types, number of training days, same-day double sessions and weekly time targets that the user explicitly wrote take precedence over the protective health rules; if there is a risk, only mention it in notes — do not remove or replace sessions the user explicitly asked for.',
+  );
+  systemParts.push('Explicit user intent:');
   systemParts.push(formatTrainingIntentForPrompt(args.requestIntent));
   systemParts.push(
-    '硬性规则：',
+    'Hard rules:',
   );
   const requestedTrainingDays = effectiveTrainingDaysPerWeek(args.request);
   const requestedRestDays = 7 - requestedTrainingDays;
@@ -769,147 +773,147 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
   const protectedTrainingDays = requestedTrainingDayIndexes(args.request);
   if (allowExtraSlots) {
     systemParts.push(
-      '- 必须覆盖 7 个 dayIndex (1..7)；允许为了满足同日多练或平均训练时长目标让 days 数组超过 7 条，同一 dayIndex 用 slotIndex=1/2 表示上午/下午两课。加练优先使用低强度 Z2、有氧、恢复或技术模板。',
+      '- You must cover all 7 dayIndex values (1..7). The days array may have more than 7 entries to satisfy same-day double sessions or the average session-length target; use slotIndex=1/2 on the same dayIndex for the AM/PM sessions. Extra sessions should preferably use low-intensity Z2, aerobic, recovery or technique templates.',
     );
     systemParts.push(
-      '- 当用户开启多个运动项目时，非明确“双阈值/同项目两练”请求下，同一天第二练应优先安排跨项目低压力恢复或技术训练；禁止用同一 sport 或同一 templateId 重复堆普通有氧。',
+      '- When the user has several sports enabled, unless they explicitly asked for "double threshold" / two sessions of the same sport, the second session of a day should preferably be a low-stress recovery or technique session in a different sport; do not stack plain aerobic sessions of the same sport or the same templateId.',
     );
   } else {
-    systemParts.push('- 必须输出且仅输出 7 条，覆盖 dayIndex 1..7；');
+    systemParts.push('- Output exactly 7 entries covering dayIndex 1..7;');
   }
   systemParts.push(
-    `- 用户选择每周 ${requestedTrainingDays} 天训练：必须正好 ${requestedTrainingDays} 天使用 running/cycling/swimming 模板，剩余 ${requestedRestDays} 天才可使用 rest/mobility 模板；`,
+    `- The user chose ${requestedTrainingDays} training days per week: exactly ${requestedTrainingDays} days must use running/cycling/swimming templates, and only the remaining ${requestedRestDays} days may use rest/mobility templates;`,
   );
   if (protectedTrainingDays.size > 0) {
     systemParts.push(
-      `- 用户明确指定 ${formatDayIndexes(protectedTrainingDays)} 为训练日：这些 dayIndex 禁止使用 rest/mobility 模板，也不能被默认休息日、近期疲劳或容量保护改成休息。`,
+      `- The user explicitly named ${formatDayIndexes(protectedTrainingDays)} as training days: these dayIndex values must not use rest/mobility templates and must not be turned into rest by the default rest day, recent fatigue or capacity protection.`,
     );
   }
   if (requestedTrainingDays === 7) {
     systemParts.push(
-      '- 用户选择每周 7 天训练：禁止使用 rest 或 mobility 模板，7 天都必须是实际运动训练；恢复只能用各运动项目的低强度恢复模板。',
+      '- The user chose 7 training days per week: rest and mobility templates are forbidden; all 7 days must be actual sport sessions, and recovery may only use each sport\'s low-intensity recovery templates.',
     );
   }
-  systemParts.push('- 每个非休息日必须给出一个允许列表中的 templateId；');
+  systemParts.push('- Every non-rest day must use a templateId from the allowed list;');
   if (args.request.forceRequestedSchedule !== true) {
-    systemParts.push('- 任意相邻两天不得同时为 intensity=high 的训练；');
+    systemParts.push('- No two consecutive days may both contain an intensity=high session;');
   } else {
     systemParts.push(
-      '- 严格模式已开启：不要因为连续高强度、近期训练刺激或容量评估自动减少用户要求的训练天数/强度；这些问题只在 notes 中写成风险提示。',
+      '- Strict mode is on: do not automatically reduce the training days/intensity the user asked for because of back-to-back hard days, recent training stimulus or the capacity assessment; mention these only as risk notes in notes.',
     );
   }
   systemParts.push(
-    `- 专业建议：本周高强度课建议不超过 ${computeHardCap(
+    `- Coaching recommendation: no more than ${computeHardCap(
       args.request,
       args.athleteProfile,
       args.recentState,
       args.trainingCapacity,
-    )} 次；如果用户显式要求超过，只能提示风险，不能删除用户要求。`,
+    )} high-intensity sessions this week; if the user explicitly asks for more, only warn about the risk — do not remove the user's request.`,
   );
   if (
     args.request.maxHardSessionsPerWeek !== null &&
     args.request.maxHardSessionsPerWeek !== undefined
   ) {
     const hardLine = args.request.forceRequestedSchedule === true
-      ? `- 用户选择每周 ${args.request.maxHardSessionsPerWeek} 次高强度，这是严格模式下的目标次数；训练天数足够且允许高级训练时，应安排到这个次数。除非用户文字明确点名更多具体高强度课，否则不得超过这个次数。`
-      : `- 用户设置的每周高强度上限为 ${args.request.maxHardSessionsPerWeek} 次，这是用户要求；除非用户文字明确点名更多具体高强度课，否则不得超过这个次数。`;
+      ? `- The user chose ${args.request.maxHardSessionsPerWeek} high-intensity sessions per week; in strict mode this is the target count. When there are enough training days and advanced workouts are allowed, schedule exactly this many. Do not exceed it unless the user's text explicitly names more specific hard sessions.`
+      : `- The user's weekly high-intensity cap is ${args.request.maxHardSessionsPerWeek} sessions; this is a user requirement. Do not exceed it unless the user's text explicitly names more specific hard sessions.`;
     systemParts.push(hardLine);
   }
   if (args.request.forceRequestedSchedule !== true) {
     systemParts.push(
-      '- 若最近 36 小时内有 threshold/vo2max/anaerobic 训练，第 1 天不得安排高强度课；',
+      '- If there was a threshold/vo2max/anaerobic session in the last 36 hours, day 1 must not contain a high-intensity session;',
     );
   }
   systemParts.push(
-    `- 本周总训练时长不得超过 ${args.request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES} 分钟；`,
+    `- Total training time this week must not exceed ${args.request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES} min;`,
   );
   if (args.requestIntent.weeklyTargetMinutes !== null) {
     systemParts.push(
-      `- 用户写明本周训练目标约 ${args.requestIntent.weeklyTargetMinutes} 分钟：在不超过周上限的前提下，应尽量接近该目标；优先增加 Z2、长距离、恢复和技术训练时长，质量课只增加热身/放松或恢复段。`,
+      `- The user stated a weekly training target of about ${args.requestIntent.weeklyTargetMinutes} min: get as close to it as possible without exceeding the weekly cap; add time mainly through Z2, long, recovery and technique sessions, and for quality sessions only extend the warm-up/cool-down or recovery segments.`,
     );
   }
   systemParts.push(
-    '- sport 字段必须与所选 templateId 对应模板的 sport 一致；',
+    '- The sport field must match the sport of the chosen templateId\'s template;',
   );
   if (requestedTrainingDays < 7) {
     systemParts.push(
-      '- 休息日请使用 rest 类模板（rest.full.v1 / rest.mobility.v1）。',
+      '- Use rest templates for rest days (rest.full.v1 / rest.mobility.v1).',
     );
   }
   systemParts.push(
-    '- 同一运动一周内若安排多次 high 强度课，应优先覆盖不同训练目的，例如 threshold / interval / VO2max / race_pace，不要无理由重复同一个 high 模板；',
+    '- If one sport has several high-intensity sessions in a week, they should cover different training purposes, e.g. threshold / interval / VO2max / race_pace; do not repeat the same high-intensity template without a reason;',
   );
   systemParts.push(
-    '- 跑步用户若一周有 2 次质量课，通常一节偏阈值/节奏，一节偏间歇/VO2max，除非近期疲劳或模板禁忌不允许；',
+    '- For runners with 2 quality sessions in a week, usually one leans threshold/tempo and the other intervals/VO2max, unless recent fatigue or template contraindications rule it out;',
   );
   systemParts.push(
-    '- 如果用户同时启用游泳、骑行、跑步，并且训练天数足够，每周必须同时覆盖三项；不要只围绕跑步安排。',
+    '- If the user enabled swimming, cycling and running and has enough training days, the week must cover all three sports; do not build the week around running only.',
   );
   systemParts.push(
-    '- 骑行有 FTP 时优先选择/输出功率目标；游泳优先使用 CSS/每 100m 配速；跑步低强度优先心率区间。',
+    '- For cycling with a known FTP prefer power targets; for swimming prefer CSS / per-100m pace; for low-intensity running prefer heart-rate zones.',
   );
   if (args.request.dailyPreferredMinutes && args.request.dailyPreferredMinutes > 0) {
     systemParts.push(
-      `- 用户填写的 ${args.request.dailyPreferredMinutes} 分钟是训练日平均时长参考，不是单节硬上限；整体课表应让训练日平均时长接近该值。低强度 Z2/有氧/长距离课可以超过该值，高级用户的 Z2 骑行通常不应短于 75-90 分钟。不要为了凑时长拉长阈值/VO2/间歇主训练。`,
+      `- The user's ${args.request.dailyPreferredMinutes} min is a reference for the average training-day duration, not a hard cap per session; the week as a whole should bring the average training-day duration close to it. Low-intensity Z2/aerobic/long sessions may exceed it, and Z2 rides for advanced athletes should usually be no shorter than 75-90 min. Do not stretch threshold/VO2/interval main sets just to fill time.`,
     );
     systemParts.push(
-      '- 如果该时长低于长距离模板的最低可执行时长，不要把普通有氧课标成 long/LSD：跑步 run.lsd.v1 至少需要 70 分钟，骑行 bike.long_ride.v1 至少需要 90 分钟；更短时使用 aerobic/endurance/recovery 模板。',
+      '- If that duration is below the minimum workable duration of a long-session template, do not label a regular aerobic session as long/LSD: run.lsd.v1 needs at least 70 min and bike.long_ride.v1 at least 90 min; use aerobic/endurance/recovery templates for shorter sessions.',
     );
     if (args.request.dailyPreferredMinutes < 30) {
       systemParts.push(
-        '- 用户单日时长非常短：优先使用 recovery/technique 模板，不要安排常规有氧、长距离或复杂质量课来硬塞进短窗口。',
+        '- The user\'s daily time is very short: prefer recovery/technique templates; do not squeeze regular aerobic, long or complex quality sessions into the short window.',
       );
     }
   }
   if (args.isColdStart) {
     systemParts.push(
-      '- 该用户结构化训练历史很少或暂无可用运动能力档案；本周日程必须保守，优先低强度、有氧基础、技术和恢复，不要安排激进配速/功率导向的高风险结构。',
+      '- This user has very little structured training history or no usable fitness profile yet; this week must be conservative, favouring low intensity, aerobic base, technique and recovery, and avoiding aggressive pace/power-driven high-risk structures.',
     );
   }
   if (args.trainingCapacity) {
     systemParts.push(
-      `- 训练容量评估：level=${args.trainingCapacity.overall.level}, readiness=${args.trainingCapacity.overall.readiness}, confidence=${args.trainingCapacity.overall.readinessConfidence}，高强度上限 ${args.trainingCapacity.guardrails.maxHardSessionsPerWeek} 次，高强度分钟占比上限 ${Math.round(args.trainingCapacity.guardrails.maxHighMinutesShare * 100)}%。`,
+      `- Training-capacity assessment: level=${args.trainingCapacity.overall.level}, readiness=${args.trainingCapacity.overall.readiness}, confidence=${args.trainingCapacity.overall.readinessConfidence}; high-intensity cap ${args.trainingCapacity.guardrails.maxHardSessionsPerWeek} sessions; high-intensity minutes share cap ${Math.round(args.trainingCapacity.guardrails.maxHighMinutesShare * 100)}%.`,
     );
     systemParts.push(
-      '- 单周专业规则：低强度训练应占主体；不要用多个长阈值/VO2/间歇课去填满用户可用时长；长跑/长骑只能作为本项目周训练量的一部分，不能吞掉大多数训练分钟。',
+      '- Weekly coaching rule: low-intensity training should make up the bulk of the week; do not fill the user\'s available time with several long threshold/VO2/interval sessions; a long run/long ride is only part of that sport\'s weekly volume and must not swallow most of the training minutes.',
     );
     if (args.request.forceRequestedSchedule === true) {
       systemParts.push(
-        '- 用户已明确要求按原请求生成：不要因为训练容量保护自动删除用户要求的训练频率/高强度意图，但必须在 notes 中说明风险与不推荐原因。',
+        '- The user explicitly asked to generate the plan as requested: do not automatically remove the requested training frequency/high-intensity intent because of capacity protection, but you must explain the risks and why it is not recommended in notes.',
       );
     } else if (!args.trainingCapacity.guardrails.allowHighIntensity) {
       systemParts.push(
-        '- 容量/恢复保护：本周禁止安排 intensity=high 的模板，只能安排低强度、技术或恢复类训练。',
+        '- Capacity/recovery protection: no intensity=high templates this week; only low-intensity, technique or recovery sessions are allowed.',
       );
     }
   }
   if (args.request.preferredTrainingWindows && args.request.preferredTrainingWindows.length > 0) {
     systemParts.push(
-      `- 用户偏好训练时段：${args.request.preferredTrainingWindows.join('、')}；调度结果会按这些时段标注 timeOfDay。`,
+      `- User's preferred training windows: ${args.request.preferredTrainingWindows.join(', ')}; the schedule will label timeOfDay from these windows.`,
     );
   }
   if (args.request.allowAdvancedWorkouts !== true) {
     if (args.request.forceRequestedSchedule === true && args.requestIntent.requiredWorkouts.length > 0) {
       systemParts.push(
-        '- 用户未开启高级训练开关，但文字里显式要求了高级训练；本次以文字要求为准，安排对应模板并在 notes 中提示风险。',
+        '- The user has not turned on advanced workouts, but explicitly asked for advanced sessions in their text; follow the text this time, schedule the matching templates and warn about the risks in notes.',
       );
     } else {
       systemParts.push(
-        '- 用户未开启高级训练：不得安排 VO2max、短间歇、无氧、冲刺、坡跑/爬坡、比赛专项、公开水域专项、双阈值或同日多练。',
+        '- The user has not turned on advanced workouts: do not schedule VO2max, short intervals, anaerobic, sprints, hill runs/climbing, race-specific, open-water-specific, double-threshold or same-day double sessions.',
       );
     }
   } else {
     systemParts.push(
-      '- 用户已开启高级训练：如果用户点名高级模板必须安排；未点名的高级模板仍需根据训练基础、疲劳、禁忌和高强度上限谨慎选择。',
+      '- The user has turned on advanced workouts: any advanced template the user names must be scheduled; advanced templates the user did not name should still be chosen carefully based on training background, fatigue, contraindications and the high-intensity cap.',
     );
   }
   systemParts.push('');
-  systemParts.push('允许的模板列表（每行格式：id | sport | intensity | purpose | block:contraindications）：');
-  systemParts.push(args.catalog || '(空)');
+  systemParts.push('Allowed template list (one per line: id | sport | intensity | purpose | block:contraindications):');
+  systemParts.push(args.catalog || '(empty)');
 
   if (args.retryViolations && args.retryViolations.length > 0) {
     systemParts.push('');
-    systemParts.push('上一次输出违反规则，请重新规划，避免下列问题：');
+    systemParts.push('Your previous output broke the rules. Re-plan the week and avoid the following problems:');
     for (const v of args.retryViolations) {
       systemParts.push(`- ${v}`);
     }
@@ -961,7 +965,7 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     { role: 'system', content: systemParts.join('\n') },
     {
       role: 'user',
-      content: `请为以下用户规划本周训练并通过 ${TOOL_NAME} 工具返回。\n\n${JSON.stringify(user, null, 2)}`,
+      content: `Plan this week's training for the following user and return it via the ${TOOL_NAME} tool (all text in English).\n\n${JSON.stringify(user, null, 2)}`,
     },
   ];
 }
@@ -987,7 +991,7 @@ function hasExplicitSameSportDoubleRequest(request: ScheduleRequest): boolean {
   ]
     .filter(Boolean)
     .join('\n');
-  return /双阈值|双阈|同项目.*两练|两练.*同项目|一天.*两.*跑|一天.*两.*骑|一天.*两.*游|double\s*threshold|same[-\s]?sport/i.test(text);
+  return /双阈值|双阈|同项目.*两练|两练.*同项目|一天.*两.*跑|一天.*两.*骑|一天.*两.*游|double\s*threshold|same[-\s]?sport|two\s*(runs|rides|swims)\s*(in\s*)?(one|a|the\s*same)\s*day/i.test(text);
 }
 
 function catalogLineForTemplate(templateId: string): string | null {

@@ -30,10 +30,10 @@ export function buildPasswordResetEmail(name: string, resetUrl: string): {
   subject: string;
   html: string;
 } {
-  const subject = '重置你的 Garmin Trainer 密码';
-  const greeting = name ? `${escapeHtml(name)}，你好` : '你好';
+  const subject = 'Reset your Garmin Trainer password';
+  const greeting = name ? `Hi ${escapeHtml(name)}` : 'Hi';
   const html = `<!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -51,26 +51,26 @@ export function buildPasswordResetEmail(name: string, resetUrl: string): {
           </tr>
           <tr>
             <td style="padding: 40px;">
-              <h2 style="margin:0 0 16px; font-size:20px; color:#5c4a2a; font-weight:600;">重置密码</h2>
-              <p style="margin:0 0 16px; font-size:16px; line-height:1.7; color:#4a3f2f;">${greeting}，</p>
+              <h2 style="margin:0 0 16px; font-size:20px; color:#5c4a2a; font-weight:600;">Reset password</h2>
+              <p style="margin:0 0 16px; font-size:16px; line-height:1.7; color:#4a3f2f;">${greeting},</p>
               <p style="margin:0 0 24px; font-size:16px; line-height:1.7; color:#4a3f2f;">
-                点击下方按钮重置你的 Garmin Trainer 密码。链接将在 1 小时后失效。
+                Click the button below to reset your Garmin Trainer password. This link expires in 1 hour.
               </p>
               <table width="100%" cellpadding="0" cellspacing="0" style="margin: 24px 0;">
                 <tr>
                   <td align="center">
-                    <a href="${resetUrl}" style="display:inline-block; background:#c4a265; color:#ffffff; text-decoration:none; padding:14px 36px; border-radius:8px; font-size:15px; font-weight:600;">重置密码</a>
+                    <a href="${resetUrl}" style="display:inline-block; background:#c4a265; color:#ffffff; text-decoration:none; padding:14px 36px; border-radius:8px; font-size:15px; font-weight:600;">Reset password</a>
                   </td>
                 </tr>
               </table>
               <p style="margin:24px 0 12px; font-size:13px; line-height:1.6; color:#9a8b6f;">
-                如果按钮无法点击，可复制下面的链接到浏览器打开：
+                If the button does not work, copy and paste this link into your browser:
               </p>
               <p style="margin:0; word-break:break-all; font-size:12px; color:#9a8b6f; font-family: 'SF Mono', Menlo, Consolas, monospace;">
                 ${resetUrl}
               </p>
               <p style="margin:24px 0 0; font-size:14px; line-height:1.7; color:#9a8b6f;">
-                如果这不是你本人发起的请求，可以安全地忽略这封邮件。
+                If you didn't request this, you can safely ignore this email.
               </p>
             </td>
           </tr>
@@ -92,10 +92,10 @@ export function buildEmailVerificationEmail(name: string, verifyUrl: string): {
   subject: string;
   html: string;
 } {
-  const subject = '验证你的 Garmin Trainer 邮箱';
-  const greeting = name ? `${escapeHtml(name)}，欢迎` : '欢迎';
+  const subject = 'Verify your Garmin Trainer email';
+  const greeting = name ? `Welcome, ${escapeHtml(name)}` : 'Welcome';
   const html = `<!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -113,26 +113,26 @@ export function buildEmailVerificationEmail(name: string, verifyUrl: string): {
           </tr>
           <tr>
             <td style="padding: 40px;">
-              <h2 style="margin:0 0 16px; font-size:20px; color:#5c4a2a; font-weight:600;">验证邮箱</h2>
-              <p style="margin:0 0 16px; font-size:16px; line-height:1.7; color:#4a3f2f;">${greeting}，</p>
+              <h2 style="margin:0 0 16px; font-size:20px; color:#5c4a2a; font-weight:600;">Verify email</h2>
+              <p style="margin:0 0 16px; font-size:16px; line-height:1.7; color:#4a3f2f;">${greeting},</p>
               <p style="margin:0 0 24px; font-size:16px; line-height:1.7; color:#4a3f2f;">
-                感谢注册 Garmin Trainer。点击下方按钮验证你的邮箱地址，验证完成后即可登录使用。链接将在 1 小时后失效。
+                Thanks for signing up for Garmin Trainer. Click the button below to verify your email address, then you can sign in. This link expires in 1 hour.
               </p>
               <table width="100%" cellpadding="0" cellspacing="0" style="margin: 24px 0;">
                 <tr>
                   <td align="center">
-                    <a href="${verifyUrl}" style="display:inline-block; background:#c4a265; color:#ffffff; text-decoration:none; padding:14px 36px; border-radius:8px; font-size:15px; font-weight:600;">验证邮箱</a>
+                    <a href="${verifyUrl}" style="display:inline-block; background:#c4a265; color:#ffffff; text-decoration:none; padding:14px 36px; border-radius:8px; font-size:15px; font-weight:600;">Verify email</a>
                   </td>
                 </tr>
               </table>
               <p style="margin:24px 0 12px; font-size:13px; line-height:1.6; color:#9a8b6f;">
-                如果按钮无法点击，可复制下面的链接到浏览器打开：
+                If the button does not work, copy and paste this link into your browser:
               </p>
               <p style="margin:0; word-break:break-all; font-size:12px; color:#9a8b6f; font-family: 'SF Mono', Menlo, Consolas, monospace;">
                 ${verifyUrl}
               </p>
               <p style="margin:24px 0 0; font-size:14px; line-height:1.7; color:#9a8b6f;">
-                如果这不是你本人发起的注册，可以安全地忽略这封邮件。
+                If you didn't sign up, you can safely ignore this email.
               </p>
             </td>
           </tr>

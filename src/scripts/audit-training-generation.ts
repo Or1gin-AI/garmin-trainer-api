@@ -24,7 +24,7 @@ type JsonRecord = Record<string, unknown>;
 
 const AUDIT_LLM_NAME = 'codex-audit-openai-compatible';
 const WEEK_START = '2026-05-18';
-const DAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 const advancedProfile: AthleteProfile = {
   heartRate: {
@@ -85,7 +85,7 @@ const normalRecentState: RecentState = {
   load7d: 420,
   load28d: 1600,
   loadTrend: 'stable',
-  recommendation: '状态正常，可以安排结构化训练。',
+  recommendation: 'Recovery is normal; structured training is fine.',
 };
 
 const highRiskRecentState: RecentState = {
@@ -95,7 +95,7 @@ const highRiskRecentState: RecentState = {
   hardSessionsLast7d: 3,
   load7d: 900,
   loadTrend: 'rising',
-  recommendation: '疲劳风险高，建议只保留风险提示并谨慎执行用户要求。',
+  recommendation: 'High fatigue risk; keep risk warnings and follow the user request with caution.',
 };
 
 function addDays(date: string, days: number): string {
@@ -107,7 +107,7 @@ function addDays(date: string, days: number): string {
 function makeRequest(overrides: Partial<ScheduleRequest>): ScheduleRequest {
   return {
     weekStartDate: WEEK_START,
-    goal: '提升综合耐力',
+    goal: 'Improve overall endurance',
     raceDate: null,
     goalDistance: null,
     daysPerWeek: 4,
@@ -137,11 +137,11 @@ function entryFor(templateId: string, dayIndex: number, slotIndex = 1): Schedule
   return {
     dayIndex,
     date: addDays(WEEK_START, dayIndex - 1),
-    dayLabel: DAY_LABELS[dayIndex - 1] ?? `第 ${dayIndex} 天`,
+    dayLabel: DAY_LABELS[dayIndex - 1] ?? `Day ${dayIndex}`,
     sport: tpl.fixed.sport,
     templateId,
     slotIndex,
-    sessionLabel: slotIndex > 1 ? `训练 ${slotIndex}` : undefined,
+    sessionLabel: slotIndex > 1 ? `Session ${slotIndex}` : undefined,
     timeOfDay: slotIndex > 1 ? 'evening' : 'morning',
     reason: 'audit',
   };
@@ -220,7 +220,7 @@ function auditAllTemplates(): string[] {
 function auditWorkoutPresentation(scope: string, workout: ParameterizedWorkout): string[] {
   const failures: string[] = [];
   const referenceDistanceTargets = (workout.targets ?? []).filter((target) =>
-    /^参考距离/.test(target),
+    /^(?:参考距离|Est\. distance)/.test(target),
   );
   const structureMinutes = sumMinutePhasesFromTemplate(workout);
   if (structureMinutes !== null && Math.abs(workout.durationMinutes - structureMinutes) > 1) {
@@ -244,7 +244,7 @@ function auditWorkoutPresentation(scope: string, workout: ParameterizedWorkout):
   if (workout.distanceKm !== null && workout.distanceKm > 0) {
     const expected = Number(workout.distanceKm.toFixed(1));
     const found = referenceDistanceTargets
-      .map((target) => /参考距离\s*(\d+(?:\.\d+)?)\s*公里/.exec(target)?.[1])
+      .map((target) => /(?:参考距离|Est\. distance)\s*(\d+(?:\.\d+)?)\s*(?:公里|km)/.exec(target)?.[1])
       .filter((value): value is string => Boolean(value))
       .map(Number);
     if (found.length > 0 && !found.some((value) => Math.abs(value - expected) < 0.05)) {
@@ -288,11 +288,13 @@ function phaseMinutesFromVars(
   if (!duration) return null;
   const trimmed = duration.trim();
   if (trimmed === '0') return 0;
-  const literal = /^(\d+(?:\.\d+)?)\s*分钟$/.exec(trimmed);
+  const literal = /^(\d+(?:\.\d+)?)\s*(?:分钟|min)$/.exec(trimmed);
   if (literal) return Number(literal[1]);
   const match = /^\$(\w+)(.*)$/.exec(trimmed);
   if (!match) return null;
-  if ((match[2] ?? '').includes('米')) return null;
+  const suffix = (match[2] ?? '').trim();
+  // Distance phases ('$var m'; legacy '$var 米') don't count toward minutes.
+  if (suffix.includes('米') || /^m\b/.test(suffix)) return null;
   const value = positiveNumber(vars[match[1]]);
   if (value <= 0) return null;
   const unit = template.variables[match[1]]?.source.unit;
@@ -467,7 +469,7 @@ function fakeWorkoutFromPrompt(payload: JsonRecord): JsonRecord {
   const entry: ScheduleEntry = {
     dayIndex: Number(schedulePayload.dayIndex ?? 1),
     date: String(schedulePayload.date ?? WEEK_START),
-    dayLabel: String(schedulePayload.dayLabel ?? '周一'),
+    dayLabel: String(schedulePayload.dayLabel ?? 'Mon'),
     sport: template.fixed.sport,
     templateId,
     slotIndex: 1,
@@ -520,9 +522,9 @@ function createFakeOpenAiServer(): Promise<{ server: http.Server; baseUrl: strin
 
     if (body.stream === true) {
       const text =
-        '## 摘要\n本周计划已生成，包含多项目训练与恢复安排。\n\n' +
-        '## 监控重点\n关注主观疲劳、睡眠和心率漂移。\n\n' +
-        '## 调整规则\n若疲劳升高，优先缩短低强度训练；若疼痛出现，立即停止当天训练。';
+        '## Summary\nThis week\'s plan is ready, with multi-sport training and recovery.\n\n' +
+        '## Monitoring\nWatch perceived fatigue, sleep, and heart-rate drift.\n\n' +
+        '## Adjustment rules\nIf fatigue rises, shorten easy sessions first; if pain appears, stop that day\'s training immediately.';
       res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`);
       res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 20 } })}\n\n`);

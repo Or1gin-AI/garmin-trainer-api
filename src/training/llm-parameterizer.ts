@@ -22,6 +22,7 @@ import type { RecentState } from './recent-state.js';
 import { MAX_WEEKLY_TRAINING_MINUTES, type ScheduleEntry } from './scheduler.js';
 import { parameterizeWorkout, type ParameterizedWorkout } from './parameterizer.js';
 import type { WorkoutTemplate, PrimaryMetric, Intensity } from './templates/types.js';
+import { NOT_APPLICABLE, isNotApplicable } from './not-applicable.js';
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -75,7 +76,7 @@ interface LlmWorkoutPayload {
 
 const TOOL_NAME = 'parameterize_workout';
 const PARAMETERIZE_TOOL_CALL_TIMEOUT_MS = 12_000;
-const NA = '不适用';
+const NA = NOT_APPLICABLE;
 const DETERMINISTIC_PARAMETERIZATION_TEMPLATE_IDS = new Set([
   'run.reverse_pyramid.v1',
   'run.progression.v1',
@@ -109,7 +110,7 @@ export async function llmParameterizeWorkout(
       function: {
         name: TOOL_NAME,
         description:
-          '为给定模板填入数值参数并生成中文训练课内容。模板的 sport / phases 不可改变。',
+          'Fill in the numeric parameters for the given template and write the workout content in English. The template\'s sport / phases must not change.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -133,21 +134,21 @@ export async function llmParameterizeWorkout(
               type: 'string',
               enum: ['heart_rate', 'pace', 'power', 'mixed', 'none'],
             },
-            targetHeartRate: { type: 'string', description: '形如 "132-146 bpm" 或 "不适用"' },
-            targetPace: { type: 'string', description: '跑步以 /km，游泳以 /100m 结尾，骑行必须为 不适用' },
-            targetPower: { type: 'string', description: '骑行以 W 结尾，否则 不适用' },
-            workoutStructure: { type: 'string', description: '中文一段，包含数字' },
+            targetHeartRate: { type: 'string', description: 'e.g. "132-146 bpm" or "N/A"' },
+            targetPace: { type: 'string', description: 'Running ends with /km, swimming ends with /100m; cycling must be "N/A"' },
+            targetPower: { type: 'string', description: 'Cycling ends with W; otherwise "N/A"' },
+            workoutStructure: { type: 'string', description: 'One English paragraph that contains numbers' },
             targets: {
               type: 'array',
               items: { type: 'string' },
-              description: '中文要点列表，每项包含数字或"不适用"',
+              description: 'List of short English bullet points; each item contains a number or "N/A"',
               minItems: 1,
             },
-            adaptation: { type: 'string', description: '若疲劳/伤病时如何调整训练' },
+            adaptation: { type: 'string', description: 'In English: how to adjust the session when fatigued or injured' },
             variables: {
               type: 'object',
               additionalProperties: { type: ['string', 'number'] },
-              description: '所选关键变量数值，便于审计 — key 与模板的 variables 名一致',
+              description: 'Chosen values of the key variables for auditing; keys match the template variables names',
             },
           },
         },
@@ -340,13 +341,14 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
   const distanceKm = sanitizeLlmDistanceKm(template, parsedDistanceKm);
 
   // Strings — coerce undefined to NA / empty, then format-validate.
-  const targetHeartRate = typeof parsed.targetHeartRate === 'string' && parsed.targetHeartRate.trim()
+  // Normalize every "not applicable" spelling (N/A, legacy 不适用, empty) to NA.
+  const targetHeartRate = typeof parsed.targetHeartRate === 'string' && !isNotApplicable(parsed.targetHeartRate)
     ? parsed.targetHeartRate.trim()
     : NA;
-  const targetPace = typeof parsed.targetPace === 'string' && parsed.targetPace.trim()
+  const targetPace = typeof parsed.targetPace === 'string' && !isNotApplicable(parsed.targetPace)
     ? parsed.targetPace.trim()
     : NA;
-  const targetPower = typeof parsed.targetPower === 'string' && parsed.targetPower.trim()
+  const targetPower = typeof parsed.targetPower === 'string' && !isNotApplicable(parsed.targetPower)
     ? parsed.targetPower.trim()
     : NA;
   const workoutStructure = typeof parsed.workoutStructure === 'string' && parsed.workoutStructure.trim()
@@ -358,8 +360,8 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
   const targets: string[] = Array.isArray(parsed.targets)
     ? parsed.targets.filter((t): t is string => isUsefulTarget(t))
     : [];
-  if (distanceKm !== null && distanceKm > 0 && !targets.some((t) => /^参考距离/.test(t))) {
-    targets.splice(1, 0, `参考距离 ${distanceKm.toFixed(1)} 公里`);
+  if (distanceKm !== null && distanceKm > 0 && !targets.some((t) => /^(?:参考距离|Est\. distance)/.test(t))) {
+    targets.splice(1, 0, `Est. distance ${distanceKm.toFixed(1)} km`);
   }
 
   const isRest = sport === 'rest' || sport === 'mobility';
@@ -391,7 +393,7 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
       violations.push('workoutStructure must contain at least one numeric token');
     }
 
-    // targets must each contain a digit (or be 不适用).
+    // targets must each contain a digit (or be N/A).
     for (const t of targets) {
       if (!/\d/.test(t) && !t.includes(NA)) {
         violations.push(`unquantified target: "${t}"`);
@@ -444,8 +446,8 @@ function validateAndBuild(args: ValidateBuildArgs): ParameterizedWorkout {
     targetHeartRate,
     targetPace,
     targetPower,
-    workoutStructure: workoutStructure || `${template.fixed.title}：${template.fixed.purpose}`,
-    targets: targets.length > 0 ? targets : [`总时长 ${durationMinutes} 分钟`],
+    workoutStructure: workoutStructure || `${template.fixed.title}: ${template.fixed.purpose}`,
+    targets: targets.length > 0 ? targets : [`Total duration ${durationMinutes} min`],
     parameterSource: {
       templateId: template.id,
       progression,
@@ -465,7 +467,7 @@ function isUsefulTarget(value: unknown): value is string {
   if (typeof value !== 'string') return false;
   const text = value.trim();
   if (!text) return false;
-  return !/^参考距离/.test(text);
+  return !/^(?:参考距离|Est\. distance)/.test(text);
 }
 
 function pickValidTargetMetric(
@@ -504,35 +506,38 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
 
   const systemParts: string[] = [];
   systemParts.push(
-    '你是一位专业运动教练，正在把一个固定结构的训练模板填上数值参数与中文文字内容。',
+    'You are a professional endurance coach filling a fixed-structure workout template with numeric parameters and written workout content.',
   );
-  systemParts.push('硬性约束：');
-  systemParts.push('- 模板的 sport、phases、purpose、intensity 不可更改；');
+  systemParts.push(
+    'Language: every natural-language field you return (workoutStructure, targets, adaptation) must be written in English, even if the template, profile or user notes contain another language.',
+  );
+  systemParts.push('Hard constraints:');
+  systemParts.push('- The template\'s sport, phases, purpose and intensity must not change;');
   if (sport === 'cycling') {
-    systemParts.push(`- targetPace 必须等于 "${NA}"；`);
+    systemParts.push(`- targetPace must equal "${NA}";`);
   }
   if (sport === 'running') {
-    systemParts.push('- targetPace 必须以 /km 结尾（如 "5:10/km" 或 "5:00-5:10/km"）；');
+    systemParts.push('- targetPace must end with /km (e.g. "5:10/km" or "5:00-5:10/km");');
   }
   if (sport === 'swimming') {
-    systemParts.push('- targetPace 必须以 /100m 结尾；');
+    systemParts.push('- targetPace must end with /100m;');
   }
-  systemParts.push('- targetHeartRate 必须包含 "bpm"，否则填 "不适用"；');
-  systemParts.push('- 非休息日必须给出 HR / 配速 / 功率 中至少一个有数值；');
-  systemParts.push('- workoutStructure 是中文一段话，必须含数字；targets 至少 1 项，每项含数字（或"不适用"）；');
-  systemParts.push('- 数值需在模板 variables 给定的 min..max 之内（如未给出则参考运动员档案）；');
-  systemParts.push('- 分段训练必须逐段写清目标；不同强度段不能复用同一个配速/功率/心率，除非模板明确要求稳定阈值。');
+  systemParts.push(`- targetHeartRate must contain "bpm"; otherwise use "${NA}";`);
+  systemParts.push('- A non-rest day must give a numeric value for at least one of HR / pace / power;');
+  systemParts.push(`- workoutStructure is one English paragraph and must contain numbers (use "min", "s", "m", "km" units); targets has at least 1 item and each item contains a number (or "${NA}");`);
+  systemParts.push('- Values must stay within the min..max given by the template variables (if none is given, use the athlete profile as reference);');
+  systemParts.push('- Segmented workouts must state the target of each segment; different intensity segments must not reuse the same pace/power/heart rate unless the template explicitly asks for a steady threshold.');
   systemParts.push(
-    `- 当前 progression=${args.progression}，对照模板的 progression 调整时长和重复次数。`,
+    `- Current progression=${args.progression}; adjust durations and repeat counts according to the template's progression.`,
   );
   if (args.request.dailyPreferredMinutes && args.request.dailyPreferredMinutes > 0) {
     systemParts.push(
-      `- 用户填写的 ${args.request.dailyPreferredMinutes} 分钟是单日可用上限，不是必须凑满的目标；若模板默认时长更短，不要为了凑时长增加阈值/VO2/间歇总量。`,
+      `- The user's ${args.request.dailyPreferredMinutes} min is the maximum time available that day, not a target that must be filled; if the template default is shorter, do not add threshold/VO2/interval volume just to fill time.`,
     );
   }
   if (args.scheduleEntry.durationCapMinutes && args.scheduleEntry.durationCapMinutes > 0) {
     systemParts.push(
-      `- 训练容量保护：本节课总时长不得超过 ${args.scheduleEntry.durationCapMinutes} 分钟（${args.scheduleEntry.durationCapReason ?? '容量上限'}）。`,
+      `- Training-capacity protection: this session's total duration must not exceed ${args.scheduleEntry.durationCapMinutes} min (${args.scheduleEntry.durationCapReason ?? 'capacity cap'}).`,
     );
   }
   if (
@@ -541,15 +546,15 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     args.template.fixed.maxDurationMinutes >= 90
   ) {
     systemParts.push(
-      '- 若最终总时长 >=75 分钟，targets 必须包含补给/补水建议：长课每小时 30-60g 碳水，骑行 90 分钟以上可接近 60-90g，并按天气补水和电解质。',
+      '- If the final total duration is >= 75 min, targets must include fueling/hydration advice: 30-60 g carbohydrate per hour for long sessions, approaching 60-90 g for rides over 90 min, plus fluids and electrolytes adjusted for the weather.',
     );
   }
   if (args.request.availableTime) {
-    systemParts.push(`- 用户可用时间说明：${args.request.availableTime}`);
+    systemParts.push(`- User's note on available time: ${args.request.availableTime}`);
   }
   if (args.isColdStart) {
     systemParts.push(
-      '- 该用户结构化训练历史很少；优先使用保守训练量和体感描述，不要强行给激进配速/功率。',
+      '- This user has very little structured training history; prefer conservative volume and perceived-effort descriptions, and do not force aggressive pace/power targets.',
     );
   }
 
@@ -594,7 +599,7 @@ function buildMessages(args: BuildMessagesArgs): ChatCompletionMessageParam[] {
     { role: 'system', content: systemParts.join('\n') },
     {
       role: 'user',
-      content: `请用 ${TOOL_NAME} 工具返回该课的最终参数。\n\n${JSON.stringify(user, null, 2)}`,
+      content: `Use the ${TOOL_NAME} tool to return the final parameters for this session (all text in English).\n\n${JSON.stringify(user, null, 2)}`,
     },
   ];
 }

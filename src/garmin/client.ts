@@ -162,7 +162,7 @@ export async function authenticateWithBrowserTicket(
 ): Promise<AuthenticatedClient> {
   const trimmed = String(ticket || '').trim();
   if (!trimmed) {
-    throw new Error(`${getRegionLabel(region)}浏览器登录回调缺少 ticket`);
+    throw new Error(`${getRegionLabel(region)}: browser sign-in callback is missing the ticket`);
   }
 
   const client = buildClient(region);
@@ -181,7 +181,7 @@ export async function authenticateWithBrowserTicket(
   const profile = await client.getUserProfile();
   if (!profile?.fullName && !profile?.userName) {
     throw new Error(
-      `${getRegionLabel(region)}登录成功，但读不到 Garmin 资料，请稍后重试`,
+      `${getRegionLabel(region)}: signed in, but the Garmin profile could not be read. Please try again later.`,
     );
   }
 
@@ -218,14 +218,14 @@ export async function authenticate(
   const account = await loadGarminAccount(userId, region);
   if (!account) {
     throw new Error(
-      `${getRegionLabel(region)}尚未连接 Garmin，请在控制台点击"连接 Garmin"完成登录`,
+      `${getRegionLabel(region)}: Garmin is not connected yet. Click "Connect Garmin" in the dashboard to sign in.`,
     );
   }
 
   const session = account.session as { oauth1?: any; oauth2?: any } | null;
   if (!session?.oauth1 || !session?.oauth2) {
     throw new Error(
-      `${getRegionLabel(region)}本地会话缺失，请重新连接 Garmin`,
+      `${getRegionLabel(region)}: no saved session found. Please reconnect your Garmin account.`,
     );
   }
   if (!looksLikeDiToken(session.oauth2)) {
@@ -234,7 +234,7 @@ export async function authenticate(
     // either). Drop the row so the user re-connects through DI.
     await clearGarminSession(userId, region);
     throw new Error(
-      `${getRegionLabel(region)}本地会话来自旧的认证流程，请重新连接 Garmin`,
+      `${getRegionLabel(region)}: the saved session comes from an outdated sign-in flow. Please reconnect your Garmin account.`,
     );
   }
 
@@ -244,7 +244,7 @@ export async function authenticate(
   } catch {
     await clearGarminSession(userId, region);
     throw new Error(
-      `${getRegionLabel(region)}本地会话已失效，请重新连接 Garmin`,
+      `${getRegionLabel(region)}: the saved session has expired. Please reconnect your Garmin account.`,
     );
   }
   patchDiRefresh(client.client);
@@ -252,7 +252,7 @@ export async function authenticate(
   const profile = await client.getUserProfile();
   if (!profile?.fullName && !profile?.userName) {
     throw new Error(
-      `${getRegionLabel(region)}会话有效但读不到 Garmin 资料，请稍后重试`,
+      `${getRegionLabel(region)}: the session is valid but the Garmin profile could not be read. Please try again later.`,
     );
   }
 

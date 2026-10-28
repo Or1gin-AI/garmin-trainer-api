@@ -315,7 +315,7 @@ export async function fetchRecentRawActivities(
 
   if (cnRes.error) {
     throw new GarminUnavailableError(
-      `无法读取 Garmin 中国区数据：${cnRes.error}`,
+      `Unable to read Garmin China region data: ${cnRes.error}`,
     );
   }
 

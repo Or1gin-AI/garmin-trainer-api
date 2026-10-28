@@ -11,6 +11,7 @@ import {
   type Workout,
 } from '../db/schema.js';
 import { authenticate } from './client.js';
+import { isNotApplicable } from '../training/not-applicable.js';
 import type { Region } from './store.js';
 
 type PublishRegion = Extract<Region, 'cn' | 'global'>;
@@ -310,13 +311,13 @@ function describeWorkout(plan: TrainingPlan, row: Workout, scheduledDate: string
   if (row.sessionLabel) lines.push(`Session: ${row.sessionLabel}`);
   if (row.durationMinutes) lines.push(`Duration: ${row.durationMinutes} min`);
   if (row.distanceKm !== null) lines.push(`Distance: ${Number(row.distanceKm).toFixed(2)} km`);
-  if (row.targetHeartRate && row.targetHeartRate !== '不适用') {
+  if (!isNotApplicable(row.targetHeartRate)) {
     lines.push(`HR: ${row.targetHeartRate}`);
   }
-  if (row.targetPace && row.targetPace !== '不适用') {
+  if (!isNotApplicable(row.targetPace)) {
     lines.push(`Pace: ${row.targetPace}`);
   }
-  if (row.targetPower && row.targetPower !== '不适用') {
+  if (!isNotApplicable(row.targetPower)) {
     lines.push(`Power: ${row.targetPower}`);
   }
   if (row.workoutStructure) {

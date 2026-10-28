@@ -23,52 +23,52 @@ const WORKOUT_MATCHERS: readonly WorkoutMatcher[] = [
   {
     templateIds: ['run.double_threshold_am.v1', 'run.double_threshold_pm.v1'],
     pattern: /双阈值|double\s*threshold/i,
-    label: '双阈值',
+    label: 'Double threshold',
   },
   {
     templateIds: ['run.reverse_pyramid.v1'],
     pattern: /倒金字塔|递减金字塔|反向金字塔|reverse\s*pyramid|inverted\s*pyramid/i,
-    label: '倒金字塔',
+    label: 'Reverse pyramid',
   },
   {
     templateIds: ['run.vo2max.v1'],
     pattern: /(跑步|跑|run|running)?.{0,8}(vo2|max\s*oxygen|最大摄氧|vvo2)/i,
-    label: '跑步 VO2max',
+    label: 'Running VO2max',
   },
   {
     templateIds: ['run.interval.v1'],
-    pattern: /(短间歇|速度耐力|400\s*m|800\s*m|400米|800米|run.*interval|interval.*run|跑.*间歇|间歇跑)/i,
-    label: '跑步间歇',
+    pattern: /(短间歇|速度耐力|400\s*m|800\s*m|400米|800米|run.*interval|interval.*run|跑.*间歇|间歇跑|track\s*intervals?|speed\s*endurance)/i,
+    label: 'Running intervals',
   },
   {
     templateIds: ['run.threshold.v1'],
     pattern: /(阈值跑|跑.*阈值|threshold\s*run|run.*threshold|zone\s*4|z4|hr\s*z4)/i,
-    label: '阈值跑',
+    label: 'Threshold run',
   },
   {
     templateIds: ['run.tempo.v1'],
     pattern: /(节奏跑|tempo\s*run|run.*tempo)/i,
-    label: '节奏跑',
+    label: 'Tempo run',
   },
   {
     templateIds: ['run.race_pace.v1'],
     pattern: /(马拉松专项|马配|比赛配速|race\s*pace|marathon\s*pace|\bmp\b)/i,
-    label: '比赛配速专项',
+    label: 'Race-pace session',
   },
   {
     templateIds: ['run.progression.v1'],
     pattern: /(渐进跑|递进跑|progression\s*run|run.*progression)/i,
-    label: '渐进跑',
+    label: 'Progression run',
   },
   {
     templateIds: ['run.strides.v1'],
     pattern: /(大步跑|加速跑|strides?)/i,
-    label: '大步跑',
+    label: 'Strides',
   },
   {
     templateIds: ['run.hill.v1'],
-    pattern: /(上坡冲刺|坡冲|坡跑|hill\s*sprint|hill\s*run)/i,
-    label: '上坡跑',
+    pattern: /(上坡冲刺|坡冲|坡跑|hill\s*sprints?|hill\s*runs?|hill\s*repeats?)/i,
+    label: 'Hill run',
   },
   {
     templateIds: ['run.lsd.v1'],
@@ -77,88 +77,88 @@ const WORKOUT_MATCHERS: readonly WorkoutMatcher[] = [
   },
   {
     templateIds: ['run.aerobic.v1'],
-    pattern: /(有氧跑|普通有氧|z2\s*run|zone\s*2\s*run|run.*zone\s*2)/i,
-    label: '有氧跑',
+    pattern: /(有氧跑|普通有氧|z2\s*run|zone\s*2\s*run|run.*zone\s*2|aerobic\s*run|easy\s*run)/i,
+    label: 'Aerobic run',
   },
   {
     templateIds: ['bike.vo2max.v1'],
     pattern: /(骑行|骑|bike|cycling|ride).{0,8}(vo2|max\s*oxygen|最大摄氧)/i,
-    label: '骑行 VO2max',
+    label: 'Cycling VO2max',
   },
   {
     templateIds: ['bike.sweet_spot.v1'],
     pattern: /甜区|sweet\s*spot/i,
-    label: '甜区骑',
+    label: 'Sweet-spot ride',
   },
   {
     templateIds: ['bike.threshold.v1'],
     pattern: /(阈值骑|骑.*阈值|bike.*threshold|cycling.*threshold|ftp.*阈值)/i,
-    label: '阈值骑',
+    label: 'Threshold ride',
   },
   {
     templateIds: ['bike.over_under.v1'],
     pattern: /(over\s*under|criss\s*cross|阈值上下|交叉变强度)/i,
-    label: '阈值上下浮动骑',
+    label: 'Over-under ride',
   },
   {
     templateIds: ['bike.anaerobic.v1'],
     pattern: /(30\/15|30-15|1min\s*间歇|1分钟间歇|无氧容量骑|anaerobic.*bike)/i,
-    label: '骑行无氧间歇',
+    label: 'Cycling anaerobic intervals',
   },
   {
     templateIds: ['bike.climb.v1'],
-    pattern: /(爬坡骑|低踏频|climb|爬坡专项)/i,
-    label: '爬坡骑',
+    pattern: /(爬坡骑|低踏频|climb|爬坡专项|low\s*cadence)/i,
+    label: 'Climbing ride',
   },
   {
     templateIds: ['bike.sprint.v1'],
     pattern: /(冲刺骑|bike.*sprint|cycling.*sprint|骑.*冲刺)/i,
-    label: '冲刺骑',
+    label: 'Sprint ride',
   },
   {
     templateIds: ['bike.long_ride.v1'],
     pattern: /(长骑|长距离骑|long\s*ride)/i,
-    label: '长距离骑',
+    label: 'Long ride',
   },
   {
     templateIds: ['bike.endurance.v1'],
-    pattern: /(z2\s*骑|zone\s*2\s*骑|耐力骑|有氧骑|bike.*zone\s*2)/i,
-    label: 'Z2 耐力骑',
+    pattern: /(z2\s*骑|zone\s*2\s*骑|耐力骑|有氧骑|bike.*zone\s*2|z2\s*ride|zone\s*2\s*ride|endurance\s*ride)/i,
+    label: 'Z2 endurance ride',
   },
   {
     templateIds: ['swim.css_threshold.v1'],
     pattern: /(阈值游|css|swim.*threshold|游.*阈值)/i,
-    label: 'CSS 阈值游',
+    label: 'CSS threshold swim',
   },
   {
     templateIds: ['swim.vo2max.v1'],
     pattern: /(游泳|游|swim).{0,8}(vo2|max\s*oxygen|最大摄氧)/i,
-    label: '游泳 VO2max',
+    label: 'Swimming VO2max',
   },
   {
     templateIds: ['swim.sprint.v1'],
     pattern: /(短冲游|50m\s*sprint|50米.*冲|swim.*sprint|游.*冲刺)/i,
-    label: '短冲游',
+    label: 'Sprint swim',
   },
   {
     templateIds: ['swim.pull.v1'],
     pattern: /(划手|pull\b|pull\s*buoy)/i,
-    label: '划手专项',
+    label: 'Pull set',
   },
   {
     templateIds: ['swim.kick.v1'],
     pattern: /(打腿|kick\b)/i,
-    label: '打腿专项',
+    label: 'Kick set',
   },
   {
     templateIds: ['swim.endurance.v1'],
     pattern: /(长组耐力游|游泳lsd|长距离游|long\s*swim|swim.*endurance)/i,
-    label: '长组耐力游',
+    label: 'Endurance swim',
   },
   {
     templateIds: ['swim.technique.v1'],
     pattern: /(技术游|drills?|游.*技术)/i,
-    label: '技术游',
+    label: 'Technique swim',
   },
 ];
 
@@ -191,7 +191,7 @@ export function extractTrainingRequestIntent(request: ScheduleRequest): Training
 
   const weeklyTargetMinutes = parseWeeklyTargetMinutes(text);
   if (weeklyTargetMinutes !== null) {
-    notes.push(`用户显式给出周训练目标约 ${weeklyTargetMinutes} 分钟。`);
+    notes.push(`User explicitly set a weekly training target of about ${weeklyTargetMinutes} min.`);
   }
 
   return {
@@ -205,15 +205,15 @@ export function formatTrainingIntentForPrompt(intent: TrainingRequestIntent): st
   const parts: string[] = [];
   if (intent.requiredWorkouts.length > 0) {
     parts.push(
-      `必须出现的训练模板：${intent.requiredWorkouts
-        .map((r) => `${r.templateId} x${r.count}（${r.raw}）`)
-        .join('、')}`,
+      `Required workout templates: ${intent.requiredWorkouts
+        .map((r) => `${r.templateId} x${r.count} (${r.raw})`)
+        .join(', ')}`,
     );
   }
   if (intent.weeklyTargetMinutes !== null) {
-    parts.push(`本周训练目标时长：约 ${intent.weeklyTargetMinutes} 分钟。`);
+    parts.push(`Weekly training-time target: about ${intent.weeklyTargetMinutes} min.`);
   }
-  if (parts.length === 0) return '未识别到额外硬性用户意图。';
+  if (parts.length === 0) return 'No additional hard user requirements detected.';
   return parts.join('\n');
 }
 
@@ -226,7 +226,7 @@ export function missingRequiredWorkoutMessages(
     const count = schedule.filter((entry) => entry.templateId === required.templateId).length;
     if (count < required.count) {
       messages.push(
-        `${required.raw}: ${required.templateId} 需要 ${required.count} 次，当前 ${count} 次`,
+        `${required.raw}: ${required.templateId} requires ${required.count}x, currently ${count}x`,
       );
     }
   }
@@ -246,8 +246,8 @@ function isSportEnabled(sport: Sport, request: ScheduleRequest): boolean {
 
 function inferRequestedCount(text: string, index: number): number {
   const window = text.slice(Math.max(0, index - 14), Math.min(text.length, index + 14));
-  if (/(三次|三堂|三节|3\s*(次|堂|节|x|×))/.test(window)) return 3;
-  if (/(两次|二次|两堂|二堂|两节|二节|2\s*(次|堂|节|x|×))/.test(window)) return 2;
+  if (/(三次|三堂|三节|3\s*(次|堂|节|x|×)|three\s*(times|sessions|workouts)|3\s*(times|sessions|workouts))/i.test(window)) return 3;
+  if (/(两次|二次|两堂|二堂|两节|二节|2\s*(次|堂|节|x|×)|two\s*(times|sessions|workouts)|twice|2\s*(times|sessions|workouts))/i.test(window)) return 2;
   return 1;
 }
 
@@ -280,7 +280,7 @@ function parseWeeklyTargetMinutes(text: string): number | null {
 
 function isWeeklyDurationContext(window: string): boolean {
   return /(本周|这周|每周|周训练|weekly|week)/i.test(window) &&
-    /(训练|时长|时间|总量|总时长|训练量|volume)/i.test(window);
+    /(训练|时长|时间|总量|总时长|训练量|volume|training|total)/i.test(window);
 }
 
 function clampWeeklyTarget(minutes: number): number {

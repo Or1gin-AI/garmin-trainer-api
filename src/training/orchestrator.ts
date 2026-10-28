@@ -267,7 +267,7 @@ export async function generatePlan(input: GeneratePlanInput): Promise<GeneratedP
         ...entry,
         templateId: downgradeId,
         sport: downgradeTpl.fixed.sport,
-        reason: `${entry.reason ?? ''} 校验未过自动降级为 ${downgradeId}。`.trim(),
+        reason: `${entry.reason ?? ''} Failed validation; auto-downgraded to ${downgradeId}.`.trim(),
       };
       // Use deterministic parameterizer for the downgrade path so we don't
       // burn another LLM round-trip on a fix-up.
@@ -549,12 +549,12 @@ export function expandMultiSessionSchedule(
     if (forceRequestedSchedule) {
       notes = [
         ...notes,
-        '用户已明确要求同日多练；训练容量/恢复评估不建议安排，系统仍按要求生成并保留风险提示。',
+        'You explicitly asked for same-day double sessions; the capacity/recovery assessment advises against it, so they were generated as requested with a risk warning.',
       ];
     } else {
       return {
         ...expanded,
-        notes: [...notes, '已请求同日多练，但训练容量/恢复评估未通过，本周保留单次训练。'],
+        notes: [...notes, 'Same-day double sessions were requested, but the capacity/recovery assessment did not pass; keeping single sessions this week.'],
       };
     }
   }
@@ -562,12 +562,12 @@ export function expandMultiSessionSchedule(
     if (forceRequestedSchedule) {
       notes = [
         ...notes,
-        '用户已明确要求双阈值；近期疲劳偏高，系统仍按要求生成但不推荐执行。',
+        'You explicitly asked for double threshold; recent fatigue is elevated, so it was generated as requested but is not recommended.',
       ];
     } else {
       return {
         ...expanded,
-        notes: [...notes, '已请求双阈值，但近期疲劳偏高，未安排同日两练。'],
+        notes: [...notes, 'Double threshold was requested, but recent fatigue is elevated; no same-day double scheduled.'],
       };
     }
   }
@@ -575,12 +575,12 @@ export function expandMultiSessionSchedule(
     if (forceRequestedSchedule) {
       notes = [
         ...notes,
-        '用户已明确要求双阈值；当前能力等级未达到推荐条件，系统仍按要求生成但建议谨慎执行。',
+        'You explicitly asked for double threshold; your current level is below the recommended threshold for it, so it was generated as requested — proceed with caution.',
       ];
     } else {
       return {
         ...expanded,
-        notes: [...notes, '双阈值仅适合高水平且恢复正常的用户，本周保留单次阈值/节奏课。'],
+        notes: [...notes, 'Double threshold is only suitable for advanced, well-recovered athletes; keeping a single threshold/tempo session this week.'],
       };
     }
   }
@@ -592,7 +592,7 @@ export function expandMultiSessionSchedule(
   if (thresholdIdx < 0) {
     return {
       ...expanded,
-      notes: [...notes, '已开启同日多练，但本周没有合适的跑步阈值日可扩展为双阈值。'],
+      notes: [...notes, 'Same-day doubles are enabled, but no suitable running threshold day this week can be extended to double threshold.'],
     };
   }
 
@@ -601,18 +601,18 @@ export function expandMultiSessionSchedule(
     ...base,
     templateId: 'run.double_threshold_am.v1',
     slotIndex: 1,
-    sessionLabel: '上午',
+    sessionLabel: 'AM',
     timeOfDay: 'morning',
-    reason: `${base.reason ?? ''} 双阈值上午课：短时间阈值间歇，控制乳酸与配速稳定。`.trim(),
+    reason: `${base.reason ?? ''} Double threshold AM: short threshold intervals, keeping lactate and pace steady.`.trim(),
   };
   applyDurationCap(am, forceRequestedSchedule ? undefined : trainingCapacity);
   const pm: ScheduleEntry = {
     ...base,
     templateId: 'run.double_threshold_pm.v1',
     slotIndex: 2,
-    sessionLabel: '下午',
+    sessionLabel: 'PM',
     timeOfDay: 'afternoon',
-    reason: '双阈值下午课：同日第二次阈值刺激，全天阈值总时间控制在 40-70 分钟。',
+    reason: 'Double threshold PM: second threshold stimulus of the day; keep total threshold time for the day at 40-70 min.',
   };
   applyDurationCap(pm, forceRequestedSchedule ? undefined : trainingCapacity);
   const days = [
@@ -623,7 +623,7 @@ export function expandMultiSessionSchedule(
   ].sort((a, b) => a.dayIndex - b.dayIndex || (a.slotIndex ?? 1) - (b.slotIndex ?? 1));
   return {
     days,
-    notes: [...notes, `第 ${base.dayIndex} 天已安排双阈值上午/下午两练。`],
+    notes: [...notes, `Day ${base.dayIndex}: double threshold scheduled as AM/PM sessions.`],
   };
 }
 
@@ -676,7 +676,7 @@ function hasLongSameDayTrainingWindow(request: ScheduleRequest): boolean {
     .filter(Boolean)
     .join('\n');
   if (!text) return false;
-  if (/(一天两练|一日两练|同日两练|双练|双课|上午.*下午|早.*晚|morning.*afternoon|morning.*evening)/i.test(text)) {
+  if (/(一天两练|一日两练|同日两练|双练|双课|上午.*下午|早.*晚|morning.*afternoon|morning.*evening|two[-\s]a[-\s]day|double\s*day|twice\s*(a|per)\s*day|\bam\s*(?:and|\+|&|\/)\s*pm\b)/i.test(text)) {
     return true;
   }
   for (const match of text.matchAll(/(\d{2,3})\s*(分钟|min|mins|minutes)/gi)) {
@@ -717,34 +717,34 @@ function applyExplicitWorkoutRequirements(
     if (!tpl) continue;
     if (!isTemplateEnabledByRequest(required.templateId, request)) {
       notes.push(
-        `用户要求 ${required.raw}，但对应项目 ${tpl.fixed.sport} 未在本次计划中启用，未强行加入。`,
+        `You asked for ${required.raw}, but ${tpl.fixed.sport} is not enabled in this plan, so it was not added.`,
       );
       continue;
     }
     while (days.filter((d) => d.templateId === required.templateId).length < required.count) {
       const idx = chooseReplacementIndex(days, tpl.fixed.sport, requiredIds);
       if (idx < 0) {
-        notes.push(`用户要求 ${required.raw}，但当前课表没有可替换课位。`);
+        notes.push(`You asked for ${required.raw}, but the current schedule has no slot that can be replaced.`);
         break;
       }
       const previous = days[idx];
       const next = replaceEntryTemplate(
         previous,
         required.templateId,
-        `用户明确要求 ${required.raw}；系统用模板库自动匹配为 ${required.templateId}。`,
+        `You explicitly asked for ${required.raw}; matched to template ${required.templateId}.`,
         request,
         trainingCapacity,
       );
       days[idx] = next;
       notes.push(
-        `${previous.dayLabel} 已按用户要求由 ${previous.templateId} 调整为 ${required.templateId}。`,
+        `${previous.dayLabel}: changed from ${previous.templateId} to ${required.templateId} as requested.`,
       );
     }
   }
 
   const missing = missingRequiredWorkoutMessages(days, intent);
   if (missing.length > 0) {
-    notes.push(`仍未完全满足用户显式训练要求：${missing.join('；')}。`);
+    notes.push(`Some explicit training requests are still not fully met: ${missing.join('; ')}.`);
   }
 
   return {
@@ -759,7 +759,7 @@ function ensureDoubleThresholdPair(
   trainingCapacity?: TrainingCapacity,
 ): { days: ScheduleEntry[]; note?: string } {
   if (!request.sports.running) {
-    return { days, note: '用户要求双阈值，但本次计划未启用跑步项目，未强行加入。' };
+    return { days, note: 'You asked for double threshold, but running is not enabled in this plan, so it was not added.' };
   }
   const hasAm = days.some((d) => d.templateId === 'run.double_threshold_am.v1');
   const hasPm = days.some((d) => d.templateId === 'run.double_threshold_pm.v1');
@@ -777,17 +777,17 @@ function ensureDoubleThresholdPair(
     existingDouble ??
     thresholdLike ??
     days[chooseReplacementIndex(days, 'running', new Set(['run.double_threshold_am.v1', 'run.double_threshold_pm.v1']))];
-  if (!base) return { days, note: '用户要求双阈值，但当前课表没有可替换的跑步课位。' };
+  if (!base) return { days, note: 'You asked for double threshold, but the current schedule has no running slot that can be replaced.' };
 
   const am = replaceEntryTemplate(
     {
       ...base,
       slotIndex: 1,
-      sessionLabel: '上午',
+      sessionLabel: 'AM',
       timeOfDay: 'morning',
     },
     'run.double_threshold_am.v1',
-    '用户明确要求双阈值：上午安排短时间阈值间歇。',
+    'Double threshold as requested: short threshold intervals in the AM session.',
     request,
     trainingCapacity,
   );
@@ -795,11 +795,11 @@ function ensureDoubleThresholdPair(
     {
       ...base,
       slotIndex: 2,
-      sessionLabel: '下午',
+      sessionLabel: 'PM',
       timeOfDay: 'afternoon',
     },
     'run.double_threshold_pm.v1',
-    '用户明确要求双阈值：下午安排 1km 阈值重复跑。',
+    'Double threshold as requested: 1 km threshold repeats in the PM session.',
     request,
     trainingCapacity,
   );
@@ -810,7 +810,7 @@ function ensureDoubleThresholdPair(
   );
   return {
     days: sortScheduleEntries([...nextDays, am, pm]),
-    note: `${base.dayLabel} 已按用户要求安排双阈值上午/下午两练；恢复风险只作为提示，不自动删除。`,
+    note: `${base.dayLabel}: double threshold AM/PM sessions scheduled as requested; recovery risk is flagged as a warning only, not removed automatically.`,
   };
 }
 
@@ -856,7 +856,7 @@ function normalizeDoubleDayVariety(
       const replacement = replaceEntryTemplate(
         day,
         replacementId,
-        `${day.reason ?? ''} 同日多练改为交叉恢复训练，避免重复堆同项目有氧。`.trim(),
+        `${day.reason ?? ''} Second session of the day switched to cross-training recovery to avoid stacking same-sport aerobic volume.`.trim(),
         request,
         trainingCapacity,
       );
@@ -864,7 +864,7 @@ function normalizeDoubleDayVariety(
       usedSports.add(replacement.sport);
       usedTemplates.add(replacement.templateId);
       notes.push(
-        `${day.dayLabel} 的第二练已从 ${day.templateId} 调整为 ${replacement.templateId}，用于避免同一天重复堆同项目训练。`,
+        `${day.dayLabel}: second session changed from ${day.templateId} to ${replacement.templateId} to avoid stacking the same sport twice in one day.`,
       );
       changed = true;
     }
@@ -898,13 +898,13 @@ function normalizeStandaloneDoubleThreshold(schedule: ScheduleResult): ScheduleR
       ...entry,
       sport: 'running',
       templateId: 'run.threshold.v1',
-      reason: `${entry.reason ?? ''} 双阈值模板需要上午/下午成对出现，已改为单次阈值课。`.trim(),
+      reason: `${entry.reason ?? ''} Double threshold templates must come as an AM/PM pair; changed to a single threshold session.`.trim(),
     };
     changed = true;
   }
 
   if (changed) {
-    notes.push('检测到孤立双阈值模板，已改为普通阈值课，避免生成语义不完整的训练。');
+    notes.push('Found an unpaired double threshold template; changed it to a regular threshold session so the workout stays coherent.');
   }
   return changed ? { days: sortScheduleEntries(days), notes } : schedule;
 }
@@ -922,7 +922,7 @@ function allowsSameSportDoubleDay(request: ScheduleRequest): boolean {
   const text = [request.goal, request.availableTime, request.notes]
     .filter(Boolean)
     .join('\n');
-  return /(一天|一日|同日)\s*两\s*(跑|骑|游)|两练都(跑|骑|游)|同项目\s*两练|两练\s*同项目/i.test(text);
+  return /(一天|一日|同日)\s*两\s*(跑|骑|游)|两练都(跑|骑|游)|同项目\s*两练|两练\s*同项目|two\s*(runs|rides|swims)\s*(in\s*)?(one|a|the\s*same)\s*day|same[-\s]?sport\s*(double|two[-\s]a[-\s]day)/i.test(text);
 }
 
 function chooseCrossTrainingRecoveryTemplate(
@@ -1022,7 +1022,7 @@ function applyAdvancedWorkoutPreferences(
       ...schedule,
       notes: [
         ...schedule.notes,
-        `已开启高级训练，但当前课表已达到高强度上限或存在相邻高强度日，未自动追加 ${templateId}。`,
+        `Advanced training is enabled, but the schedule is already at the hard-session cap or has adjacent hard days; ${templateId} was not added.`,
       ],
     };
   }
@@ -1041,7 +1041,7 @@ function applyAdvancedWorkoutPreferences(
   const next = replaceEntryTemplate(
     previous,
     templateId,
-    `用户开启高级训练且训练时间充足；系统主动加入 ${templateId}，避免只生成基础模板。`,
+    `Advanced training is enabled and there is enough training time; added ${templateId} so the week is not limited to basic templates.`,
     request,
     trainingCapacity,
   );
@@ -1052,7 +1052,7 @@ function applyAdvancedWorkoutPreferences(
     days: sortScheduleEntries(days),
     notes: [
       ...schedule.notes,
-      `${previous.dayLabel} 已根据高级训练偏好由 ${previous.templateId} 调整为 ${templateId}。`,
+      `${previous.dayLabel}: changed from ${previous.templateId} to ${templateId} based on your advanced training preference.`,
     ],
   };
 }
@@ -1127,20 +1127,20 @@ function appendForcedScheduleRiskNotes(
 
   if (hardDays.length > hardCap) {
     riskNotes.push(
-      `用户要求优先：本周保留 ${hardDays.length} 个高强度训练日，已超过当前建议上限 ${hardCap}；系统不强制删改课表，仅提示执行风险。`,
+      `Your request takes priority: keeping ${hardDays.length} hard days this week, above the recommended cap of ${hardCap}; the schedule was not changed, but watch the execution risk.`,
     );
   }
 
   const consecutivePairs = consecutiveHardDayPairs(hardDays);
   if (consecutivePairs.length > 0) {
     riskNotes.push(
-      `用户要求优先：第 ${consecutivePairs.map((p) => `${p[0]}-${p[1]}`).join('、')} 天为连续高强度；系统不强制调整，请根据疲劳和睡眠主动降级。`,
+      `Your request takes priority: days ${consecutivePairs.map((p) => `${p[0]}-${p[1]}`).join(', ')} are back-to-back hard days; not adjusted automatically — downgrade yourself based on fatigue and sleep.`,
     );
   }
 
   if (recentState.fatigue === 'tired' || recentState.fatigue === 'high_risk') {
     riskNotes.push(
-      `用户要求优先：当前疲劳状态为 ${recentState.fatigue}，训练计划仍按要求生成；如 RPE、睡眠或静息心率恶化，应把当天高强度课改为低强度有氧或休息。`,
+      `Your request takes priority: current fatigue is ${recentState.fatigue}, and the plan was still generated as requested; if RPE, sleep or resting HR worsen, swap that day's hard session for easy aerobic work or rest.`,
     );
   }
 
@@ -1175,7 +1175,7 @@ function enforceUserHardWorkoutLayout(
     days = ensureRequestedHardEntries(days, request, cap, trainingCapacity);
     const afterHard = countHighScheduleEntries(days);
     if (afterHard > beforeHard && afterHard >= Math.min(cap, activeTrainingEntries(days).length)) {
-      notes.push(`用户明确选择 ${cap} 次高强度，已按目标安排 ${afterHard} 次质量课。`);
+      notes.push(`You chose ${cap} hard sessions; scheduled ${afterHard} quality sessions to match.`);
     }
   }
 
@@ -1193,7 +1193,7 @@ function enforceUserHardWorkoutLayout(
     const idx = chooseHardLayoutDowngradeIndex(days, requiredIds, hardDays);
     if (idx < 0) {
       notes.push(
-        `用户设置高强度上限 ${cap} 次，但显式要求的高强度课无法继续自动降级；系统保留课表并仅提示风险。`,
+        `Your hard-session cap is ${cap}, but the explicitly requested hard sessions cannot be downgraded further; the schedule is kept with a risk warning.`,
       );
       break;
     }
@@ -1207,10 +1207,10 @@ function enforceUserHardWorkoutLayout(
       ...entry,
       sport: downgrade.fixed.sport,
       templateId: downgrade.id,
-      reason: `${entry.reason ?? ''} 为满足用户设置的高强度上限/间隔，自动改为 ${downgrade.id}。`.trim(),
+      reason: `${entry.reason ?? ''} Auto-changed to ${downgrade.id} to respect your hard-session cap/spacing.`.trim(),
     };
     notes.push(
-      `${entry.dayLabel} 已从 ${entry.templateId} 调整为 ${downgrade.id}，用于满足用户设置的每周高强度上限和避免连续高强度。`,
+      `${entry.dayLabel}: changed from ${entry.templateId} to ${downgrade.id} to respect your weekly hard-session cap and avoid back-to-back hard days.`,
     );
   }
 
@@ -1249,7 +1249,7 @@ function ensureRequestedHardEntries(
     next[candidate.index] = replaceEntryTemplate(
       candidate.entry,
       replacementId,
-      `用户明确要求 ${cap} 次高强度；补足质量课目标。`,
+      `You asked for ${cap} hard sessions; topping up quality sessions to meet the target.`,
       request,
       trainingCapacity,
     );
@@ -1275,7 +1275,7 @@ function ensureRequestedHardEntries(
       return replaceEntryTemplate(
         entry,
         replacementId,
-        `用户明确要求 ${cap} 次高强度；按一周内均匀间隔重排质量课。`,
+        `You asked for ${cap} hard sessions; quality sessions re-spaced evenly across the week.`,
         request,
         trainingCapacity,
       );
@@ -1286,7 +1286,7 @@ function ensureRequestedHardEntries(
       return replaceEntryTemplate(
         entry,
         replacementId,
-        '为满足用户高强度次数并保持间隔，改为低强度补量。',
+        'Switched to easy volume to keep your hard-session count and spacing.',
         request,
         trainingCapacity,
       );
@@ -1536,7 +1536,7 @@ function expandRequestedDoubleDay(
   if (existingForDay.some((d) => (d.slotIndex ?? 1) > 1)) {
     return {
       ...schedule,
-      notes: [...schedule.notes, `${base.dayLabel} 已按用户要求包含同日多练。`],
+      notes: [...schedule.notes, `${base.dayLabel}: includes same-day double sessions as requested.`],
     };
   }
 
@@ -1545,7 +1545,7 @@ function expandRequestedDoubleDay(
     : {
         ...base,
         slotIndex: 1,
-        sessionLabel: base.sessionLabel ?? '上午',
+        sessionLabel: base.sessionLabel ?? 'AM',
         timeOfDay: base.timeOfDay ?? 'morning',
       };
   const second = buildRequestedDoubleSecond(primary, request, athleteProfile, trainingCapacity, forceRequestedSchedule);
@@ -1558,7 +1558,7 @@ function expandRequestedDoubleDay(
     days,
     notes: [
       ...schedule.notes,
-      `${primary.dayLabel} 已按用户要求安排一天两练：${primary.templateId} + ${second.templateId}。`,
+      `${primary.dayLabel}: two sessions scheduled as requested: ${primary.templateId} + ${second.templateId}.`,
     ],
   };
 }
@@ -1581,9 +1581,9 @@ function buildRequestedDoublePrimary(
     sport: tpl.fixed.sport,
     templateId,
     slotIndex: 1,
-    sessionLabel: '上午',
+    sessionLabel: 'AM',
     timeOfDay: 'morning',
-    reason: '用户明确要求这一天安排两练；原休息日改为低风险主训练。',
+    reason: 'You asked for two sessions on this day; the rest day was changed to a low-risk main session.',
   };
   applyDurationCap(entry, forceRequestedSchedule ? undefined : trainingCapacity);
   return entry;
@@ -1605,9 +1605,9 @@ function buildRequestedDoubleSecond(
     sport: tpl.fixed.sport,
     templateId,
     slotIndex: 2,
-    sessionLabel: '下午',
+    sessionLabel: 'PM',
     timeOfDay: 'afternoon',
-    reason: '用户明确要求一天两练；第二练安排为低压力恢复/交叉训练。',
+    reason: 'You asked for two sessions in one day; the second session is low-stress recovery/cross-training.',
   };
   applyDurationCap(entry, forceRequestedSchedule ? undefined : trainingCapacity);
   return entry;
@@ -1821,7 +1821,7 @@ async function runSummaryStage(args: {
       name: 'llm_stream_summary',
       displayName: TOOL_DISPLAY.llm_stream_summary,
       phase: 'done',
-      summary: '总结、监测重点与调整规则已生成',
+      summary: 'Summary, monitoring and adjustment rules generated',
       durationMs: Date.now() - summaryStart,
     });
     return {
@@ -1850,7 +1850,7 @@ async function runSummaryStage(args: {
       name: 'llm_stream_summary',
       displayName: TOOL_DISPLAY.llm_stream_summary,
       phase: 'done',
-      summary: '已使用规则引擎生成总结',
+      summary: 'Summary generated by the rule engine',
       durationMs: Date.now() - summaryStart,
     });
     return {
@@ -1943,7 +1943,7 @@ function annotateWeeklyLoadEstimate(args: {
     workouts,
     athleteProfile.trainingLoadCalibration,
   ).trainingLoad;
-  schedule.notes.push(`预计 Garmin 周训练负荷约 ${estimate}。`);
+  schedule.notes.push(`Estimated weekly Garmin training load: ~${estimate}.`);
   return { estimated: estimate };
 }
 
@@ -1995,7 +1995,7 @@ function enforceWeeklyDurationLimit(
   );
   if (reducible <= 0) {
     schedule.notes.push(
-      `用户周时长上限为 ${limit} 分钟，但当前训练日数量下每节课已接近最低可执行时长，无法继续压缩。`,
+      `Your weekly limit is ${limit} min, but with this many training days each session is already near its minimum workable duration and cannot be shortened further.`,
     );
     return;
   }
@@ -2038,11 +2038,11 @@ function enforceWeeklyDurationLimit(
   const finalTotal = activeWeeklyMinutes(schedule, workouts);
   if (finalTotal <= limit) {
     schedule.notes.push(
-      `本周原始生成时长 ${total} 分钟，已按用户周上限压缩到 ${finalTotal}/${limit} 分钟。`,
+      `Generated weekly volume was ${total} min; trimmed to ${finalTotal}/${limit} min to fit your weekly limit.`,
     );
   } else {
     schedule.notes.push(
-      `本周原始生成时长 ${total} 分钟，已尽量压缩到 ${finalTotal} 分钟，但仍超过用户周上限 ${limit} 分钟。`,
+      `Generated weekly volume was ${total} min; trimmed as far as possible to ${finalTotal} min, still above your weekly limit of ${limit} min.`,
     );
   }
 }
@@ -2119,7 +2119,7 @@ function enforceWeeklyDurationTarget(
 
   if (!changed) {
     schedule.notes.push(
-      `用户训练时长目标约 ${requestedTarget} 分钟，但当前模板下无法继续专业地拉长训练课。`,
+      `Your volume target is about ${requestedTarget} min, but the current templates cannot be lengthened further in a sound way.`,
     );
     return;
   }
@@ -2128,11 +2128,11 @@ function enforceWeeklyDurationTarget(
 
   if (total >= Math.round(target * 0.97)) {
     schedule.notes.push(
-      `已按用户平均训练时长目标把本周训练时长调整到约 ${total}/${target} 分钟；高时长优先用低压力训练分摊，避免单次训练过长或重复堆同类有氧。`,
+      `Weekly volume adjusted to about ${total}/${target} min to match your average session target; extra time goes to low-stress sessions to avoid overly long sessions or stacking similar aerobic work.`,
     );
   } else {
     schedule.notes.push(
-      `用户训练时长目标约 ${requestedTarget} 分钟，当前已尽量提高到 ${total}/${target} 分钟；剩余差距不再用高强度主项硬凑。`,
+      `Your volume target is about ${requestedTarget} min; raised as far as possible to ${total}/${target} min. The remaining gap is not filled with extra hard work.`,
     );
   }
 }
@@ -2146,7 +2146,7 @@ function weeklyDurationTargetFromDailyPreference(request: ScheduleRequest): numb
 
 function pruneStaleDurationEstimateNotes(schedule: ScheduleResult): void {
   const stale =
-    /(总时长估算|训练时长估算|当前方案约|距离\s*\d+\s*分钟目标|距离.*目标|建议.*延长.*达到|可达到约)/;
+    /(总时长估算|训练时长估算|当前方案约|距离\s*\d+\s*分钟目标|距离.*目标|建议.*延长.*达到|可达到约|total\s*duration\s*estimate|estimated\s*(total\s*)?duration|current\s*plan\s*is\s*(about|around|~)|\d+\s*min(ute)?s?\s*target|extend.*to\s*reach|can\s*reach\s*(about|around|~))/i;
   schedule.notes.splice(
     0,
     schedule.notes.length,
@@ -2237,12 +2237,12 @@ function adjustWorkoutDuration(
       : workout.distanceKm;
   const targets = [
     mode === 'target'
-      ? `总时长 ${syncedDurationMinutes} 分钟（已按周目标 ${weeklyLimit} 分钟分配）`
-      : `总时长 ${syncedDurationMinutes} 分钟（已按周上限 ${weeklyLimit} 分钟控制）`,
-    ...(workout.targets ?? []).filter((t) => !/^总时长\s*\d+\s*分钟/.test(t) && !/^参考距离/.test(t)),
+      ? `Total duration ${syncedDurationMinutes} min (allocated to weekly target ${weeklyLimit} min)`
+      : `Total duration ${syncedDurationMinutes} min (capped by weekly limit ${weeklyLimit} min)`,
+    ...(workout.targets ?? []).filter((t) => !/^(?:总时长|Total duration)\s*\d+\s*(?:分钟|min)/.test(t) && !/^(?:参考距离|Est\. distance)/.test(t)),
   ];
   if (distanceKm !== null && distanceKm > 0) {
-    targets.splice(1, 0, `参考距离 ${distanceKm.toFixed(1)} 公里`);
+    targets.splice(1, 0, `Est. distance ${distanceKm.toFixed(1)} km`);
   }
   return {
     ...synced,
@@ -2295,7 +2295,11 @@ function syncSimpleMainDuration(
     durationMinutes: syncedDurationMinutes,
     workoutStructure: replacePhaseDurationText(
       workout.workoutStructure,
-      '主训练',
+      [
+        template.fixed.phases.find((phase) => phase.name === 'main')?.label ?? 'Main set',
+        'Main set',
+        '主训练',
+      ],
       currentMain,
       roundedMain,
     ),
@@ -2311,14 +2315,19 @@ function syncSimpleMainDuration(
 
 function replacePhaseDurationText(
   structure: string,
-  phaseLabel: string,
+  phaseLabels: string[],
   oldMinutes: number,
   newMinutes: number,
 ): string {
+  // Accept the current English labels as well as the legacy Chinese ones
+  // ('主训练 40 分钟') that persisted plans may still carry.
+  const labels = Array.from(new Set(phaseLabels.filter(Boolean)))
+    .map(escapeRegExp)
+    .join('|');
   const oldRounded = Math.round(oldMinutes);
-  const exact = new RegExp(`(${escapeRegExp(phaseLabel)}\\s+)${oldRounded}(\\s*分钟)`);
+  const exact = new RegExp(`((?:${labels})\\s*[:：]?\\s+)${oldRounded}(\\s*(?:分钟|min))`);
   if (exact.test(structure)) return structure.replace(exact, `$1${newMinutes}$2`);
-  const fallback = new RegExp(`(${escapeRegExp(phaseLabel)}\\s+)\\d+(\\s*分钟)`);
+  const fallback = new RegExp(`((?:${labels})\\s*[:：]?\\s+)\\d+(\\s*(?:分钟|min))`);
   return structure.replace(fallback, `$1${newMinutes}$2`);
 }
 
@@ -2439,7 +2448,7 @@ function addLowIntensityVolumeSessions(args: {
       sport: tpl.fixed.sport,
       templateId,
       slotIndex,
-      sessionLabel: '训练 2',
+      sessionLabel: 'Session 2',
       timeOfDay: 'evening',
       reason: day.reason,
     };
@@ -2521,8 +2530,8 @@ function chooseExtraVolumeDay(
       maxExtraMinutes,
       reason:
         tpl.fixed.sport === entry.sport
-          ? '用户高时长目标；新增一节短恢复训练，与当天主课区分，不重复堆有氧强度。'
-          : '用户高时长目标；新增一节低压力交叉训练，与当天主课区分，避免重复堆同项目有氧。',
+          ? 'High volume target: added a short recovery session, distinct from the main session, without stacking aerobic intensity.'
+          : 'High volume target: added a low-stress cross-training session, distinct from the main session, to avoid stacking same-sport aerobic volume.',
       hasHigh,
       minutes,
       index,
@@ -2653,71 +2662,71 @@ function buildSummary(
   }
 
   const sportPart = Object.entries(sportCounts)
-    .map(([s, n]) => `${n} 次${SPORT_ZH[s] ?? s}`)
+    .map(([s, n]) => `${n}x ${SPORT_EN[s] ?? s}`)
     .join(' + ');
 
-  const fatigueZh = FATIGUE_ZH[recentState.fatigue] ?? recentState.fatigue;
-  const stimulusZh = STIMULUS_ZH[recentState.latestStimulus] ?? recentState.latestStimulus;
+  const fatigueEn = FATIGUE_EN[recentState.fatigue] ?? recentState.fatigue;
+  const stimulusEn = STIMULUS_EN[recentState.latestStimulus] ?? recentState.latestStimulus;
 
   const parts: string[] = [];
   parts.push(
-    `本周课表：${sportPart || '以休息为主'}${restCount > 0 ? `，含 ${restCount} 天恢复/休息` : ''}。`,
+    `This week: ${sportPart || 'mostly rest'}${restCount > 0 ? `, plus ${restCount} recovery/rest day${restCount > 1 ? 's' : ''}` : ''}. `,
   );
   parts.push(
-    `最新可靠训练为${stimulusZh}，疲劳${fatigueZh}。`,
+    `Latest reliable session: ${stimulusEn}; fatigue: ${fatigueEn}. `,
   );
   parts.push(
-    `本周计划 ${hardCount} 次高强度课（上限 ${hardCap}），高强度课之间间隔至少 48 小时。`,
+    `${hardCount} hard session${hardCount === 1 ? '' : 's'} planned this week (cap ${hardCap}), with at least 48 h between hard sessions.`,
   );
   return parts.join('');
 }
 
 function buildMonitoring(recentState: RecentState): string {
   const parts = [
-    '每次训练后记录主观疲劳和睡眠质量；',
-    '关注静息心率和晨起精神状态变化；',
+    'Log perceived exertion and sleep quality after every session; ',
+    'watch resting HR and how you feel each morning; ',
   ];
   if (recentState.fatigue === 'tired' || recentState.fatigue === 'high_risk') {
-    parts.push('若两次连续训练心率明显升高或主观疲劳持续偏高，将后续高强度课改为恢复或有氧。');
+    parts.push('if HR is clearly elevated in two consecutive sessions or perceived fatigue stays high, swap upcoming hard sessions for recovery or aerobic work.');
   } else {
-    parts.push('每周完成度低于 70% 时下周自动下调强度，高于 90% 时考虑小幅升级。');
+    parts.push('if weekly completion is below 70%, reduce intensity next week; above 90%, consider a small progression.');
   }
   return parts.join('');
 }
 
 function buildAdjustmentRules(hardCap: number): string {
   return [
-    `本周高强度课不超过 ${hardCap} 次；连续两天不安排高强度。`,
-    '若当天主观疲劳 RPE ≥ 7/10，将主训练时长缩短 20-30%，目标心率上限降低 5-10 bpm。',
-    '若发生伤病或感冒，立即将本周剩余日改为完全休息或活动恢复。',
+    `No more than ${hardCap} hard sessions this week; never two hard days in a row. `,
+    'If RPE is ≥ 7/10 on the day, shorten the main set by 20-30% and lower the target HR ceiling by 5-10 bpm. ',
+    'If injured or sick, switch the rest of the week to full rest or mobility work immediately.',
   ].join('');
 }
 
-const SPORT_ZH: Record<string, string> = {
-  running: '跑步',
-  cycling: '骑行',
-  swimming: '游泳',
-  rest: '休息',
-  mobility: '活动恢复',
-  strength: '力量',
+const SPORT_EN: Record<string, string> = {
+  running: 'run',
+  cycling: 'ride',
+  swimming: 'swim',
+  rest: 'rest',
+  mobility: 'mobility',
+  strength: 'strength',
 };
 
-const FATIGUE_ZH: Record<string, string> = {
-  fresh: '新鲜',
-  normal: '正常',
-  tired: '偏疲劳',
-  high_risk: '高风险',
+const FATIGUE_EN: Record<string, string> = {
+  fresh: 'fresh',
+  normal: 'normal',
+  tired: 'tired',
+  high_risk: 'high risk',
 };
 
-const STIMULUS_ZH: Record<string, string> = {
-  recovery: '恢复课',
-  aerobic: '有氧',
-  long_endurance: 'LSD',
-  tempo: '节奏跑',
-  threshold: '阈值',
+const STIMULUS_EN: Record<string, string> = {
+  recovery: 'recovery',
+  aerobic: 'aerobic',
+  long_endurance: 'long endurance (LSD)',
+  tempo: 'tempo',
+  threshold: 'threshold',
   vo2max: 'VO2max',
-  anaerobic: '无氧',
-  unknown: '未知',
+  anaerobic: 'anaerobic',
+  unknown: 'unknown',
 };
 
 // touch HARD_STIMULI to keep symbol referenced for future logic.

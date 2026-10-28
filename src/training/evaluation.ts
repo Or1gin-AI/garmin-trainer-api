@@ -1,10 +1,11 @@
 // Rule-based training evaluation engine.
 // Compares planned workouts to actual Garmin activities and produces a
-// structured score + Chinese-language commentary.
+// structured score + English-language commentary.
 // Pure functions, no I/O, no DB, no LLM.
 
 import type { NormalizedActivity } from './activity-normalizer.js';
 import type { QualityResult } from './activity-quality.js';
+import { isNotApplicable } from './not-applicable.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -95,10 +96,8 @@ interface TargetRange {
   high: number | null;
 }
 
-const NA = '不适用';
-
 export function parseHrTarget(s: string | null | undefined): TargetRange | null {
-  if (!s || s === NA) return null;
+  if (!s || isNotApplicable(s)) return null;
   // "132-146 bpm"
   const range = s.match(/^(\d+)\s*-\s*(\d+)\s*bpm$/i);
   if (range) return { low: Number(range[1]), high: Number(range[2]) };
@@ -109,13 +108,13 @@ export function parseHrTarget(s: string | null | undefined): TargetRange | null 
 }
 
 export function parsePaceTarget(s: string | null | undefined): TargetRange | null {
-  if (!s || s === NA) return null;
+  if (!s || isNotApplicable(s)) return null;
   const unit = s.includes('/100m') ? '/100m' : '/km';
   // "5:00-5:10/km" or "1:20-1:25/100m"
   const range = s.match(/^(\d+:\d+)\s*-\s*(\d+:\d+)/);
   if (range) return { low: mmssToSec(range[1]), high: mmssToSec(range[2]) };
-  // "不快于 6:20/km" or "不快于 1:40/100m"
-  const cap = s.match(/不快于\s*(\d+:\d+)/);
+  // "no faster than 6:20/km" or legacy "不快于 1:40/100m" (persisted plans)
+  const cap = s.match(/(?:不快于|no faster than)\s*(\d+:\d+)/i);
   if (cap) return { low: null, high: mmssToSec(cap[1]) };
   // Single pace "5:00/km"
   const single = s.match(/^(\d+:\d+)/);
@@ -127,7 +126,7 @@ export function parsePaceTarget(s: string | null | undefined): TargetRange | nul
 }
 
 export function parsePowerTarget(s: string | null | undefined): TargetRange | null {
-  if (!s || s === NA) return null;
+  if (!s || isNotApplicable(s)) return null;
   // "200-250 W"
   const range = s.match(/^(\d+)\s*-\s*(\d+)\s*W$/i);
   if (range) return { low: Number(range[1]), high: Number(range[2]) };
@@ -226,7 +225,7 @@ function buildPairings(
         matchedActivityRef: null,
         verdict: 'missed',
         subScore: 0,
-        notes: ['未找到匹配的运动记录'],
+        notes: ['No matching activity found'],
       });
     }
   }
@@ -255,7 +254,7 @@ function scorePairing(
   const sportOk = sportsMatch(w.sport, a.sport);
   sportScore = sportOk ? 100 : 0;
   if (!sportOk) {
-    notes.push(`运动类型不匹配：计划 ${sportZh(w.sport)}，实际 ${sportZh(a.sport)}`);
+    notes.push(`Sport mismatch: planned ${sportZh(w.sport)}, actual ${sportZh(a.sport)}`);
   }
 
   // Duration match (25%)
@@ -263,8 +262,8 @@ function scorePairing(
     hasDuration = true;
     const ratio = a.durationMin / w.durationMinutes;
     durationScore = ratioToScore(ratio);
-    if (ratio < 0.75) notes.push(`时长不足：完成了计划的 ${pct(ratio)}`);
-    else if (ratio > 1.25) notes.push(`时长超出：实际为计划的 ${pct(ratio)}`);
+    if (ratio < 0.75) notes.push(`Duration short: completed ${pct(ratio)} of plan`);
+    else if (ratio > 1.25) notes.push(`Duration over: ${pct(ratio)} of plan`);
   }
 
   // Distance match (20%)
@@ -273,8 +272,8 @@ function scorePairing(
     hasDistance = true;
     const ratio = a.distanceKm / plannedDist;
     distanceScore = ratioToScore(ratio);
-    if (ratio < 0.75) notes.push(`距离不足：完成了计划的 ${pct(ratio)}`);
-    else if (ratio > 1.25) notes.push(`距离超出：实际为计划的 ${pct(ratio)}`);
+    if (ratio < 0.75) notes.push(`Distance short: completed ${pct(ratio)} of plan`);
+    else if (ratio > 1.25) notes.push(`Distance over: ${pct(ratio)} of plan`);
   }
 
   // Intensity match (25%)
@@ -396,7 +395,7 @@ function compareHr(
     const over = Math.round(actual - (target.high ?? actual));
     return {
       score: Math.max(0, 100 - over * 4),
-      note: `心率偏高：平均 ${Math.round(actual)} bpm，超出目标上限 ${over} bpm`,
+      note: `HR too high: avg ${Math.round(actual)} bpm, ${over} bpm above target cap`,
     };
   }
 
@@ -404,7 +403,7 @@ function compareHr(
     const under = Math.round((target.low ?? actual) - actual);
     return {
       score: Math.max(30, 100 - under * 3),
-      note: `心率偏低：平均 ${Math.round(actual)} bpm，低于目标下限 ${under} bpm`,
+      note: `HR too low: avg ${Math.round(actual)} bpm, ${under} bpm below target floor`,
     };
   }
 
@@ -439,13 +438,13 @@ function comparePace(
   if (effectiveLow !== null && actual < effectiveLow) {
     return {
       score: 70,
-      note: `配速偏快：实际 ${secToMmss(actual)}${unit}，快于目标范围`,
+      note: `Pace too fast: actual ${secToMmss(actual)}${unit}, faster than target range`,
     };
   }
   if (effectiveHigh !== null && actual > effectiveHigh) {
     return {
       score: Math.max(30, 70),
-      note: `配速偏慢：实际 ${secToMmss(actual)}${unit}，慢于目标范围`,
+      note: `Pace too slow: actual ${secToMmss(actual)}${unit}, slower than target range`,
     };
   }
 
@@ -477,14 +476,14 @@ function comparePower(
     const over = Math.round(actual - (target.high ?? actual));
     return {
       score: Math.max(30, 100 - over),
-      note: `功率偏高：平均 ${Math.round(actual)} W，超出目标 ${over} W`,
+      note: `Power too high: avg ${Math.round(actual)} W, ${over} W above target`,
     };
   }
   if (effectiveLow !== null && actual < effectiveLow) {
     const under = Math.round((target.low ?? actual) - actual);
     return {
       score: Math.max(30, 100 - under),
-      note: `功率偏低：平均 ${Math.round(actual)} W，低于目标 ${under} W`,
+      note: `Power too low: avg ${Math.round(actual)} W, ${under} W below target`,
     };
   }
 
@@ -518,7 +517,7 @@ function buildLoadComment(
     return {
       planned: null,
       actual: hasActualLoad ? Math.round(totalActualLoad) : null,
-      comment: hasActualLoad ? `实际训练负荷 ${Math.round(totalActualLoad)}` : '无负荷数据',
+      comment: hasActualLoad ? `Actual training load ${Math.round(totalActualLoad)}` : 'No load data',
     };
   }
 
@@ -536,16 +535,16 @@ function buildLoadComment(
     : `${totalLow}-${totalHigh}`;
 
   if (!hasActualLoad) {
-    return { planned, actual: null, comment: '设备未记录训练负荷数据' };
+    return { planned, actual: null, comment: 'Device did not record training load' };
   }
 
   let comment: string;
   if (totalActualLoad < totalLow * 0.7) {
-    comment = `训练负荷偏低：实际 ${Math.round(totalActualLoad)}，期望 ${planned}`;
+    comment = `Training load low: actual ${Math.round(totalActualLoad)}, expected ${planned}`;
   } else if (totalActualLoad > totalHigh * 1.3) {
-    comment = `训练负荷偏高：实际 ${Math.round(totalActualLoad)}，期望 ${planned}`;
+    comment = `Training load high: actual ${Math.round(totalActualLoad)}, expected ${planned}`;
   } else {
-    comment = `训练负荷在合理范围：实际 ${Math.round(totalActualLoad)}，期望 ${planned}`;
+    comment = `Training load on target: actual ${Math.round(totalActualLoad)}, expected ${planned}`;
   }
 
   return { planned, actual: totalActualLoad, comment };
@@ -561,22 +560,22 @@ function buildIntensitySummary(
 ): { planned: string | null; actual: string | null; comment: string } {
   const nonRest = workouts.filter((w) => !REST_SPORTS.has(w.sport));
   if (nonRest.length === 0) {
-    return { planned: null, actual: null, comment: '计划为休息日' };
+    return { planned: null, actual: null, comment: 'Rest day planned' };
   }
 
-  const planned = nonRest.map((w) => intensityZh(w.intensity)).join('、');
+  const planned = nonRest.map((w) => intensityZh(w.intensity)).join(', ');
 
   const actualParts: string[] = [];
   for (const a of activities) {
     if (a.averageHr) actualParts.push(`HR ${Math.round(a.averageHr)}`);
-    else if (a.averagePaceSecPerKm) actualParts.push(`配速 ${secToMmss(a.averagePaceSecPerKm)}/km`);
+    else if (a.averagePaceSecPerKm) actualParts.push(`Pace ${secToMmss(a.averagePaceSecPerKm)}/km`);
     else if (a.averagePower) actualParts.push(`${Math.round(a.averagePower)}W`);
   }
 
   return {
     planned,
-    actual: actualParts.length > 0 ? actualParts.join('、') : null,
-    comment: actualParts.length > 0 ? `计划强度 ${planned}` : '缺少强度数据',
+    actual: actualParts.length > 0 ? actualParts.join(', ') : null,
+    comment: actualParts.length > 0 ? `Planned intensity: ${planned}` : 'No intensity data',
   };
 }
 
@@ -635,7 +634,7 @@ export function evaluateTrainingDay(input: EvaluateInput): TrainingEvaluationRes
       const q = activityQualities.get(key);
       if (q && q.confidence === 'low') {
         p.subScore = Math.round(p.subScore * 0.7);
-        p.notes.push('活动数据可信度较低，评分已折扣');
+        p.notes.push('Low activity data confidence; score discounted');
       }
     }
   }
@@ -752,20 +751,20 @@ function buildRestDayActiveResult(
   const isLight = totalLoad < 40 && activities.every((a) => (a.durationMin ?? 0) < 45);
 
   const highlights = isLight
-    ? ['休息日进行了轻度活动，有助于恢复']
+    ? ['Light activity on a rest day supports recovery']
     : [];
   const risks = !isLight
-    ? ['休息日运动强度偏高，可能影响恢复']
+    ? ['Rest-day activity was fairly intense and may slow recovery']
     : [];
   const suggestions = !isLight
-    ? ['建议休息日以轻度活动为主，控制时间和强度']
-    : ['继续保持适度的恢复性活动'];
+    ? ['Keep rest days to light activity with limited duration and intensity']
+    : ['Keep up the moderate recovery activity'];
 
   return {
-    title: isLight ? '休息日活动 (合理)' : '休息日活动 (偏多)',
+    title: isLight ? 'Rest Day Activity (OK)' : 'Rest Day Activity (Too Much)',
     summary: isLight
-      ? `计划为休息日，你进行了${activities.length}项轻度活动，有助于积极恢复。`
-      : `计划为休息日，但实际进行了${activities.length}项运动，总负荷 ${totalLoad}，建议注意恢复。`,
+      ? `Rest day planned; you did ${activities.length} light ${activities.length === 1 ? 'activity' : 'activities'}, which supports active recovery.`
+      : `Rest day planned, but you logged ${activities.length} ${activities.length === 1 ? 'activity' : 'activities'} with a total load of ${totalLoad}. Prioritize recovery.`,
     score: isLight ? 80 : 50,
     verdict: 'rest_day_active',
     plannedWorkoutCount: workouts.length,
@@ -777,14 +776,14 @@ function buildRestDayActiveResult(
       intensityMatched: null,
     },
     load: {
-      planned: '0 (休息日)',
+      planned: '0 (rest day)',
       actual: totalLoad > 0 ? totalLoad : null,
-      comment: isLight ? '轻度活动，不影响恢复' : '负荷偏高，建议注意恢复',
+      comment: isLight ? 'Light activity; recovery unaffected' : 'Load on the high side; prioritize recovery',
     },
     intensity: {
-      planned: '休息',
+      planned: 'Rest',
       actual: null,
-      comment: isLight ? '轻度活动' : '强度偏高',
+      comment: isLight ? 'Light activity' : 'Intensity on the high side',
     },
     highlights,
     risks,
@@ -796,7 +795,7 @@ function buildRestDayActiveResult(
       matchedActivityRef: null,
       verdict: 'matched' as const,
       subScore: isLight ? 80 : 50,
-      notes: isLight ? ['轻度恢复活动'] : ['休息日运动强度偏高'],
+      notes: isLight ? ['Light recovery activity'] : ['Rest-day intensity too high'],
     })),
     physiology: null,
   };
@@ -804,8 +803,8 @@ function buildRestDayActiveResult(
 
 function buildRestDayCleanResult(workouts: PlannedWorkout[]): TrainingEvaluationResult {
   return {
-    title: '休息日 — 完成',
-    summary: '计划为休息日，你按计划休息了，做得好！',
+    title: 'Rest Day — Done',
+    summary: 'Rest day planned and you rested as planned. Nice work!',
     score: 100,
     verdict: 'matched',
     plannedWorkoutCount: workouts.length,
@@ -816,9 +815,9 @@ function buildRestDayCleanResult(workouts: PlannedWorkout[]): TrainingEvaluation
       distanceRatio: null,
       intensityMatched: null,
     },
-    load: { planned: '0 (休息日)', actual: null, comment: '按计划休息' },
-    intensity: { planned: '休息', actual: null, comment: '按计划休息' },
-    highlights: ['按计划执行了休息日'],
+    load: { planned: '0 (rest day)', actual: null, comment: 'Rested as planned' },
+    intensity: { planned: 'Rest', actual: null, comment: 'Rested as planned' },
+    highlights: ['Took the planned rest day'],
     risks: [],
     suggestions: [],
     pairings: workouts.map((w) => ({
@@ -836,8 +835,8 @@ function buildRestDayCleanResult(workouts: PlannedWorkout[]): TrainingEvaluation
 
 function buildNoPlannedResult(activities: NormalizedActivity[]): TrainingEvaluationResult {
   return {
-    title: '自由训练',
-    summary: `当天没有训练计划，但完成了${activities.length}项运动。`,
+    title: 'Unplanned Training',
+    summary: `No workout was planned today, but you completed ${activities.length} ${activities.length === 1 ? 'activity' : 'activities'}.`,
     score: 60,
     verdict: 'matched',
     plannedWorkoutCount: 0,
@@ -850,7 +849,7 @@ function buildNoPlannedResult(activities: NormalizedActivity[]): TrainingEvaluat
     },
     load: buildLoadComment([], activities),
     intensity: buildIntensitySummary([], activities),
-    highlights: [`完成了${activities.length}项运动`],
+    highlights: [`Completed ${activities.length} ${activities.length === 1 ? 'activity' : 'activities'}`],
     risks: [],
     suggestions: [],
     pairings: [],
@@ -863,16 +862,16 @@ function buildNoPlannedResult(activities: NormalizedActivity[]): TrainingEvaluat
 // ---------------------------------------------------------------------------
 
 const VERDICT_TITLE: Record<Verdict, string> = {
-  matched: '训练达标',
-  under_done: '训练不足',
-  over_done: '训练过量',
-  different_sport: '项目不匹配',
-  missed: '训练缺失',
-  rest_day_active: '休息日活动',
+  matched: 'On Target',
+  under_done: 'Under Target',
+  over_done: 'Over Target',
+  different_sport: 'Sport Mismatch',
+  missed: 'Missed Workout',
+  rest_day_active: 'Rest Day Activity',
 };
 
 function buildTitle(verdict: Verdict, score: number): string {
-  return `${VERDICT_TITLE[verdict]} (${score}分)`;
+  return `${VERDICT_TITLE[verdict]} (${score} pts)`;
 }
 
 function buildSummary(
@@ -887,17 +886,17 @@ function buildSummary(
 
   switch (verdict) {
     case 'matched':
-      return `今日训练计划执行良好，${matched}/${total} 项训练达标。继续保持！`;
+      return `Today's plan was executed well: ${matched}/${total} workouts on target. Keep it up!`;
     case 'under_done':
-      return `今日训练量不足，完成度低于计划要求。建议下次尽量按计划完成全部训练内容。`;
+      return `Today's training volume fell short of the plan. Next time, aim to complete the full session as planned.`;
     case 'over_done':
-      return `今日训练量超出计划，注意控制训练量，避免过度疲劳影响后续训练。`;
+      return `Today's training exceeded the plan. Keep volume in check so fatigue doesn't compromise upcoming sessions.`;
     case 'different_sport':
-      return `实际运动项目与计划不一致。如果是有意调整请忽略，否则建议按计划项目执行。`;
+      return `The sport you did doesn't match the plan. Ignore this if it was intentional; otherwise stick to the planned sport.`;
     case 'missed':
-      return `今日计划训练未完成。如果是身体原因，建议休息恢复；否则尽快补上。`;
+      return `Today's planned workout wasn't completed. If it was for health reasons, rest and recover; otherwise make it up soon.`;
     case 'rest_day_active':
-      return `计划为休息日，但有运动记录。适度活动有益恢复，但注意不要过量。`;
+      return `Rest day planned, but activity was recorded. Moderate movement aids recovery; just don't overdo it.`;
   }
 }
 
@@ -911,16 +910,16 @@ function buildHighlights(
   if (matched.length > 0) {
     for (const p of matched) {
       if (p.subScore >= 85) {
-        highlights.push(`${p.workoutTitle} 完成质量优秀`);
+        highlights.push(`${p.workoutTitle}: excellent execution`);
       } else {
-        highlights.push(`完成了计划的 ${p.workoutTitle}`);
+        highlights.push(`Completed planned ${p.workoutTitle}`);
       }
     }
   }
 
   for (const p of pairings) {
     for (const note of p.notes) {
-      if (note.includes('心率控制') || note.includes('配速在目标')) {
+      if (note.includes('HR well controlled') || note.includes('Pace within target')) {
         highlights.push(note);
       }
     }
@@ -936,7 +935,7 @@ function buildHighlights(
     (a) => !matchedRefs.has(`${a.region}:${String(a.activityId)}`),
   );
   if (extra.length > 0) {
-    highlights.push(`额外完成了 ${extra.length} 项运动`);
+    highlights.push(`${extra.length} extra ${extra.length === 1 ? 'activity' : 'activities'} completed`);
   }
 
   return highlights;
@@ -952,11 +951,11 @@ function buildRisks(
   for (const p of pairings) {
     for (const note of p.notes) {
       if (
-        note.includes('偏高') ||
-        note.includes('偏低') ||
-        note.includes('不足') ||
-        note.includes('超出') ||
-        note.includes('不匹配')
+        note.includes('too high') ||
+        note.includes('too low') ||
+        note.includes(' short:') ||
+        note.includes(' over:') ||
+        note.includes('mismatch')
       ) {
         risks.push(note);
       }
@@ -967,7 +966,7 @@ function buildRisks(
     const key = `${a.region}-${String(a.activityId)}`;
     const q = qualities.get(key);
     if (q && q.confidence === 'low') {
-      risks.push('部分活动数据可信度较低，评价结果仅供参考');
+      risks.push('Some activity data has low confidence; treat this evaluation as indicative only');
       break;
     }
   }
@@ -983,28 +982,28 @@ function buildSuggestions(
 
   switch (verdict) {
     case 'under_done':
-      suggestions.push('下次尽量按计划完成全部训练内容');
-      if (pairings.some((p) => p.notes.some((n) => n.includes('时长不足')))) {
-        suggestions.push('可以适当延长训练时间以达到计划要求');
+      suggestions.push('Next time, aim to complete the full planned session');
+      if (pairings.some((p) => p.notes.some((n) => n.includes('Duration short')))) {
+        suggestions.push('Extend the session a bit to meet the planned duration');
       }
       break;
     case 'over_done':
-      suggestions.push('注意控制训练量，过度训练可能增加受伤风险');
-      suggestions.push('如果感到疲劳，下次训练可适当降低强度');
+      suggestions.push('Keep volume in check; overtraining raises injury risk');
+      suggestions.push('If you feel fatigued, ease the intensity next session');
       break;
     case 'different_sport':
-      suggestions.push('建议按照计划的运动项目执行，以保持训练的系统性');
+      suggestions.push('Stick to the planned sport to keep training consistent');
       break;
     case 'missed':
-      suggestions.push('如果因身体原因缺席，建议充分休息后再恢复训练');
-      suggestions.push('如果是时间原因，可考虑调整训练时间安排');
+      suggestions.push('If you missed it for health reasons, rest fully before resuming');
+      suggestions.push('If time was the issue, consider rescheduling your sessions');
       break;
     case 'matched':
-      if (pairings.some((p) => p.notes.some((n) => n.includes('心率偏高')))) {
-        suggestions.push('尝试全程保持在目标心率区间内');
+      if (pairings.some((p) => p.notes.some((n) => n.includes('HR too high')))) {
+        suggestions.push('Try to stay within the target HR zone throughout');
       }
-      if (pairings.some((p) => p.notes.some((n) => n.includes('配速偏快')))) {
-        suggestions.push('控制配速在目标范围内，避免前半程过快');
+      if (pairings.some((p) => p.notes.some((n) => n.includes('Pace too fast')))) {
+        suggestions.push('Keep pace within the target range and avoid going out too fast');
       }
       break;
   }
@@ -1063,13 +1062,13 @@ function secToMmss(sec: number): string {
 }
 
 const SPORT_ZH: Record<string, string> = {
-  running: '跑步',
-  cycling: '骑行',
-  swimming: '游泳',
-  rest: '休息',
-  strength: '力量',
-  mobility: '恢复活动',
-  other: '其他',
+  running: 'Running',
+  cycling: 'Cycling',
+  swimming: 'Swimming',
+  rest: 'Rest',
+  strength: 'Strength',
+  mobility: 'Mobility',
+  other: 'Other',
 };
 
 function sportZh(s: string): string {
@@ -1077,9 +1076,9 @@ function sportZh(s: string): string {
 }
 
 const INTENSITY_ZH: Record<string, string> = {
-  low: '低强度',
-  medium: '中强度',
-  high: '高强度',
+  low: 'Low intensity',
+  medium: 'Moderate intensity',
+  high: 'High intensity',
 };
 
 function intensityZh(s: string): string {
@@ -1127,8 +1126,8 @@ function classifyHrZoneFromActivity(a: NormalizedActivity, _maxHr: number): numb
 }
 
 const ZONE_LABELS: Record<string, string> = {
-  '1': 'Z1 恢复', '1.5': 'Z1-2', '2': 'Z2 有氧', '2.5': 'Z2-3',
-  '3': 'Z3 节奏', '3.5': 'Z3-4', '4': 'Z4 阈值', '4.5': 'Z4-5', '5': 'Z5 VO₂max',
+  '1': 'Z1 Recovery', '1.5': 'Z1-2', '2': 'Z2 Aerobic', '2.5': 'Z2-3',
+  '3': 'Z3 Tempo', '3.5': 'Z3-4', '4': 'Z4 Threshold', '4.5': 'Z4-5', '5': 'Z5 VO₂max',
 };
 
 function zoneLabel(z: number): string {
@@ -1163,26 +1162,26 @@ function evaluateTrainingEffect(a: NormalizedActivity, intensity: string): TERes
 
   if (intensity === 'low') {
     if (aer > 3.5) {
-      return { match: false, note: `有氧训练效果 ${aer.toFixed(1)}，对于恢复日偏高` };
+      return { match: false, note: `Aerobic TE ${aer.toFixed(1)} is too high for a recovery day` };
     }
-    return { match: true, note: aer <= 2.0 ? `有氧效果 ${aer.toFixed(1)}，适合恢复日` : null };
+    return { match: true, note: aer <= 2.0 ? `Aerobic TE ${aer.toFixed(1)}, appropriate for a recovery day` : null };
   }
 
   if (intensity === 'medium') {
     if (aer < 2.0) {
-      return { match: false, note: `有氧效果仅 ${aer.toFixed(1)}，未达到中强度刺激水平` };
+      return { match: false, note: `Aerobic TE only ${aer.toFixed(1)}, below a moderate training stimulus` };
     }
     if (aer > 4.5) {
-      return { match: false, note: `有氧效果 ${aer.toFixed(1)}，超出中强度计划预期` };
+      return { match: false, note: `Aerobic TE ${aer.toFixed(1)}, above what the moderate session called for` };
     }
-    return { match: true, note: `有氧效果 ${aer.toFixed(1)}，符合中强度训练` };
+    return { match: true, note: `Aerobic TE ${aer.toFixed(1)}, in line with a moderate session` };
   }
 
   if (intensity === 'high') {
     if (aer < 3.0 && (ana === null || ana < 1.0)) {
-      return { match: false, note: `有氧效果 ${aer.toFixed(1)}${ana !== null ? `，无氧效果 ${ana.toFixed(1)}` : ''}，未达高强度目标` };
+      return { match: false, note: `Aerobic TE ${aer.toFixed(1)}${ana !== null ? `, anaerobic TE ${ana.toFixed(1)}` : ''}; below the high-intensity target` };
     }
-    return { match: true, note: `训练效果 ${aer.toFixed(1)}/${(ana ?? 0).toFixed(1)}，达到高强度刺激` };
+    return { match: true, note: `Training effect ${aer.toFixed(1)}/${(ana ?? 0).toFixed(1)}, high-intensity stimulus achieved` };
   }
 
   return { match: true, note: null };
@@ -1196,18 +1195,18 @@ function checkRecoveryRisks(a: NormalizedActivity, intensity: string): string[] 
   const risks: string[] = [];
 
   if (intensity === 'high' && a.recoveryTimeHours !== null && a.recoveryTimeHours > 24) {
-    risks.push(`高强度训练时恢复时间仍剩余 ${Math.round(a.recoveryTimeHours)}h，存在过度训练风险`);
+    risks.push(`Hard session done with ${Math.round(a.recoveryTimeHours)}h of recovery time still remaining; overtraining risk`);
   }
 
   if (a.hrvStatus) {
     const lower = a.hrvStatus.toLowerCase();
     if (lower === 'low' || lower === 'poor' || lower === 'unbalanced') {
-      risks.push(`HRV 状态偏低 (${a.hrvStatus})，建议关注恢复`);
+      risks.push(`HRV status low (${a.hrvStatus}); keep an eye on recovery`);
     }
   }
 
   if (a.sleepScore !== null && a.sleepScore < 50) {
-    risks.push(`前夜睡眠评分偏低 (${a.sleepScore}分)，可能影响训练质量`);
+    risks.push(`Low sleep score last night (${a.sleepScore}); may affect training quality`);
   }
 
   return risks;
@@ -1342,8 +1341,8 @@ function buildPhysiologyRisks(
   }
 
   if (physiology.zoneMatch === false && physiology.hrZone !== null && physiology.plannedZone) {
-    const actualZoneLabel = physiology.hrZone !== null ? zoneLabel(physiology.hrZone) : '未知';
-    risks.push(`实际训练区间 (${actualZoneLabel}) 偏离计划要求 (${physiology.plannedZone})`);
+    const actualZoneLabel = physiology.hrZone !== null ? zoneLabel(physiology.hrZone) : 'Unknown';
+    risks.push(`Actual training zone (${actualZoneLabel}) deviated from plan (${physiology.plannedZone})`);
   }
 
   return risks;
@@ -1364,11 +1363,11 @@ function buildPhysiologyHighlights(
   }
 
   if (physiology.zoneMatch === true && physiology.hrZone !== null) {
-    highlights.push(`心率区间 ${zoneLabel(physiology.hrZone)} 与计划匹配`);
+    highlights.push(`HR zone ${zoneLabel(physiology.hrZone)} matched the plan`);
   }
 
   if (physiology.tss !== null && physiology.intensityFactor !== null) {
-    highlights.push(`骑行 IF=${physiology.intensityFactor.toFixed(2)}，TSS=${physiology.tss}`);
+    highlights.push(`Ride IF=${physiology.intensityFactor.toFixed(2)}, TSS=${physiology.tss}`);
   }
 
   return highlights;
@@ -1384,7 +1383,7 @@ function buildPhysiologySuggestions(
   const primaryIntensity = workouts.find((w) => !REST_SPORTS.has(w.sport))?.intensity ?? 'medium';
 
   if (primaryIntensity === 'low' && physiology.hrZone !== null && physiology.hrZone >= 3) {
-    suggestions.push('轻松日保持 Zone 1-2 有助于长期适应（Seiler 极化训练原则）');
+    suggestions.push('Keeping easy days in Zone 1-2 supports long-term adaptation (Seiler polarized training)');
   }
 
   for (const a of activities) {
@@ -1393,7 +1392,7 @@ function buildPhysiologySuggestions(
   }
 
   if (physiology.edwardsTRIMP !== null && physiology.edwardsTRIMP > 400) {
-    suggestions.push('单日 TRIMP 偏高，注意安排充足恢复');
+    suggestions.push('High daily TRIMP; make sure to schedule enough recovery');
   }
 
   return suggestions;

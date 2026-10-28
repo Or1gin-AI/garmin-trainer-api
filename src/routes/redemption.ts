@@ -40,10 +40,10 @@ redemptionRouter.post('/redeem', requireUser, async (req, res) => {
       .where(eq(redemptionCode.code, code))
       .limit(1);
     if (!found[0]) {
-      res.status(404).json({ error: '卡密不存在' });
+      res.status(404).json({ error: 'Redemption code not found' });
       return;
     }
-    res.status(409).json({ error: '卡密已被使用' });
+    res.status(409).json({ error: 'Redemption code has already been used' });
     return;
   }
 

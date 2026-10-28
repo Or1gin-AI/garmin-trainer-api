@@ -265,32 +265,32 @@ interface RecommendationInput {
 }
 
 const STIMULUS_ZH: Record<Stimulus, string> = {
-  recovery: '恢复课',
-  aerobic: '有氧',
-  tempo: '节奏跑',
-  threshold: '阈值',
+  recovery: 'recovery',
+  aerobic: 'aerobic',
+  tempo: 'tempo',
+  threshold: 'threshold',
   vo2max: 'VO2max',
-  anaerobic: '无氧',
+  anaerobic: 'anaerobic',
   long_endurance: 'LSD',
-  unknown: '未知强度',
+  unknown: 'unknown intensity',
 };
 
 const FATIGUE_ZH: Record<Fatigue, string> = {
-  fresh: '状态新鲜',
-  normal: '负荷正常',
-  tired: '已有疲劳',
-  high_risk: '过度训练风险',
+  fresh: 'Fresh',
+  normal: 'Load normal',
+  tired: 'Some fatigue',
+  high_risk: 'Overtraining risk',
 };
 
 const TREND_ZH: Record<LoadTrend, string> = {
-  rising: '上升',
-  stable: '平稳',
-  falling: '下降',
+  rising: 'rising',
+  stable: 'stable',
+  falling: 'falling',
 };
 
 function buildRecommendation(input: RecommendationInput): string {
   if (!input.latestReliableActivity) {
-    return '暂无可靠的近期活动数据，建议从轻松有氧或恢复课开始，逐步建立基线。';
+    return 'No reliable recent activity data yet. Start with easy aerobic or recovery sessions to build a baseline.';
   }
 
   const parts: string[] = [];
@@ -298,29 +298,29 @@ function buildRecommendation(input: RecommendationInput): string {
   const loadPart =
     input.latestTrainingLoad !== null
       ? `${Math.round(input.latestTrainingLoad)} TL`
-      : '负荷未记录';
+      : 'load not recorded';
   const hoursAgo = Math.max(0, Math.round(input.hoursSinceLatest));
   const timePart =
-    hoursAgo < 24 ? `${hoursAgo} 小时前` : `${Math.round(hoursAgo / 24)} 天前`;
-  parts.push(`最近可靠训练为${stimulusLabel}（${loadPart}，${timePart}）`);
+    hoursAgo < 24 ? `${hoursAgo} h ago` : `${Math.round(hoursAgo / 24)} d ago`;
+  parts.push(`Latest reliable session: ${stimulusLabel} (${loadPart}, ${timePart})`);
 
   parts.push(
-    `7 天负荷 ${input.load7d}，28 天 ${input.load28d}，趋势${TREND_ZH[input.loadTrend]}`,
+    `7-day load ${input.load7d}, 28-day ${input.load28d}, trend ${TREND_ZH[input.loadTrend]}`,
   );
 
   parts.push(FATIGUE_ZH[input.fatigue]);
 
   if (HARD_STIMULI.has(input.latestStimulus) && hoursAgo < 36) {
-    parts.push('下一次质量课至少推迟 24 小时');
+    parts.push('Delay the next quality session by at least 24 hours');
   } else if (input.fatigue === 'high_risk') {
-    parts.push('建议本周以恢复和低强度有氧为主');
+    parts.push('Keep this week mostly recovery and easy aerobic work');
   } else if (input.fatigue === 'tired') {
-    parts.push('建议先做一次恢复或轻松有氧课');
+    parts.push('Start with a recovery or easy aerobic session');
   } else if (input.hardSessionsLast7d >= 2) {
-    parts.push('本周高强度课已达 2 次，剩余安排以有氧为主');
+    parts.push('Already 2 hard sessions this week; keep the rest aerobic');
   }
 
-  let out = parts.join('；') + '。';
+  let out = parts.join('; ') + '.';
   if (out.length > 240) out = out.slice(0, 237) + '…';
   return out;
 }

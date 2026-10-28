@@ -113,7 +113,7 @@ garminRouter.post('/callback/:region', requireUser, async (req, res) => {
   }
   const ticket = String((req.body && req.body.ticket) || '').trim();
   if (!ticket) {
-    res.status(400).json({ ok: false, error: '缺少 ticket' });
+    res.status(400).json({ ok: false, error: 'Missing ticket' });
     return;
   }
   const rawServiceUrl = req.body && req.body.serviceUrl;
@@ -124,7 +124,7 @@ garminRouter.post('/callback/:region', requireUser, async (req, res) => {
     if (!cooldown.canBind) {
       res.status(429).json({
         ok: false,
-        error: `同一区域 Garmin 账号 7 天内只能绑定一次，请在 ${cooldown.nextBindAllowedAt?.toLocaleString('zh-CN')} 后再试。`,
+        error: `A Garmin account can only be linked once per region every 7 days. Please try again after ${cooldown.nextBindAllowedAt?.toLocaleString('en-US')}.`,
         code: 'garmin_bind_cooldown',
         nextBindAllowedAt: cooldown.nextBindAllowedAt,
       });

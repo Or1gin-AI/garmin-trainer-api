@@ -463,12 +463,12 @@ function deriveRunning(
   if (allRuns.length === 0) return profile;
   if (runs.length === 0) {
     profile.evidence = {
-      notes: ['所有近期跑步都被判为低可信，未输出配速能力。'],
+      notes: ['All recent runs were rated low-confidence; no pace capability was derived.'],
       easyPace: {
         confidence: 'low',
         method: 'excluded_low_quality_runs',
         samples: allRuns.slice(0, 8).map((r) =>
-          buildRunningEvidenceSample(r, qualities, false, '低可信活动，未纳入能力估计'),
+          buildRunningEvidenceSample(r, qualities, false, 'Low-confidence activity; excluded from capability estimate'),
         ),
         warnings: ['no_reliable_running_samples'],
       },
@@ -594,7 +594,7 @@ function deriveRunning(
     .sort((a, b) => (a.averagePaceSecPerKm ?? 9999) - (b.averagePaceSecPerKm ?? 9999))
     .slice(0, 8)
     .map((r) =>
-      buildRunningEvidenceSample(r, qualities, true, '阈值/稳态能力候选样本'),
+      buildRunningEvidenceSample(r, qualities, true, 'Threshold/steady-state capability candidate'),
     );
 
   profile.evidence = {
@@ -667,16 +667,16 @@ function buildEasyRunningCandidates(
       !highIntensityStimulus &&
       (garminEasy || inHrEasy);
     let reason = included
-      ? '近期可靠低强度/有氧样本'
-      : '不满足低强度有氧样本条件';
+      ? 'Recent reliable easy/aerobic sample'
+      : 'Does not meet easy aerobic sample criteria';
 
     if (thresholdPace !== null && pace - thresholdPace < 35) {
       included = false;
-      reason = '配速过于接近阈值配速，未作为有氧能力样本';
+      reason = 'Pace too close to threshold pace; not used as an aerobic sample';
     }
     if (avgHr !== null && hr !== null && avgHr > hr.tempoRange[0]) {
       included = false;
-      reason = '平均心率进入 tempo 或更高区间，未作为有氧样本';
+      reason = 'Average HR in tempo zone or higher; not used as an aerobic sample';
     }
     out.push({ activity: r, pace, included, reason });
   }
@@ -778,19 +778,19 @@ function buildRunningEvidenceNotes(args: {
   vo2Max?: number;
 }): string[] {
   const notes = [
-    `使用 ${args.runs.length} 条非低可信跑步样本建立跑步画像。`,
+    `Running profile built from ${args.runs.length} non-low-confidence runs.`,
   ];
   if (args.excludedCount > 0) {
-    notes.push(`${args.excludedCount} 条跑步因质量过低被排除。`);
+    notes.push(`${args.excludedCount} runs excluded due to low data quality.`);
   }
   if (args.easyAdjusted) {
-    notes.push('有氧配速样本过于接近阈值配速，已按阈值差距规则保守修正。');
+    notes.push('Aerobic pace samples were too close to threshold pace; adjusted conservatively using the threshold-gap rule.');
   }
   if (args.economy === 'needs_work') {
-    notes.push('跑姿经济性指标偏弱，配速处方应优先保守。');
+    notes.push('Running economy metrics are weak; pace prescriptions should lean conservative.');
   }
   if (args.vo2Max !== undefined) {
-    notes.push(`Garmin VO2max 参考值约 ${args.vo2Max}。`);
+    notes.push(`Garmin VO2max reference: ~${args.vo2Max}.`);
   }
   return notes;
 }

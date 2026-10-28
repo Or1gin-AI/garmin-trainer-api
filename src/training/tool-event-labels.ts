@@ -1,45 +1,46 @@
-// Centralizes Chinese display names and summary builders for the `tool_event`
+// Centralizes English display names and summary builders for the `tool_event`
 // SSE channel. Both the orchestrator (plan generation) and the chat route
 // dispatch through these helpers so the frontend always shows consistent,
 // user-facing labels — never raw tool names or arg JSON.
 
 import type { Violation } from './validation.js';
+import { isNotApplicable } from './not-applicable.js';
 
 export const TOOL_DISPLAY: Record<string, string> = {
   // Plan-generation pseudo tools.
-  load_recent_activities: '查询近 56 天国区 Garmin 训练记录',
-  load_athlete_profile: '分析跑者画像与近期状态',
-  llm_build_schedule: '编排本周训练日程',
-  llm_parameterize_workout: '配置训练课参数',
-  validate_plan: '校验训练负荷',
-  llm_stream_summary: '生成本周总结与监测建议',
+  load_recent_activities: 'Loading the last 56 days of Garmin China training history',
+  load_athlete_profile: 'Analyzing athlete profile and recent state',
+  llm_build_schedule: "Building this week's schedule",
+  llm_parameterize_workout: 'Setting workout parameters',
+  validate_plan: 'Checking training load',
+  llm_stream_summary: 'Writing weekly summary and monitoring tips',
 
   // Real chat tools.
-  regenerate_day: '重新生成训练课',
-  add_second_workout: '新增第二堂训练课',
-  update_workout_field: '更新训练状态',
+  regenerate_day: 'Regenerating workout',
+  add_second_workout: 'Adding a second workout',
+  update_workout_field: 'Updating workout status',
 };
 
-const SPORT_ZH: Record<string, string> = {
-  running: '跑步',
-  cycling: '骑行',
-  swimming: '游泳',
-  rest: '休息',
-  mobility: '活动恢复',
-  strength: '力量',
+const SPORT_LABEL: Record<string, string> = {
+  running: 'Run',
+  cycling: 'Ride',
+  swimming: 'Swim',
+  rest: 'Rest',
+  mobility: 'Mobility',
+  strength: 'Strength',
 };
 
-const STATUS_ZH: Record<string, string> = {
-  completed: '已完成',
-  skipped: '已跳过',
-  planned: '计划中',
+const STATUS_LABEL: Record<string, string> = {
+  completed: 'Completed',
+  skipped: 'Skipped',
+  planned: 'Planned',
 };
 
 export function dayDisplay(dayIndex: number, sport?: string): string {
-  const dayLabel = `第 ${dayIndex} 天`;
+  const dayLabel = `Day ${dayIndex}`;
   if (sport) {
-    const zh = SPORT_ZH[sport] ?? sport;
-    return `${dayLabel} · ${zh}`;
+    const label = SPORT_LABEL[sport] ?? sport;
+    return `${dayLabel} · ${label}`;
   }
   return dayLabel;
 }
@@ -54,26 +55,26 @@ export function summarizeParameterized(
     targetHeartRate?: string;
   },
 ): string {
-  if (source === 'rest') return '休息日，无需 LLM 参数化';
+  if (source === 'rest') return 'Rest day, no parameters needed';
   const parts: string[] = [];
   if (workout.title) parts.push(workout.title);
   if (workout.distanceKm != null && Number.isFinite(workout.distanceKm)) {
     parts.push(`${Number(workout.distanceKm).toFixed(1)}km`);
   } else if (workout.durationMinutes != null) {
-    parts.push(`${workout.durationMinutes} 分钟`);
+    parts.push(`${workout.durationMinutes} min`);
   }
-  if (workout.targetPace && workout.targetPace !== '不适用') {
+  if (workout.targetPace && !isNotApplicable(workout.targetPace)) {
     parts.push(workout.targetPace);
-  } else if (workout.targetHeartRate && workout.targetHeartRate !== '不适用') {
+  } else if (workout.targetHeartRate && !isNotApplicable(workout.targetHeartRate)) {
     parts.push(workout.targetHeartRate);
   }
-  const head = source === 'fallback' ? '已用模板默认值 · ' : '';
-  return head + (parts.join(' · ') || '已生成');
+  const head = source === 'fallback' ? 'Template defaults · ' : '';
+  return head + (parts.join(' · ') || 'Generated');
 }
 
 export function summarizeValidation(violations: Violation[]): string {
-  if (violations.length === 0) return '无冲突';
-  return `检出 ${violations.length} 处冲突，已自动降级处理`;
+  if (violations.length === 0) return 'No conflicts';
+  return `${violations.length} conflict${violations.length === 1 ? '' : 's'} found, auto-adjusted`;
 }
 
 export function summarizeSchedule(
@@ -83,22 +84,22 @@ export function summarizeSchedule(
 ): string {
   const parts = Object.entries(sportCounts)
     .filter(([, n]) => n > 0)
-    .map(([sport, n]) => `${n} 次${SPORT_ZH[sport] ?? sport}`)
+    .map(([sport, n]) => `${n} × ${SPORT_LABEL[sport] ?? sport}`)
     .join(' + ');
-  const head = source === 'deterministic' ? '已回退到规则引擎 · ' : '';
-  return head + `${daysCount} 天日程（${parts || '以休息为主'}）`;
+  const head = source === 'deterministic' ? 'Rule-based fallback · ' : '';
+  return head + `${daysCount}-day schedule (${parts || 'mostly rest'})`;
 }
 
 export function summarizeRegenerateDay(dayIndex: number, sport: string): string {
-  const zh = SPORT_ZH[sport] ?? sport;
-  return `已为第 ${dayIndex} 天生成${zh}训练`;
+  const label = SPORT_LABEL[sport] ?? sport;
+  return `Generated a ${label.toLowerCase()} workout for Day ${dayIndex}`;
 }
 
 export function summarizeAddSecondWorkout(dayIndex: number, sport: string): string {
-  const zh = SPORT_ZH[sport] ?? sport;
-  return `已为第 ${dayIndex} 天新增${zh}第二练`;
+  const label = SPORT_LABEL[sport] ?? sport;
+  return `Added a second ${label.toLowerCase()} workout to Day ${dayIndex}`;
 }
 
 export function summarizeUpdateStatus(value: string): string {
-  return `状态已设为：${STATUS_ZH[value] ?? value}`;
+  return `Status set to: ${STATUS_LABEL[value] ?? value}`;
 }

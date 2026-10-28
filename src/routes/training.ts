@@ -77,6 +77,7 @@ import {
   InvalidLlmWorkoutError,
 } from '../training/llm-parameterizer.js';
 import { renderIntervalsIcu } from '../training/intervals-icu.js';
+import { NOT_APPLICABLE, isNotApplicable } from '../training/not-applicable.js';
 import { buildTrainingLoadCalibration } from '../training/load-estimator.js';
 
 export const trainingRouter = Router();
@@ -160,6 +161,7 @@ const trainingEvaluationSchema = z.object({
 
 const ACTIVITY_LOOKBACK_DAYS = 56;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const DAY_LABELS_EN: readonly string[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const MAX_TRAINING_PLANS_PER_USER = 10;
 const GENERATION_TIMEOUT_MS = 180_000;
 const STALE_GENERATING_PLAN_MS = 20 * 60_000;
@@ -213,7 +215,7 @@ async function loadDerivedContext(
     name: 'load_recent_activities',
     displayName: TOOL_DISPLAY.load_recent_activities,
     phase: 'done',
-    summary: `已加载 ${activities.length} 条活动`,
+    summary: `Loaded ${activities.length} activities`,
     durationMs: Date.now() - activitiesStart,
   });
 
@@ -285,7 +287,7 @@ async function loadDerivedContext(
     name: 'load_athlete_profile',
     displayName: TOOL_DISPLAY.load_athlete_profile,
     phase: 'done',
-    summary: `${summarizeProfileShort(athleteProfile, recentState)} · 容量 ${trainingCapacity.overall.readiness}`,
+    summary: `${summarizeProfileShort(athleteProfile, recentState)} · Capacity: ${trainingCapacity.overall.readiness}`,
     durationMs: Date.now() - profileStart,
   });
 
@@ -304,20 +306,20 @@ function summarizeProfileShort(
   profile: AthleteProfile,
   state: ReturnType<typeof deriveRecentTrainingState>,
 ): string {
-  const fatigueZh: Record<string, string> = {
-    fresh: '新鲜',
-    normal: '正常',
-    tired: '偏疲劳',
-    high_risk: '高风险',
+  const fatigueLabel: Record<string, string> = {
+    fresh: 'Fresh',
+    normal: 'Normal',
+    tired: 'Tired',
+    high_risk: 'High risk',
   };
   const exp = profile.experienceLevel ?? 'unknown';
-  const expZh: Record<string, string> = {
-    beginner: '入门',
-    intermediate: '进阶',
-    advanced: '资深',
-    unknown: '未知',
+  const expLabel: Record<string, string> = {
+    beginner: 'Beginner',
+    intermediate: 'Intermediate',
+    advanced: 'Advanced',
+    unknown: 'Unknown level',
   };
-  return `${expZh[exp] ?? exp} · 疲劳：${fatigueZh[state.fatigue] ?? state.fatigue}`;
+  return `${expLabel[exp] ?? exp} · Fatigue: ${fatigueLabel[state.fatigue] ?? state.fatigue}`;
 }
 
 function parseInjuries(text: string | undefined): string[] {
@@ -369,7 +371,7 @@ function hasStrongScheduleOverrideIntent(parsed: z.infer<typeof planRequestSchem
     .filter(Boolean)
     .join('\n');
   if (!text) return false;
-  return /强烈要求|坚持生成|坚持按|强制生成|强制安排|无论如何|不要降级|不要保守|按我的要求|照我说的|force|override|insist/i.test(text);
+  return /强烈要求|坚持生成|坚持按|强制生成|强制安排|无论如何|不要降级|不要保守|按我的要求|照我说的|force|override|insist|no\s*matter\s*what|don'?t\s*downgrade|do\s*not\s*downgrade|as\s*i\s*(?:asked|requested|said)/i.test(text);
 }
 
 interface TrainingPlanSummary {
@@ -554,8 +556,10 @@ function buildWorkoutRow(
 
 function chunkSummary(summary: string): string[] {
   if (!summary) return [];
-  // Split by 句号 / period for a "streaming" feel even though we're deterministic.
-  const parts = summary.split(/(?<=。)/).filter((s) => s.trim().length > 0);
+  // Split by 句号 / sentence-ending punctuation for a "streaming" feel even
+  // though we're deterministic. English periods only split when followed by
+  // whitespace so decimals like "5.5 km" stay intact.
+  const parts = summary.split(/(?<=[。！？])|(?<=[.!?])(?=\s)/).filter((s) => s.trim().length > 0);
   if (parts.length === 0) return [summary];
   // Group into 3-5 chunks max.
   const target = Math.min(5, Math.max(3, parts.length));
@@ -904,8 +908,8 @@ function buildEvaluationPlaceholder(
   activityRefs: Array<{ region: 'cn' | 'global' | 'manual'; activityId: string }>,
 ) {
   return {
-    title: '训练评价已生成',
-    summary: '已记录这一天的实际运动，并与当天训练计划建立对比关系。详细评价模型稍后接入。',
+    title: 'Workout review created',
+    summary: "Recorded this day's actual activities and linked them to the planned workouts. Detailed evaluation will follow.",
     plannedWorkoutCount: plannedWorkoutIds.length,
     activityCount: activityRefs.length,
   };
@@ -1225,7 +1229,7 @@ trainingRouter.post(
       } else if (message === 'generation_timeout') {
         errorPayload = {
           error: 'generation_timeout',
-          message: '训练计划生成超时，请稍后重试。',
+          message: 'Training plan generation timed out. Please try again later.',
         };
       } else if (message === 'client_disconnected') {
         errorPayload = { error: 'client_disconnected' };
@@ -1652,9 +1656,9 @@ function renderPlainTextPlan(planRow: TrainingPlan, workouts: Workout[]): string
     const session = w.sessionLabel ? ` ${w.sessionLabel}` : '';
     lines.push(`D${w.dayIndex}${session} ${w.title}`);
     lines.push(`Sport: ${w.sport}  Duration: ${w.durationMinutes ?? ''}min  Distance: ${w.distanceKm ?? ''}km`);
-    if (w.targetHeartRate && w.targetHeartRate !== '不适用') lines.push(`HR: ${w.targetHeartRate}`);
-    if (w.targetPace && w.targetPace !== '不适用') lines.push(`Pace: ${w.targetPace}`);
-    if (w.targetPower && w.targetPower !== '不适用') lines.push(`Power: ${w.targetPower}`);
+    if (!isNotApplicable(w.targetHeartRate)) lines.push(`HR: ${w.targetHeartRate}`);
+    if (!isNotApplicable(w.targetPace)) lines.push(`Pace: ${w.targetPace}`);
+    if (!isNotApplicable(w.targetPower)) lines.push(`Power: ${w.targetPower}`);
     if (w.workoutStructure) lines.push(w.workoutStructure);
     lines.push('');
   }
@@ -1705,7 +1709,7 @@ function renderWordHtml(planRow: TrainingPlan, workouts: Workout[]): string {
       (w) => `<tr><td>${escapeHtml(String(w.date))}</td><td>${w.dayIndex}.${w.slotIndex ?? 1}</td><td>${escapeHtml(w.sessionLabel ?? '')}</td><td>${escapeHtml(w.sport)}</td><td>${escapeHtml(w.title)}</td><td>${escapeHtml(w.targetHeartRate ?? '')}</td><td>${escapeHtml(w.targetPace ?? '')}</td><td>${escapeHtml(w.targetPower ?? '')}</td><td>${escapeHtml(w.workoutStructure ?? '')}</td></tr>`,
     )
     .join('');
-  return `<!doctype html><html><head><meta charset="utf-8"><style>body{font-family:Arial,"Microsoft YaHei",sans-serif}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px;font-size:12px}th{background:#eee}</style></head><body><h1>训练计划 ${escapeHtml(String(planRow.weekStartDate))}</h1><table><thead><tr><th>日期</th><th>课次</th><th>时段</th><th>项目</th><th>训练</th><th>心率</th><th>配速</th><th>功率</th><th>结构</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><style>body{font-family:Arial,"Microsoft YaHei",sans-serif}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px;font-size:12px}th{background:#eee}</style></head><body><h1>Training Plan ${escapeHtml(String(planRow.weekStartDate))}</h1><table><thead><tr><th>Date</th><th>Session</th><th>Time</th><th>Sport</th><th>Workout</th><th>Heart rate</th><th>Pace</th><th>Power</th><th>Structure</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
 }
 
 function escapeHtml(value: string): string {
@@ -1855,7 +1859,7 @@ trainingRouter.post(
       emitToolEv({
         id: paramId,
         name: 'llm_parameterize_workout',
-        displayName: `第 ${dayIndex} 天 · 重新生成参数`,
+        displayName: `Day ${dayIndex} · Regenerating parameters`,
         phase: 'start',
       });
       const w = parameterizeWorkout({
@@ -1873,9 +1877,9 @@ trainingRouter.post(
       emitToolEv({
         id: paramId,
         name: 'llm_parameterize_workout',
-        displayName: `第 ${dayIndex} 天 · 重新生成参数`,
+        displayName: `Day ${dayIndex} · Regenerating parameters`,
         phase: 'done',
-        summary: w.title || '已生成',
+        summary: w.title || 'Generated',
         durationMs: Date.now() - paramStart,
       });
 
@@ -1903,7 +1907,7 @@ trainingRouter.post(
             : {
                 dayIndex: row.dayIndex,
                 date: String(row.date),
-                dayLabel: '周' + '一二三四五六日'[row.dayIndex - 1],
+                dayLabel: DAY_LABELS_EN[row.dayIndex - 1] ?? `Day ${row.dayIndex}`,
                 sport: row.sport as ScheduleEntry['sport'],
                 templateId: row.templateId,
                 slotIndex: row.slotIndex ?? 1,
@@ -1939,7 +1943,7 @@ trainingRouter.post(
         name: 'validate_plan',
         displayName: TOOL_DISPLAY.validate_plan,
         phase: 'done',
-        summary: violations.length === 0 ? '无冲突' : `检出 ${violations.length} 处冲突`,
+        summary: violations.length === 0 ? 'No conflicts' : `${violations.length} conflict${violations.length === 1 ? '' : 's'} found`,
         durationMs: Date.now() - validateStart,
       });
 
@@ -2012,9 +2016,9 @@ function workoutRowToParameterized(row: Workout): ParameterizedWorkout {
     durationMinutes: row.durationMinutes ?? 0,
     distanceKm: row.distanceKm !== null ? Number(row.distanceKm) : null,
     targetMetric: (row.targetMetric ?? 'none') as ParameterizedWorkout['targetMetric'],
-    targetHeartRate: row.targetHeartRate ?? '不适用',
-    targetPace: row.targetPace ?? '不适用',
-    targetPower: row.targetPower ?? '不适用',
+    targetHeartRate: row.targetHeartRate ?? NOT_APPLICABLE,
+    targetPace: row.targetPace ?? NOT_APPLICABLE,
+    targetPower: row.targetPower ?? NOT_APPLICABLE,
     workoutStructure: row.workoutStructure ?? '',
     targets: row.targets ?? [],
     parameterSource: (row.parameterSource as ParameterizedWorkout['parameterSource']) ?? {
@@ -2030,7 +2034,7 @@ function workoutRowToScheduleEntry(row: Workout): ScheduleEntry {
   return {
     dayIndex: row.dayIndex,
     date: String(row.date),
-    dayLabel: '周' + '一二三四五六日'[row.dayIndex - 1],
+    dayLabel: DAY_LABELS_EN[row.dayIndex - 1] ?? `Day ${row.dayIndex}`,
     sport: row.sport as ScheduleEntry['sport'],
     templateId: row.templateId,
     slotIndex: row.slotIndex ?? 1,
@@ -2259,7 +2263,7 @@ trainingRouter.post(
               name: call.name,
               displayName,
               phase: 'error',
-              errorMessage: (err as Error).message || '工具执行失败',
+              errorMessage: (err as Error).message || 'Tool execution failed',
               durationMs: Date.now() - toolEventStart,
             });
             throw err;
@@ -2285,14 +2289,14 @@ trainingRouter.post(
             if (w) {
               summary = summarizeRegenerateDay(call.arguments.dayIndex, w.sport as string);
             } else {
-              summary = `第 ${call.arguments.dayIndex} 天处理完成`;
+              summary = `Day ${call.arguments.dayIndex} updated`;
             }
           } else if (call.name === 'add_second_workout') {
             const w = dispatched.updatedWorkout;
             if (w) {
               summary = summarizeAddSecondWorkout(call.arguments.dayIndex, w.sport as string);
             } else {
-              summary = `第 ${call.arguments.dayIndex} 天加练处理完成`;
+              summary = `Extra session for Day ${call.arguments.dayIndex} processed`;
             }
           } else if (call.name === 'update_workout_field') {
             summary = summarizeUpdateStatus(call.arguments.value);
@@ -2648,17 +2652,17 @@ async function dispatchChatToolCall(
     const entry: ScheduleEntry = {
       dayIndex,
       date: String(candidates[0].date),
-      dayLabel: '周' + '一二三四五六日'[dayIndex - 1],
+      dayLabel: DAY_LABELS_EN[dayIndex - 1] ?? `Day ${dayIndex}`,
       sport: tpl.fixed.sport,
       templateId,
       slotIndex,
-      sessionLabel: slotIndex === 2 ? '下午' : '加练',
+      sessionLabel: slotIndex === 2 ? 'PM' : 'Extra',
       timeOfDay: slotIndex === 2 ? 'afternoon' : 'evening',
       reason: call.arguments.reason,
       durationCapMinutes: isExplicitTemplate ? undefined : secondWorkoutDurationCap(templateId),
       durationCapReason: isExplicitTemplate
         ? undefined
-        : '聊天加练：用户未指定训练类型，默认控制为短低压力训练。',
+        : 'Extra session added via chat: no workout type specified, so it defaults to a short, low-stress session.',
     };
 
     const progression =
@@ -2770,8 +2774,8 @@ function inferChatTemplateId(
   if (/恢复跑|恢复.*跑|recovery.*run/.test(lower)) return 'run.recovery.v1';
 
   if (/甜区|sweet\s*spot/.test(lower)) return 'bike.sweet_spot.v1';
-  if (/阈值骑|骑.*阈值/.test(lower)) return 'bike.threshold.v1';
-  if (/阈值游|游.*阈值|css/.test(lower)) return 'swim.css_threshold.v1';
+  if (/阈值骑|骑.*阈值|(?:bike|ride|cycling).*threshold|threshold.*(?:bike|ride|cycling)/.test(lower)) return 'bike.threshold.v1';
+  if (/阈值游|游.*阈值|css|swim.*threshold|threshold.*swim/.test(lower)) return 'swim.css_threshold.v1';
   if (/阈值跑|跑.*阈值|threshold|zone\s*4|z4|hr\s*z4/.test(lower)) {
     if (sportHint === 'cycling') return 'bike.threshold.v1';
     if (sportHint === 'swimming') return 'swim.css_threshold.v1';
@@ -2783,13 +2787,13 @@ function inferChatTemplateId(
     if (sportHint === 'swimming') return 'swim.vo2max.v1';
     return 'run.vo2max.v1';
   }
-  if (/短间歇|间歇|400|800|interval/.test(lower)) return 'run.interval.v1';
+  if (/短间歇|间歇|400|800|intervals?/.test(lower)) return 'run.interval.v1';
   if (/节奏跑|tempo/.test(lower)) return 'run.tempo.v1';
-  if (/递进跑|progression/.test(lower)) return 'run.progression.v1';
+  if (/递进跑|渐进跑|progression/.test(lower)) return 'run.progression.v1';
   if (/大步跑|strides?/.test(lower)) return 'run.strides.v1';
-  if (/坡跑|上坡|hill/.test(lower)) return 'run.hill.v1';
-  if (/有氧跑|普通有氧|zone\s*2|z2/.test(lower)) return 'run.aerobic.v1';
-  if (/lsd|长距离|长跑/.test(lower)) return 'run.lsd.v1';
+  if (/坡跑|上坡|hills?/.test(lower)) return 'run.hill.v1';
+  if (/有氧跑|普通有氧|zone\s*2|z2|aerobic\s*run|easy\s*run/.test(lower)) return 'run.aerobic.v1';
+  if (/lsd|长距离|长跑|long\s*run/.test(lower)) return 'run.lsd.v1';
 
   return undefined;
 }

@@ -95,7 +95,7 @@ async function appendLog(
 async function processJob(job: { id: string; userId: string }) {
   const { id, userId } = job;
   console.log(`[worker] processing ${id} user=${userId}`);
-  await appendLog(id, 'info', '开始双向同步');
+  await appendLog(id, 'info', 'Starting two-way sync');
   try {
     const result = await runBidirectionalSync(userId, {
       onProgress: (p) => {
@@ -111,7 +111,7 @@ async function processJob(job: { id: string; userId: string }) {
         status: partial ? 'failed' : 'success',
         finishedAt: new Date(),
         error: partial
-          ? `${result.failedCount} 条同步失败，详见日志`
+          ? `${result.failedCount} activities failed to sync; see logs`
           : null,
         result: {
           uploaded: result.uploadedCount,
@@ -124,17 +124,17 @@ async function processJob(job: { id: string; userId: string }) {
       .where(eq(syncJob.id, id));
     for (const e of result.errors) {
       const dirLabel =
-        e.direction === 'cnToGlobal' ? 'CN→国际' : '国际→CN';
+        e.direction === 'cnToGlobal' ? 'CN→Global' : 'Global→CN';
       await appendLog(
         id,
         'error',
-        `${dirLabel} 活动 "${e.name}" (${e.activityId}) 失败: ${e.message}`,
+        `${dirLabel} activity "${e.name}" (${e.activityId}) failed: ${e.message}`,
       );
     }
     await appendLog(
       id,
       partial ? 'warn' : 'info',
-      `同步完成 上传${result.uploadedCount}（CN→国际 ${result.cnToGlobal.uploaded}，国际→CN ${result.globalToCn.uploaded}）跳过${result.skippedCount} 失败${result.failedCount}`,
+      `Sync complete: uploaded ${result.uploadedCount} (CN→Global ${result.cnToGlobal.uploaded}, Global→CN ${result.globalToCn.uploaded}), skipped ${result.skippedCount}, failed ${result.failedCount}`,
     );
     console.log(`[worker] ${id} ${partial ? 'partial-failure' : 'success'}`);
   } catch (error) {
@@ -153,7 +153,7 @@ async function processJob(job: { id: string; userId: string }) {
 }
 
 async function refreshAthleteProfileAfterSync(jobId: string, userId: string) {
-  await appendLog(jobId, 'info', '刷新近期活动指标与运动能力画像');
+  await appendLog(jobId, 'info', 'Refreshing recent activity metrics and athlete profile');
   try {
     const fetched = await fetchRecentRawActivities(userId, {
       days: PROFILE_REFRESH_DAYS,
@@ -162,11 +162,11 @@ async function refreshAthleteProfileAfterSync(jobId: string, userId: string) {
     await appendLog(
       jobId,
       'info',
-      `运动能力画像已刷新：中国区读取 ${fetched.cn.count} 条，纳入 ${fetched.activities.length} 条近期活动`,
+      `Athlete profile refreshed: read ${fetched.cn.count} China region activities, included ${fetched.activities.length} recent activities`,
     );
   } catch (error) {
     const msg = (error as Error).message || String(error);
-    await appendLog(jobId, 'warn', `运动能力画像刷新失败：${msg}`);
+    await appendLog(jobId, 'warn', `Athlete profile refresh failed: ${msg}`);
     console.warn(`[worker] ${jobId} profile refresh failed:`, msg);
   }
 }

@@ -40,11 +40,11 @@ async function downloadActivityFile(sourceClient: any, activityId: string | numb
     await sourceClient.downloadOriginalActivityData(activity, tempDir);
     const before = walkFiles(tempDir);
     const zipPath = before.find((f) => f.endsWith('.zip'));
-    if (!zipPath) throw new Error(`活动 ${activityId} 下载成功，但未找到原始压缩包`);
+    if (!zipPath) throw new Error(`Activity ${activityId} downloaded, but the original archive was not found`);
     await decompress(zipPath, tempDir);
     const all = walkFiles(tempDir);
     const fitFile = all.find((f) => /\.(fit|gpx|tcx)$/i.test(f));
-    if (!fitFile) throw new Error(`活动 ${activityId} 解压后未找到 .fit/.gpx/.tcx 文件`);
+    if (!fitFile) throw new Error(`No .fit/.gpx/.tcx file found after extracting activity ${activityId}`);
     return { fitFile, cleanup: () => removeDir(tempDir) };
   } catch (error) {
     removeDir(tempDir);
@@ -176,7 +176,7 @@ export async function runBidirectionalSync(
   const globalToCn: DirectionStats = { uploaded: 0, skipped: 0, failed: 0 };
 
   options.onProgress?.(
-    buildProgress({ stage: 'preparing', message: '正在读取双区最新记录' }),
+    buildProgress({ stage: 'preparing', message: 'Reading latest activities from both regions' }),
   );
 
   const [cnList, globalList] = await Promise.all([
@@ -209,8 +209,8 @@ export async function runBidirectionalSync(
     buildProgress({
       stage: 'syncing',
       message: total
-        ? `共发现 ${toGlobal.length} 条 CN→国际、${toCn.length} 条 国际→CN 待同步`
-        : '两区已同步，无新增记录',
+        ? `Found ${toGlobal.length} CN→Global and ${toCn.length} Global→CN activities to sync`
+        : 'Both regions are in sync; no new activities',
       total,
       completed,
       scanned,
@@ -230,7 +230,7 @@ export async function runBidirectionalSync(
       direction === 'cnToGlobal' ? 'global' : 'cn';
     const targetSigs = direction === 'cnToGlobal' ? globalSigs : cnSigs;
     const dirLabel =
-      direction === 'cnToGlobal' ? 'CN→国际' : '国际→CN';
+      direction === 'cnToGlobal' ? 'CN→Global' : 'Global→CN';
 
     for (let i = 0; i < pending.length; i += 1) {
       const activity = pending[i];
@@ -248,7 +248,7 @@ export async function runBidirectionalSync(
           errors.push({
             direction,
             activityId: activity.activityId,
-            name: activity.activityName || '未命名活动',
+            name: activity.activityName || 'Untitled activity',
             message: humanizeSyncFailure(error, targetRegion),
           });
         }
@@ -281,8 +281,8 @@ export async function runBidirectionalSync(
       stage: failedCount > 0 ? 'failed' : 'finishing',
       message:
         failedCount > 0
-          ? `同步完成（${failedCount} 条失败）`
-          : '同步完成',
+          ? `Sync complete (${failedCount} failed)`
+          : 'Sync complete',
       total,
       completed,
       scanned,

@@ -400,7 +400,7 @@ export function mapActivity(
     region,
     activityId: activity.activityId,
     signature: activitySignature(activity),
-    name: activity.activityName || '未命名活动',
+    name: activity.activityName || 'Untitled activity',
     type: activity.activityType?.typeKey || activityTypeDTO?.typeKey || 'unknown',
     startTimeLocal: activity.startTimeLocal || null,
     distanceKm: Number(((activity.distance || 0) / 1000).toFixed(2)),
@@ -501,7 +501,7 @@ export function delay(ms: number) {
 }
 
 export function getRegionLabel(region: 'cn' | 'global') {
-  return region === 'cn' ? '国区' : '国际区';
+  return region === 'cn' ? 'China region' : 'Global region';
 }
 
 export function getErrorStatus(error: unknown): number {
@@ -535,13 +535,13 @@ export function humanizeSyncFailure(
 ): string {
   const message = String((error as Error)?.message || '');
   if (message.includes('HTTP Error (412): Precondition Failed')) {
-    const label = targetRegion ? getRegionLabel(targetRegion) : '目标区';
-    return `${label}账号拒绝活动导入。这个账号还没有授予上传 consent，请先登录 ${label} Garmin Connect 网页手动完成一次活动导入授权后再重试。`;
+    const label = targetRegion ? getRegionLabel(targetRegion) : 'Target region';
+    return `${label}: the account rejected the activity import because it has not granted upload consent yet. Sign in to the ${label} Garmin Connect website, complete one manual activity import to grant consent, then retry.`;
   }
   if (isRetryableTransferError(error)) {
-    return 'Garmin 服务器响应超时或临时异常。下次同步会自动重试已经失败的活动。';
+    return 'Garmin servers timed out or returned a temporary error. Failed activities will be retried automatically on the next sync.';
   }
-  return message || '同步失败';
+  return message || 'Sync failed';
 }
 
 export function humanizeAuthError(
@@ -551,16 +551,16 @@ export function humanizeAuthError(
   const message = String((error as Error)?.message || '');
   const regionLabel = getRegionLabel(region);
   if (message.includes('HTTP Error (429)') || message.includes('Too Many Requests')) {
-    return `${regionLabel}Garmin 服务器对当前请求节流（429）。请稍后再试，如果反复出现请告诉作者，可能需要换出口 IP。`;
+    return `${regionLabel}: Garmin servers are rate-limiting requests (429). Please try again later; if this keeps happening, contact the developer — the outbound IP may need to change.`;
   }
   if (message.includes('DI token exchange failed')) {
-    return `${regionLabel}DI 令牌兑换失败。常见原因：service ticket 已被使用过、过期（CAS ticket 通常 5 分钟内有效），或 client_id 全部失效。请重新点"连接 Garmin"获取新 ticket。`;
+    return `${regionLabel}: DI token exchange failed. Common causes: the service ticket was already used or expired (CAS tickets are usually valid for 5 minutes), or all client_ids are invalid. Click "Connect Garmin" again to get a new ticket.`;
   }
   if (message.includes('No OAuth2 token available')) {
-    return `${regionLabel}登录失败：无法获取 OAuth 令牌，请检查账号密码或稍后重试`;
+    return `${regionLabel}: sign-in failed — could not obtain an OAuth token. Check your credentials or try again later.`;
   }
   if (message.includes('Cannot find module')) {
-    return `${regionLabel}登录依赖缺失：${message}`;
+    return `${regionLabel}: sign-in dependency missing: ${message}`;
   }
-  return message || `${regionLabel}登录失败`;
+  return message || `${regionLabel}: sign-in failed`;
 }

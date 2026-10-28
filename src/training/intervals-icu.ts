@@ -1,6 +1,5 @@
 import type { Workout } from '../db/schema.js';
-
-const NA = '不适用';
+import { isNotApplicable } from './not-applicable.js';
 
 type WorkoutVars = Record<string, string | number | boolean | null | undefined>;
 
@@ -322,7 +321,7 @@ function meters(w: Workout, names: string[], fallback: number): number {
 }
 
 function usable(value: string | null | undefined): string | null {
-  if (!value || value === NA) return null;
+  if (!value || isNotApplicable(value)) return null;
   return value.trim();
 }
 

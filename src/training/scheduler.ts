@@ -74,7 +74,7 @@ export interface ScheduleRequest {
 export interface ScheduleEntry {
   dayIndex: number; // 1..7 (1 = Monday for the weekStartDate)
   date: string; // 'YYYY-MM-DD'
-  dayLabel: string; // '周一' to '周日'
+  dayLabel: string; // 'Mon' to 'Sun'
   sport: Sport;
   templateId: string;
   slotIndex?: number; // 1 = first session, 2 = second session on same date.
@@ -94,7 +94,7 @@ export interface ScheduleResult {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DAY_LABELS: readonly string[] = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+const DAY_LABELS: readonly string[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 const DAY_NAME_TO_INDEX: Record<string, number> = {
   monday: 1,
@@ -163,7 +163,7 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
 
   if (enabledSports.length === 0) {
     // Nothing enabled — fall back to a fully-rest week.
-    notes.push('未选择任何运动，本周安排完全休息。');
+    notes.push('No sports selected; the whole week is rest.');
     return {
       days: buildAllRestWeek(request.weekStartDate, recentState, trainingCapacity),
       notes,
@@ -175,11 +175,11 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
   const daysPerWeek = Math.max(requestedDaysPerWeek, protectedTrainingDays.size);
   if (protectedTrainingDays.size > 0) {
     notes.push(
-      `用户指定训练日 ${formatDayIndexes(protectedTrainingDays)} 已锁定为训练日，不会被默认休息日覆盖。`,
+      `Requested training days ${formatDayIndexes(protectedTrainingDays)} are locked in and will not be replaced by default rest days.`,
     );
     if (protectedTrainingDays.size > requestedDaysPerWeek) {
       notes.push(
-        `用户指定训练日数量 ${protectedTrainingDays.size} 天超过每周训练天数 ${requestedDaysPerWeek} 天，已优先按指定训练日生成。`,
+        `You specified ${protectedTrainingDays.size} training days, more than the ${requestedDaysPerWeek} days/week setting; the specified days take priority.`,
       );
     }
   }
@@ -214,49 +214,49 @@ export function buildWeeklySchedule(args: BuildScheduleArgs): ScheduleResult {
     if (forceRequestedSchedule || (userHardCap !== null && userHardCap !== undefined)) {
       if (capacityCap < hardCap) {
         notes.push(
-          `用户要求高强度上限 ${hardCap} 次；系统未应用容量建议上限 ${capacityCap} 次，只保留风险提示。`,
+          `You asked for up to ${hardCap} hard sessions; the suggested capacity cap of ${capacityCap} was not applied and is kept as a risk note only.`,
         );
       }
     } else {
       if (capacityCap < hardCap) {
         notes.push(
-          `由于恢复/训练容量评估，本周未按原高强度要求生成，已从 ${hardCap} 次降至 ${capacityCap} 次。`,
+          `Based on the recovery/training capacity check, hard sessions this week were reduced from ${hardCap} to ${capacityCap}.`,
         );
       }
       hardCap = Math.min(hardCap, capacityCap);
     }
   }
-  notes.push(`本周高强度课上限 ${hardCap} 次。`);
+  notes.push(`Hard-session cap this week: ${hardCap}.`);
 
   if (HARD_STIMULI.has(recentState.latestStimulus)) {
     const hoursAgo = hoursSince(recentState);
     if (hoursAgo !== null && hoursAgo < 36) {
       notes.push(
         forceRequestedSchedule
-          ? `近 36 小时内有 ${recentState.latestStimulus} 刺激；系统按用户要求生成，仅保留风险提示。`
-          : `近 36 小时内有 ${recentState.latestStimulus} 刺激，本周开局优先恢复。`,
+          ? `${recentState.latestStimulus} stimulus in the last 36 h; generated as requested, kept as a risk note only.`
+          : `${recentState.latestStimulus} stimulus in the last 36 h; the week starts with recovery.`,
       );
     }
   }
   if (recentState.fatigue === 'high_risk') {
     notes.push(
       forceRequestedSchedule
-        ? '近期负荷偏高；系统按用户要求生成，不因恢复风险自动删减训练日。'
-        : '近期负荷偏高，本周以恢复和低强度有氧为主。',
+        ? 'Recent load is high; generated as requested without dropping training days for recovery risk.'
+        : 'Recent load is high; this week focuses on recovery and easy aerobic work.',
     );
   } else if (recentState.fatigue === 'tired') {
     notes.push(
       forceRequestedSchedule
-        ? '已有疲劳；系统按用户要求生成，不因疲劳自动改掉首个训练日。'
-        : '已有疲劳，本周第一次训练以轻松课开局。',
+        ? 'Some fatigue present; generated as requested without changing the first training day.'
+        : 'Some fatigue present; the first session of the week is easy.',
     );
   }
   if (request.dailyPreferredMinutes && request.dailyPreferredMinutes > 0) {
-    notes.push(`单日可用时间上限 ${request.dailyPreferredMinutes} 分钟；系统不会为凑满时长而拉长质量课。`);
+    notes.push(`Daily time limit ${request.dailyPreferredMinutes} min; quality sessions will not be stretched just to fill the time.`);
   }
-  notes.push(`本周总训练时长上限 ${request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES} 分钟。`);
+  notes.push(`Weekly training time limit: ${request.weeklyMaxMinutes ?? MAX_WEEKLY_TRAINING_MINUTES} min.`);
   if (request.preferredTrainingWindows && request.preferredTrainingWindows.length > 0) {
-    notes.push(`优先使用偏好时段：${request.preferredTrainingWindows.join('、')}。`);
+    notes.push(`Preferred training windows: ${request.preferredTrainingWindows.join(', ')}.`);
   }
 
   // First pass: pick templates per training day.
@@ -358,14 +358,14 @@ function capacityGuardrailNotesForRequest(
   const capacityCap = trainingCapacity.guardrails.maxHardSessionsPerWeek;
   const overrideHardCap = (forceRequestedSchedule || explicitHardCap) && requestedHardCap > capacityCap;
   return trainingCapacity.guardrails.notes.map((note) => {
-    if (overrideHardCap && note.startsWith('训练容量评估：')) {
+    if (overrideHardCap && note.startsWith('Training capacity:')) {
       return note.replace(
-        `高强度上限 ${capacityCap} 次`,
-        `容量建议高强度上限 ${capacityCap} 次；用户选择 ${requestedHardCap} 次，按用户目标生成`,
+        `hard-session cap ${capacityCap}/week`,
+        `suggested hard-session cap ${capacityCap}/week; you chose ${requestedHardCap}, generating to your target`,
       );
     }
-    if (allowDoubleDays && note.includes('未满足高级且恢复良好的条件，本周不自动安排同日两练')) {
-      return '容量评估不主动推荐同日高强度两练；若用户允许且周时长目标需要，只添加低强度第二练。';
+    if (allowDoubleDays && note.startsWith('Advanced/recovered criteria not met')) {
+      return 'Capacity check does not recommend same-day hard doubles; if allowed and needed for the weekly volume target, only an easy second session is added.';
     }
     return note;
   });
@@ -589,7 +589,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
     input.recentState.fatigue === 'high_risk' &&
     input.dayIndex <= 2
   ) {
-    return forceRecovery(input.sport, allowedIds, '近期高风险疲劳，先做恢复。');
+    return forceRecovery(input.sport, allowedIds, 'High-risk fatigue recently; recover first.');
   }
 
   // Recent-stimulus cooldown: if last reliable session was hard within 36h,
@@ -603,7 +603,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
     return forceAerobic(
       input.sport,
       allowedIds,
-      '近 36 小时内有阈值/VO2 刺激，先做有氧。',
+      'Threshold/VO2 stimulus in the last 36 h; aerobic first.',
     );
   }
 
@@ -613,7 +613,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
     input.isFirstTraining &&
     input.recentState.fatigue === 'tired'
   ) {
-    return forceAerobic(input.sport, allowedIds, '已有疲劳，开局做有氧。');
+    return forceAerobic(input.sport, allowedIds, 'Some fatigue; start with aerobic work.');
   }
 
   // Previous day was hard -> not hard today (avoid back-to-back).
@@ -635,7 +635,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
   ) {
     return {
       templateId: 'run.lsd.v1',
-      reason: '本周长距离有氧。',
+      reason: 'Weekly long aerobic session.',
       intensity: 'low',
     };
   }
@@ -650,7 +650,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
   ) {
     return {
       templateId: 'bike.long_ride.v1',
-      reason: '本周长距离骑行。',
+      reason: 'Weekly long ride.',
       intensity: 'low',
     };
   }
@@ -666,7 +666,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
   ) {
     return {
       templateId: 'run.race_pace.v1',
-      reason: '比赛目标专项配速课。',
+      reason: 'Race-specific pace session for your goal.',
       intensity: 'high',
     };
   }
@@ -691,7 +691,7 @@ function pickTemplateForDay(input: PickInput): PickOutput {
   }
 
   // Fallback: aerobic for the sport, otherwise recovery.
-  return forceAerobic(input.sport, allowedIds, '默认有氧。');
+  return forceAerobic(input.sport, allowedIds, 'Default aerobic session.');
 }
 
 function hasMeaningfulLongSessionTime(input: PickInput, templateId: string): boolean {
@@ -818,9 +818,9 @@ function rotateByHardSessionCount(ids: string[], hardScheduled: number): string[
 }
 
 function rotationReason(templateId: string, intensity: 'low' | 'medium' | 'high'): string {
-  if (intensity === 'high') return '本周质量课。';
-  if (intensity === 'medium') return '本周中强度课。';
-  return '常规有氧/恢复。';
+  if (intensity === 'high') return 'Quality session this week.';
+  if (intensity === 'medium') return 'Moderate session this week.';
+  return 'Regular aerobic/recovery.';
 }
 
 function enforceExplicitHardSessionTarget(
@@ -874,7 +874,7 @@ function enforceExplicitHardSessionTarget(
     days[item.index] = {
       ...item.entry,
       templateId: replacement,
-      reason: `用户明确要求 ${hardCap} 次高强度；补足质量课目标。`,
+      reason: `You asked for ${hardCap} hard sessions; filling the quality-session target.`,
     };
     selected.add(item.entry.dayIndex);
   }
@@ -898,7 +898,7 @@ function enforceExplicitHardSessionTarget(
         days[item.index] = {
           ...item.entry,
           templateId: replacement,
-          reason: `用户明确要求 ${hardCap} 次高强度；按一周内均匀间隔重排质量课。`,
+          reason: `You asked for ${hardCap} hard sessions; quality sessions re-spaced evenly across the week.`,
         };
       } else if (templateIntensity(item.entry.templateId) === 'high') {
         const replacement = swapToAerobic(item.entry.sport);
@@ -906,7 +906,7 @@ function enforceExplicitHardSessionTarget(
           days[item.index] = {
             ...item.entry,
             templateId: replacement,
-            reason: '为满足用户高强度次数并保持间隔，改为低强度补量。',
+            reason: 'Switched to easy volume to keep your hard-session count with proper spacing.',
           };
         }
       }
@@ -915,7 +915,7 @@ function enforceExplicitHardSessionTarget(
 
   const finalHardCount = days.filter((entry) => entry && templateIntensity(entry.templateId) === 'high').length;
   if (finalHardCount >= target) {
-    notes.push(`用户明确选择 ${hardCap} 次高强度，本周已按目标安排 ${finalHardCount} 次。`);
+    notes.push(`You chose ${hardCap} hard sessions; ${finalHardCount} scheduled this week.`);
   }
 }
 
@@ -1081,7 +1081,7 @@ function activeRecoveryFallback(sport: ActiveSport, reason: string): PickOutput 
         : 'swim.recovery.v1';
   return {
     templateId,
-    reason: `${reason} 已保留为低强度训练，避免训练日变成休息日。`,
+    reason: `${reason} Kept as an easy session so the training day doesn't become a rest day.`,
     intensity: templateIntensity(templateId),
   };
 }
@@ -1151,8 +1151,8 @@ function buildRestEntry(
     templateId: restTemplate,
     reason:
       restTemplate === 'rest.full.v1'
-        ? '完全休息日。'
-        : '低强度活动恢复。',
+        ? 'Full rest day.'
+        : 'Easy active recovery.',
   };
   applyDurationCap(entry, trainingCapacity);
   return entry;
@@ -1222,14 +1222,14 @@ function applySanityPass(
         const replacement = swapToAerobic(sport);
         if (replacement && replacement !== entry.templateId) {
           notes.push(
-            `${entry.dayLabel} 由 ${entry.templateId} 调整为 ${replacement}（${
-              hardCount >= hardCap ? '超出用户高强度上限' : '避免连续高强度'
-            }）。`,
+            `${entry.dayLabel}: ${entry.templateId} changed to ${replacement} (${
+              hardCount >= hardCap ? 'over your hard-session cap' : 'avoiding back-to-back hard days'
+            }).`,
           );
           days[i] = {
             ...entry,
             templateId: replacement,
-            reason: `${entry.reason ?? ''} 受连续高强度/上限保护，自动降级。`.trim(),
+            reason: `${entry.reason ?? ''} Auto-downgraded by back-to-back/hard-cap protection.`.trim(),
           };
           prevHigh = templateIntensity(replacement) === 'high';
           if (templateIntensity(replacement) === 'high') hardCount += 1;
@@ -1298,7 +1298,7 @@ export function formatDayIndexes(days: Iterable<number>): string {
     .filter((d) => d >= 1 && d <= 7)
     .sort((a, b) => a - b)
     .map((d) => DAY_LABELS[d - 1])
-    .join('、');
+    .join(', ');
 }
 
 function firstDayIndexInText(raw: string): number | null {

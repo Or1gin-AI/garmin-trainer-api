@@ -92,37 +92,37 @@ export type SwimPaceVar = (typeof SWIM_PACE_VARS)[number];
 
 export const VARIABLE_DESCRIPTIONS: Record<string, string> = {
   // HR
-  'HR.recovery': '恢复区间，例如 110-128 bpm。来源：最大心率、静息心率、最近恢复课心率。',
-  'HR.aerobicLow': '低有氧区间，例如 128-140 bpm。来源：Garmin 有氧课、长距离课。',
-  'HR.aerobic': '标准有氧区间，例如 132-146 bpm。来源：最近 28 天稳定有氧活动。',
-  'HR.tempo': 'Tempo 区间，例如 148-158 bpm。来源：节奏/中高有氧活动。',
-  'HR.threshold': '阈值区间，例如 160-170 bpm。来源：阈值活动、乳酸阈值、20-40 分钟高稳态。',
-  'HR.vo2Cap': '高强度保护上限，例如 <176 bpm。来源：最大心率或历史高强度心率。',
+  'HR.recovery': 'Recovery zone, e.g. 110-128 bpm. Source: max HR, resting HR, recent recovery-session HR.',
+  'HR.aerobicLow': 'Low aerobic zone, e.g. 128-140 bpm. Source: Garmin aerobic and long sessions.',
+  'HR.aerobic': 'Standard aerobic zone, e.g. 132-146 bpm. Source: steady aerobic activities in the last 28 days.',
+  'HR.tempo': 'Tempo zone, e.g. 148-158 bpm. Source: tempo / upper-aerobic activities.',
+  'HR.threshold': 'Threshold zone, e.g. 160-170 bpm. Source: threshold activities, lactate threshold, 20-40 min hard steady efforts.',
+  'HR.vo2Cap': 'High-intensity protective cap, e.g. <176 bpm. Source: max HR or historical high-intensity HR.',
 
   // Run pace
-  'RUN.easyPace': '轻松跑配速。来源：近期可靠有氧跑均配，或 thresholdPace + 50-90 秒/km。',
-  'RUN.longPace': 'LSD 配速。规则：easyPace + 10-30 秒/km，只作上限。',
-  'RUN.tempoPace': '节奏跑配速。规则：thresholdPace + 15-30 秒/km。',
-  'RUN.thresholdPace': '阈值配速。来源：近期阈值能力，允许 ±5 秒/km。',
-  'RUN.intervalPace': '间歇配速。规则：thresholdPace - 15-30 秒/km。',
-  'RUN.vo2Pace': 'VO2max 配速。规则：thresholdPace - 25-45 秒/km。',
-  'RUN.racePace': '比赛目标配速。来源：用户目标距离和目标时间推导。',
+  'RUN.easyPace': 'Easy run pace. Source: average pace of recent reliable aerobic runs, or thresholdPace + 50-90 s/km.',
+  'RUN.longPace': 'Long-run (LSD) pace. Rule: easyPace + 10-30 s/km, used only as an upper cap.',
+  'RUN.tempoPace': 'Tempo pace. Rule: thresholdPace + 15-30 s/km.',
+  'RUN.thresholdPace': 'Threshold pace. Source: recent threshold ability, ±5 s/km allowed.',
+  'RUN.intervalPace': 'Interval pace. Rule: thresholdPace - 15-30 s/km.',
+  'RUN.vo2Pace': 'VO2max pace. Rule: thresholdPace - 25-45 s/km.',
+  'RUN.racePace': 'Goal race pace. Source: derived from the athlete\'s target distance and target time.',
 
   // Bike
-  'BIKE.ftp': 'FTP 功率。来源：Garmin FTP、20 分钟功率估算；缺失则 null。',
-  'BIKE.recoveryHr': '恢复骑心率。等同 HR.recovery。',
-  'BIKE.enduranceHr': '耐力骑心率。等同 HR.aerobicLow 或 HR.aerobic。',
-  'BIKE.tempoHr': 'Tempo 骑心率。等同 HR.tempo。',
-  'BIKE.thresholdHr': '阈值骑心率。等同 HR.threshold。',
-  'BIKE.vo2HrCap': '骑行高强度保护上限。等同 HR.vo2Cap。',
+  'BIKE.ftp': 'FTP power. Source: Garmin FTP or a 20 min power estimate; null if missing.',
+  'BIKE.recoveryHr': 'Recovery ride HR. Same as HR.recovery.',
+  'BIKE.enduranceHr': 'Endurance ride HR. Same as HR.aerobicLow or HR.aerobic.',
+  'BIKE.tempoHr': 'Tempo ride HR. Same as HR.tempo.',
+  'BIKE.thresholdHr': 'Threshold ride HR. Same as HR.threshold.',
+  'BIKE.vo2HrCap': 'Cycling high-intensity protective cap. Same as HR.vo2Cap.',
 
   // Swim pace
-  'SWIM.easyPace': '轻松游配速。规则：cssPace + 12-25 秒/100m。',
-  'SWIM.aerobicPace': '有氧游配速。规则：cssPace + 8-18 秒/100m。',
-  'SWIM.endurancePace': '长组耐力配速。规则：cssPace + 10-20 秒/100m。',
-  'SWIM.cssPace': 'CSS / 阈值配速。来源：CSS 测试、400/200 测试或近期阈值组。',
-  'SWIM.vo2Pace': 'VO2 游配速。规则：cssPace - 3-8 秒/100m。',
-  'SWIM.sprintPace': '短冲配速。规则：cssPace - 10-20 秒/100m。',
+  'SWIM.easyPace': 'Easy swim pace. Rule: cssPace + 12-25 s/100m.',
+  'SWIM.aerobicPace': 'Aerobic swim pace. Rule: cssPace + 8-18 s/100m.',
+  'SWIM.endurancePace': 'Endurance-set pace. Rule: cssPace + 10-20 s/100m.',
+  'SWIM.cssPace': 'CSS / threshold pace. Source: CSS test, 400/200 test or recent threshold sets.',
+  'SWIM.vo2Pace': 'VO2 swim pace. Rule: cssPace - 3-8 s/100m.',
+  'SWIM.sprintPace': 'Sprint pace. Rule: cssPace - 10-20 s/100m.',
 };
 
 // ----- Hard-session policy helpers ----------------------------------------

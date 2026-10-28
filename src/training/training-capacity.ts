@@ -178,7 +178,7 @@ export function getCapacityDurationCap(
   if (!Number.isFinite(minutes) || minutes <= 0) return null;
   return {
     minutes: Math.round(minutes),
-    reason: isLong ? '历史长课容量上限' : '历史单次训练容量上限',
+    reason: isLong ? 'historical long-session capacity cap' : 'historical single-session capacity cap',
   };
 }
 
@@ -195,32 +195,32 @@ function deriveOverallCapacity(args: {
 
   if (args.acuteChronicRatio !== null && args.acuteChronicRatio > 1.5) {
     score += 2;
-    reasons.push(`7 天负荷约为 28 天周均的 ${args.acuteChronicRatio} 倍`);
+    reasons.push(`7-day load is ~${args.acuteChronicRatio}x the 28-day weekly average`);
   } else if (args.acuteChronicRatio !== null && args.acuteChronicRatio > 1.3) {
     score += 1;
-    reasons.push(`近期负荷上升（ACWR ${args.acuteChronicRatio}）`);
+    reasons.push(`Recent load rising (ACWR ${args.acuteChronicRatio})`);
   }
 
   if (args.monotony !== null && args.monotony > 2.5 && args.acute7d.load > 0) {
     score += 2;
-    reasons.push(`训练单调性偏高（${args.monotony}）`);
+    reasons.push(`Training monotony high (${args.monotony})`);
   } else if (args.monotony !== null && args.monotony > 2.0 && args.acute7d.load > 0) {
     score += 1;
-    reasons.push(`训练单调性升高（${args.monotony}）`);
+    reasons.push(`Training monotony elevated (${args.monotony})`);
   }
 
   for (const [label, risk] of [
-    ['睡眠', args.recovery.sleepRisk],
+    ['Sleep', args.recovery.sleepRisk],
     ['HRV', args.recovery.hrvRisk],
-    ['Garmin 训练状态', args.recovery.trainingStatusRisk],
-    ['恢复时间', args.recovery.recoveryTimeRisk],
+    ['Garmin training status', args.recovery.trainingStatusRisk],
+    ['Recovery time', args.recovery.recoveryTimeRisk],
   ] as const) {
     if (risk === 'high') {
       score += 2;
-      reasons.push(`${label}提示恢复风险高`);
+      reasons.push(`${label} indicates high recovery risk`);
     } else if (risk === 'moderate') {
       score += 1;
-      reasons.push(`${label}提示恢复风险中等`);
+      reasons.push(`${label} indicates moderate recovery risk`);
     }
   }
 
@@ -241,7 +241,7 @@ function deriveOverallCapacity(args: {
         : 'low';
 
   if (reasons.length === 0) {
-    reasons.push('近期负荷与恢复信号未触发保护规则');
+    reasons.push('Recent load and recovery signals did not trigger any protection rule');
   }
 
   return {
@@ -282,14 +282,14 @@ function deriveGuardrails(
   const maxSessionMinutes = fromSports((sport) => sports[sport].durability.safeSessionMinutes);
   const maxLongSessionMinutes = fromSports((sport) => sports[sport].durability.safeLongSessionMinutes);
   const notes: string[] = [
-    `训练容量评估：${overall.level}，恢复状态 ${overall.readiness}，高强度上限 ${maxHardSessionsPerWeek} 次。`,
-    `强度分布保护：高强度分钟不超过本周训练分钟的 ${Math.round(intensityBounds.maxHighMinutesShare * 100)}%，低强度分钟目标不低于 ${Math.round(intensityBounds.minLowMinutesShare * 100)}%。`,
+    `Training capacity: ${overall.level}, readiness ${overall.readiness}, hard-session cap ${maxHardSessionsPerWeek}/week.`,
+    `Intensity distribution guard: high-intensity minutes at most ${Math.round(intensityBounds.maxHighMinutesShare * 100)}% of weekly training minutes; low-intensity minutes at least ${Math.round(intensityBounds.minLowMinutesShare * 100)}%.`,
   ];
   if (!allowHighIntensity) {
-    notes.push('恢复或数据置信度不足，本周不自动安排高强度课。');
+    notes.push('Recovery or data confidence is insufficient; no high-intensity sessions scheduled automatically this week.');
   }
   if (!allowDoubleDays) {
-    notes.push('未满足高级且恢复良好的条件，本周不自动安排同日两练。');
+    notes.push('Advanced/recovered criteria not met; no automatic same-day double sessions this week.');
   }
 
   return {
@@ -386,8 +386,8 @@ function deriveSportCapacity(
     minutes28 / 4,
   );
   const limiters: string[] = [];
-  if (confidence === 'low') limiters.push('该项目近期可靠数据不足');
-  if (hardSessions7d >= 2) limiters.push('该项目近 7 天高强度次数偏多');
+  if (confidence === 'low') limiters.push('Not enough recent reliable data for this sport');
+  if (hardSessions7d >= 2) limiters.push('Many hard sessions in this sport over the last 7 days');
 
   return {
     available: sportActivities.length > 0,

@@ -277,8 +277,8 @@ export async function runChatTurn(
 function buildFallbackCoachReply(input: ChatTurnInput, usedTools: boolean): string {
   const text = input.userMessage.trim();
   const asksLoad =
-    /负荷/.test(text) &&
-    /(为什么|为何|怎么|不一样|不同|差异|差这么多|差距)/.test(text);
+    /(负荷|\bload\b)/i.test(text) &&
+    /(为什么|为何|怎么|不一样|不同|差异|差这么多|差距|\bwhy\b|\bhow\b|differ|different|difference|\bgap\b)/i.test(text);
 
   if (asksLoad) {
     const loadRows = input.workouts
@@ -288,23 +288,23 @@ function buildFallbackCoachReply(input: ChatTurnInput, usedTools: boolean): stri
           | undefined;
         const load = Number(vars?.__estimated_training_load);
         return Number.isFinite(load) && load > 0
-          ? `第 ${w.dayIndex} 天 ${w.title}：${Math.round(load)}`
+          ? `Day ${w.dayIndex} ${w.title}: ${Math.round(load)}`
           : null;
       })
       .filter((row): row is string => Boolean(row));
     const loadText = loadRows.length > 0
-      ? `\n\n当前计划中可见的预估负荷是：${loadRows.join('；')}。`
+      ? `\n\nEstimated loads visible in the current plan: ${loadRows.join('; ')}.`
       : '';
     return [
-      '训练负荷不只看标题或卡片时长，而是按这节课的总时长、训练类型、结构里的强度时间，以及你的心率/配速画像一起估计。',
-      '所以同样是 Zone 2，LSD 如果主训练更长，会比普通有氧跑更高；阈值、VO2、间歇则会因为高强度分钟占比更高而显著增加。',
-      '如果你看到两节课结构和时长几乎一样但负荷不同，那就是计划生成一致性问题，应该修计划本身，而不是解释成合理差异。',
+      'Training load is not based on the title or card duration alone. It is estimated from the session\'s total duration, workout type, the time spent at each intensity in the structure, and your heart-rate/pace profile.',
+      'So even when both sessions are Zone 2, a long run (LSD) with a longer main set scores higher than a regular aerobic run, while threshold, VO2 and interval sessions score noticeably higher because a larger share of their minutes is high intensity.',
+      'If two sessions have almost identical structure and duration but different loads, that is a plan-generation consistency issue and the plan itself should be fixed, rather than explained away as a reasonable difference.',
     ].join('\n\n') + loadText;
   }
 
   return usedTools
-    ? '我已经完成了必要的数据查询，但模型这轮没有返回文字。请再发一次你的问题，我会基于刚加载的画像和计划继续回答。'
-    : '这轮模型没有返回有效文字。请再发一次你的问题，我会继续基于当前训练计划回答。';
+    ? 'I finished looking up the data I needed, but the model returned no text this turn. Please send your question again and I will answer based on the profile and plan I just loaded.'
+    : 'The model returned no usable text this turn. Please send your question again and I will keep answering based on your current training plan.';
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +318,7 @@ function buildToolDefs(): ChatCompletionTool[] {
       function: {
         name: TOOL_REGEN,
         description:
-          '为本周第 dayIndex 天（1=周一，7=周日）重新生成或替换训练课。同一天有多课时必须带 slotIndex 或 workoutId。用户明确要求“替换成/改成某训练”时必须传 templateId。reason 用中文一句说明用户的诉求或调整原因。',
+          'Regenerate or replace the session on day dayIndex of this week (1=Monday, 7=Sunday). When the day has several sessions you must pass slotIndex or workoutId. When the user explicitly asks to "replace with / change to" a specific workout you must pass templateId. reason is one English sentence describing the user\'s request or why the change is made.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -328,25 +328,25 @@ function buildToolDefs(): ChatCompletionTool[] {
               type: 'integer',
               minimum: 1,
               maximum: 7,
-              description: '需要重新生成的本周天数 (1..7)',
+              description: 'Day of this week to regenerate (1..7)',
             },
             slotIndex: {
               type: 'integer',
               minimum: 1,
               maximum: 3,
-              description: '同一天多课时的课次编号；默认 1',
+              description: 'Session number when the day has several sessions; defaults to 1',
             },
             workoutId: {
               type: 'string',
-              description: '若上下文中有 workoutId，优先用它精确指定要重生成的训练课',
+              description: 'If the context has a workoutId, prefer it to identify exactly which session to regenerate',
             },
             templateId: {
               type: 'string',
-              description: '可选模板 id；用户明确要求替换训练类型时必须填写，例如 run.reverse_pyramid.v1、run.threshold.v1',
+              description: 'Optional template id; required when the user explicitly asks to change the workout type, e.g. run.reverse_pyramid.v1, run.threshold.v1',
             },
             reason: {
               type: 'string',
-              description: '中文一句说明为什么要重新生成',
+              description: 'One English sentence explaining why the session is regenerated',
             },
           },
         },
@@ -357,7 +357,7 @@ function buildToolDefs(): ChatCompletionTool[] {
       function: {
         name: TOOL_ADD_SECOND,
         description:
-          '给本周第 dayIndex 天新增第二堂训练课，创建 slotIndex=2/3。用户要求“一天两练”“加第二练”“某天加练”时使用这个工具，而不是 regenerate_day。用户明确要求训练类型时必须传 templateId；只有用户让你自己决定时，才默认加低强度恢复/交叉训练。',
+          'Add a second session on day dayIndex of this week, creating slotIndex=2/3. Use this tool (not regenerate_day) when the user asks for "two sessions in one day", "add a second session" or "add an extra session on some day". When the user explicitly names a workout type you must pass templateId; only default to a low-intensity recovery/cross-training session when the user leaves the choice to you.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -367,20 +367,20 @@ function buildToolDefs(): ChatCompletionTool[] {
               type: 'integer',
               minimum: 1,
               maximum: 7,
-              description: '需要加第二练的本周天数 (1..7)',
+              description: 'Day of this week that gets the second session (1..7)',
             },
             sport: {
               type: 'string',
               enum: ['running', 'cycling', 'swimming', 'mobility'],
-              description: '用户指定或你选择的第二练项目；不填则系统自动选低冲击恢复课',
+              description: 'Sport for the second session, specified by the user or chosen by you; if omitted the system picks a low-impact recovery session',
             },
             templateId: {
               type: 'string',
-              description: '可选模板 id；明确双阈值用 run.double_threshold_pm.v1，倒金字塔跑用 run.reverse_pyramid.v1；不填时系统按安全规则选择低强度模板',
+              description: 'Optional template id; use run.double_threshold_pm.v1 for an explicit double threshold and run.reverse_pyramid.v1 for a reverse pyramid run; if omitted the system picks a low-intensity template using safety rules',
             },
             reason: {
               type: 'string',
-              description: '中文一句说明为什么要新增第二练',
+              description: 'One English sentence explaining why the second session is added',
             },
           },
         },
@@ -391,7 +391,7 @@ function buildToolDefs(): ChatCompletionTool[] {
       function: {
         name: TOOL_UPDATE_FIELD,
         description:
-          '更新某个训练日的字段。当前仅支持把 status 改为 completed/skipped/planned。',
+          'Update a field of a training session. Currently only supports setting status to completed/skipped/planned.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -565,36 +565,36 @@ function parseToolCall(name: string, argsBuffer: string): ParseResult {
 
 function buildSystemPrompt(input: ChatTurnInput): string {
   const parts: string[] = [];
-  parts.push('你是一位经验丰富的耐力运动教练 AI，正在与用户讨论一份本周的训练计划。');
+  parts.push('You are an experienced endurance coaching AI discussing this week\'s training plan with the user.');
   parts.push('');
-  parts.push('回答风格：');
-  parts.push('- 全程使用中文，语气友好、专业、简洁；');
-  parts.push('- 单条回答通常不超过 300 字，必要时可使用列表或加粗；');
-  parts.push('- 引用某天时使用「第 X 天 / 周X」与具体的 templateId（如 run.tempo.v1），方便用户对应；');
-  parts.push('- 不得编造训练负荷、配速、心率、功率等数值，所有判断必须基于下面给出的运动员档案与近期状态；');
-  parts.push('- 当用户的请求模糊时，可先问 1 个澄清问题，再决定是否调用工具；');
-  parts.push('- 与训练无关的问题礼貌拒绝并把话题拉回训练。');
+  parts.push('Response style:');
+  parts.push('- Always reply in English, even if the user writes in another language (e.g. Chinese); keep a friendly, professional and concise tone;');
+  parts.push('- Keep a single reply to roughly 200 words or fewer; lists or bold text are fine when useful;');
+  parts.push('- When referring to a day, use "Day X / weekday" together with the specific templateId (e.g. run.tempo.v1) so the user can match it;');
+  parts.push('- Never invent training load, pace, heart rate, power or other numbers; every judgement must be based on the athlete profile and recent state given below;');
+  parts.push('- When the request is ambiguous you may ask 1 clarifying question before deciding whether to call a tool;');
+  parts.push('- Politely decline questions unrelated to training and steer the conversation back to training.');
   parts.push('');
-  parts.push('重要行为规则：');
-  parts.push('- 用户明确说「替换/改成/加/新增/第二练」并给出训练类型时，不要反问具体怎么练；你应根据模板库自动选择最接近模板并调用工具。');
-  parts.push('- 只有缺少日期、动作（新增还是替换）或目标训练完全无法识别时，才问澄清问题。');
-  parts.push('- 如果用户要求高强度或高级训练，可以先用一句话提示恢复风险，但必须尊重明确请求并调用工具；不要把明确的双阈值、倒金字塔、间歇等自动改成恢复游/恢复跑。');
-  parts.push('- 常见口语映射：双阈值/Double Threshold → run.double_threshold_pm.v1（新增第二练）或 run.double_threshold_am.v1（替换主课）；倒金字塔/递减金字塔/reverse pyramid → run.reverse_pyramid.v1；阈值跑/Zone4/Z4 → run.threshold.v1；节奏跑/tempo → run.tempo.v1；间歇/800/400 → run.interval.v1；VO2/最大摄氧 → run.vo2max.v1。');
+  parts.push('Important behaviour rules:');
+  parts.push('- When the user explicitly says "replace / change to / add / second session" and names a workout type, do not ask how exactly to do it; pick the closest template from the library and call the tool.');
+  parts.push('- Only ask a clarifying question when the day, the action (add vs. replace) or the target workout is completely unclear.');
+  parts.push('- If the user asks for high-intensity or advanced work, you may warn about recovery risk in one sentence, but you must respect the explicit request and call the tool; never silently turn an explicit double threshold, reverse pyramid, intervals, etc. into a recovery swim/recovery run.');
+  parts.push('- Common phrase mapping (users may write these in English or Chinese): double threshold / 双阈值 → run.double_threshold_pm.v1 (add as second session) or run.double_threshold_am.v1 (replace the main session); reverse pyramid / 倒金字塔 / 递减金字塔 → run.reverse_pyramid.v1; threshold run / Zone 4 / Z4 / 阈值跑 → run.threshold.v1; tempo run / 节奏跑 → run.tempo.v1; intervals / 800s / 400s / 间歇 → run.interval.v1; VO2 / VO2max / 最大摄氧 → run.vo2max.v1.');
   parts.push('');
-  parts.push('修改训练计划的唯一方式是调用下列工具，禁止直接声称已修改课表：');
-  parts.push('- regenerate_day(dayIndex, reason, slotIndex?, workoutId?, templateId?) — 重新生成或替换指定训练课；同一天有多课时必须传 slotIndex 或 workoutId；用户说「替换/改成」时传 templateId；');
-  parts.push('- add_second_workout(dayIndex, reason, sport?, templateId?) — 给某一天新增第二堂训练课；用户说“一天两练 / 加第二练 / 某天加练”时必须优先用这个工具；');
-  parts.push('- update_workout_field(workoutId, field="status", value) — 修改某个训练日的状态。');
-  parts.push('- 如果用户让你自己决定第二练内容，优先选择低强度恢复或低冲击交叉训练，例如跑后加恢复游；不要用 regenerate_day 代替新增课时。');
-  parts.push('调用工具前请先用一句话告诉用户你打算做什么，然后再触发工具调用。');
+  parts.push('The only way to change the training plan is to call the tools below; never claim the plan has been changed without calling them:');
+  parts.push('- regenerate_day(dayIndex, reason, slotIndex?, workoutId?, templateId?) — regenerate or replace a specific session; when the day has several sessions you must pass slotIndex or workoutId; pass templateId when the user says "replace / change to";');
+  parts.push('- add_second_workout(dayIndex, reason, sport?, templateId?) — add a second session on a day; you must prefer this tool when the user says "two sessions in one day / add a second session / add an extra session on some day";');
+  parts.push('- update_workout_field(workoutId, field="status", value) — change the status of a session.');
+  parts.push('- If the user lets you decide the second session, prefer low-intensity recovery or low-impact cross-training, e.g. a recovery swim after a run; do not use regenerate_day in place of adding a session.');
+  parts.push('Tool arguments such as reason must also be written in English. Before calling a tool, tell the user in one sentence what you are about to do, then make the tool call.');
   parts.push('');
-  parts.push('# 可用训练模板');
+  parts.push('# Available workout templates');
   parts.push(getCatalogForPrompt());
   parts.push('');
-  parts.push('# 本轮用户意图提示');
+  parts.push('# Intent hints for this turn');
   parts.push(buildIntentHint(input.userMessage));
   parts.push('');
-  parts.push('# 当前计划上下文');
+  parts.push('# Current plan context');
   parts.push(buildPlanContextBlock(input));
   return parts.join('\n');
 }
@@ -602,16 +602,16 @@ function buildSystemPrompt(input: ChatTurnInput): string {
 function buildIntentHint(userMessage: string): string {
   const dayIndex = inferDayIndex(userMessage);
   const templateId = inferTemplateIdFromText(userMessage);
-  const isAdd = /(加|新增|添加|第二练|第二堂|一天两练|双练|double\s*day)/i.test(userMessage);
-  const isReplace = /(替换|换成|改成|改为|换掉|replace)/i.test(userMessage);
+  const isAdd = /(加|新增|添加|第二练|第二堂|一天两练|双练|double\s*day|\badd\b|second\s*(session|workout)|extra\s*(session|workout)|two-a-day)/i.test(userMessage);
+  const isReplace = /(替换|换成|改成|改为|换掉|replace|\bswap\b|change\s*(it\s*)?to|switch\s*(it\s*)?to|instead\s*of)/i.test(userMessage);
   return JSON.stringify(
     {
       dayIndex,
       action: isAdd ? 'add_second_workout' : isReplace ? 'regenerate_day_with_templateId' : null,
       inferredTemplateId: templateId,
       note: templateId
-        ? '用户已给出可识别训练类型；如果日期和动作足够明确，应直接调用工具，不要追问训练结构。'
-        : '若用户给出的是训练类型但这里未识别，请从模板库选择最接近的 templateId。',
+        ? 'The user named a recognizable workout type; if the day and action are clear enough, call the tool directly instead of asking about the workout structure.'
+        : 'If the user named a workout type that was not recognized here, pick the closest templateId from the template library.',
     },
     null,
     2,
@@ -620,13 +620,13 @@ function buildIntentHint(userMessage: string): string {
 
 function inferDayIndex(text: string): number | null {
   const patterns: Array<[number, RegExp]> = [
-    [1, /(周一|星期一|礼拜一|第\s*1\s*天|day\s*1|monday|mon)/i],
-    [2, /(周二|星期二|礼拜二|第\s*2\s*天|day\s*2|tuesday|tue)/i],
-    [3, /(周三|星期三|礼拜三|第\s*3\s*天|day\s*3|wednesday|wed)/i],
-    [4, /(周四|星期四|礼拜四|第\s*4\s*天|day\s*4|thursday|thu)/i],
-    [5, /(周五|星期五|礼拜五|第\s*5\s*天|day\s*5|friday|fri)/i],
-    [6, /(周六|星期六|礼拜六|第\s*6\s*天|day\s*6|saturday|sat)/i],
-    [7, /(周日|周天|星期日|星期天|礼拜日|礼拜天|第\s*7\s*天|day\s*7|sunday|sun)/i],
+    [1, /(周一|星期一|礼拜一|第\s*1\s*天|\bday\s*1\b|\bmonday\b|\bmon\b)/i],
+    [2, /(周二|星期二|礼拜二|第\s*2\s*天|\bday\s*2\b|\btuesday\b|\btue\b)/i],
+    [3, /(周三|星期三|礼拜三|第\s*3\s*天|\bday\s*3\b|\bwednesday\b|\bwed\b)/i],
+    [4, /(周四|星期四|礼拜四|第\s*4\s*天|\bday\s*4\b|\bthursday\b|\bthu\b)/i],
+    [5, /(周五|星期五|礼拜五|第\s*5\s*天|\bday\s*5\b|\bfriday\b|\bfri\b)/i],
+    [6, /(周六|星期六|礼拜六|第\s*6\s*天|\bday\s*6\b|\bsaturday\b|\bsat\b)/i],
+    [7, /(周日|周天|星期日|星期天|礼拜日|礼拜天|第\s*7\s*天|\bday\s*7\b|\bsunday\b|\bsun\b)/i],
   ];
   return patterns.find(([, pattern]) => pattern.test(text))?.[0] ?? null;
 }
@@ -639,6 +639,10 @@ function inferTemplateIdFromText(text: string): string | null {
   }
   if (/最大摄氧|vo2|max\s*oxygen|vvo2/.test(lower)) return 'run.vo2max.v1';
   if (/短间歇|间歇|400|800|interval/.test(lower)) return 'run.interval.v1';
+  if (/threshold\s*(ride|bike)|(bike|ride|cycling).*threshold/.test(lower)) return 'bike.threshold.v1';
+  if (/threshold\s*swim|swim.*threshold|\bcss\b/.test(lower)) return 'swim.css_threshold.v1';
+  if (/recovery\s*swim|swim.*recovery/.test(lower)) return 'swim.recovery.v1';
+  if (/recovery\s*(ride|spin|bike)|(ride|bike).*recovery/.test(lower)) return 'bike.recovery_spin.v1';
   if (/阈值跑|跑.*阈值|threshold|zone\s*4|z4|hr\s*z4/.test(lower)) return 'run.threshold.v1';
   if (/节奏跑|tempo/.test(lower)) return 'run.tempo.v1';
   if (/递进跑|progression/.test(lower)) return 'run.progression.v1';
@@ -648,7 +652,7 @@ function inferTemplateIdFromText(text: string): string | null {
   if (/恢复骑|恢复.*骑/.test(lower)) return 'bike.recovery_spin.v1';
   if (/阈值骑|骑.*阈值/.test(lower)) return 'bike.threshold.v1';
   if (/甜区|sweet\s*spot/.test(lower)) return 'bike.sweet_spot.v1';
-  if (/恢复跑|恢复.*跑/.test(lower)) return 'run.recovery.v1';
+  if (/恢复跑|恢复.*跑|recovery\s*run|easy\s*recovery/.test(lower)) return 'run.recovery.v1';
   return null;
 }
 

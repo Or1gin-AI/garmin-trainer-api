@@ -32,13 +32,17 @@ export interface LlmStreamSummaryResult {
 }
 
 const SECTION_HEADERS: Record<SummaryDeltaKind, string> = {
-  summary: '## 摘要',
-  monitoring: '## 监控重点',
-  adjustment_rules: '## 调整规则',
+  summary: '## Summary',
+  monitoring: '## Monitoring',
+  adjustment_rules: '## Adjustment Rules',
 };
 
-// Header → kind, in the order they should appear.
+// Header → kind, in the order they should appear. The legacy Chinese headers
+// stay as aliases so a model that still answers with them is parsed correctly.
 const HEADER_TO_KIND: ReadonlyArray<readonly [string, SummaryDeltaKind]> = [
+  ['## Summary', 'summary'],
+  ['## Monitoring', 'monitoring'],
+  ['## Adjustment Rules', 'adjustment_rules'],
   ['## 摘要', 'summary'],
   ['## 监控重点', 'monitoring'],
   ['## 调整规则', 'adjustment_rules'],
@@ -190,20 +194,21 @@ function lastSafeBoundary(text: string): number {
 
 function buildMessages(args: LlmStreamSummaryArgs): ChatCompletionMessageParam[] {
   const systemParts: string[] = [];
-  systemParts.push('你是一位中文运动教练，正在为用户撰写本周训练计划的总结说明。');
-  systemParts.push('请按以下三个段落严格输出，每段以 "## 标题" 开头，段落之间用空行分隔：');
+  systemParts.push('You are an endurance coach writing the summary notes for this week\'s training plan.');
+  systemParts.push('Write ALL output in English, even if the user\'s goal or notes are written in another language.');
+  systemParts.push('Output exactly the following three sections, each starting with its "## Heading" line, separated by a blank line:');
   systemParts.push(`${SECTION_HEADERS.summary}`);
-  systemParts.push('（用 2-3 句中文概括本周课表：训练日数、各运动次数、是否含长距离/质量课，并提及当前疲劳/最新刺激。）');
+  systemParts.push('(2-3 sentences summarizing the week: number of training days, sessions per sport, whether it includes long or quality sessions, and the current fatigue / latest training stimulus.)');
   systemParts.push('');
   systemParts.push(`${SECTION_HEADERS.monitoring}`);
-  systemParts.push('（2-4 句指出本周需要重点关注的指标：心率、主观疲劳、睡眠等，以及触发降级的条件。）');
+  systemParts.push('(2-4 sentences on what to watch this week: heart rate, perceived fatigue, sleep, etc., and the conditions that should trigger a downgrade.)');
   systemParts.push('');
   systemParts.push(`${SECTION_HEADERS.adjustment_rules}`);
-  systemParts.push('（2-4 条规则，给出何时缩短训练、降低强度或全休的明确触发条件，每条 1-2 句。）');
+  systemParts.push('(2-4 rules with clear triggers for when to shorten a session, lower the intensity, or take a full rest day; 1-2 sentences each.)');
   systemParts.push('');
-  systemParts.push('禁止偏离上述结构、禁止增加新段落、禁止使用 Markdown 列表外的多级标题。');
-  systemParts.push('如果提到“质量课”或“高强度课”的数量，必须使用 payload.metrics.highSessions；如果提到高强度训练日，必须使用 payload.metrics.hardDays。');
-  systemParts.push('当 payload.metrics.forceRequestedSchedule=true 时，用户要求优先：不要说系统删除或强制修改了用户要求，只能说明风险、监控重点和执行时的降级条件。');
+  systemParts.push('Do not deviate from this structure, do not add extra sections, and do not use any heading levels other than these three section headings (Markdown lists are fine).');
+  systemParts.push('If you mention the number of quality or high-intensity sessions, you must use payload.metrics.highSessions; if you mention high-intensity training days, you must use payload.metrics.hardDays.');
+  systemParts.push('When payload.metrics.forceRequestedSchedule=true the user\'s request takes priority: do not say the system removed or overrode the user\'s request; only describe the risks, what to monitor, and the conditions for scaling back during execution.');
 
   const metrics = buildPlanMetrics(args);
   const userPayload = {
@@ -256,7 +261,7 @@ function buildMessages(args: LlmStreamSummaryArgs): ChatCompletionMessageParam[]
     { role: 'system', content: systemParts.join('\n') },
     {
       role: 'user',
-      content: `请基于下列课表生成三段说明：\n\n${JSON.stringify(userPayload, null, 2)}`,
+      content: `Write the three sections in English for the following weekly plan:\n\n${JSON.stringify(userPayload, null, 2)}`,
     },
   ];
 }

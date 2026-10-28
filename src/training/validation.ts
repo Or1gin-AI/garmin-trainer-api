@@ -7,6 +7,7 @@
 import type { ParameterizedWorkout } from './parameterizer.js';
 import { MAX_WEEKLY_TRAINING_MINUTES, type ScheduleEntry } from './scheduler.js';
 import type { CapacityLevel, CapacitySport, TrainingCapacity } from './training-capacity.js';
+import { isNotApplicableSentinel, mentionsNotApplicable } from './not-applicable.js';
 
 export interface PlanForValidation {
   schedule: ScheduleEntry[];
@@ -29,7 +30,6 @@ export interface Violation {
   details: string;
 }
 
-const NA = '不适用';
 const HARD_STIMULI: ReadonlySet<string> = new Set(['threshold', 'vo2max', 'anaerobic']);
 const HIGH_WORKOUT_TYPES = new Set([
   'threshold',
@@ -68,7 +68,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
   if (coveredDays.size !== 7 || plan.workouts.length !== plan.schedule.length) {
     violations.push({
       rule: 'week_coverage',
-      details: `coveredDays=${coveredDays.size}, schedule.length=${plan.schedule.length}, workouts.length=${plan.workouts.length}；期望覆盖 7 天且 workout 与 schedule 一一对应。`,
+      details: `coveredDays=${coveredDays.size}, schedule.length=${plan.schedule.length}, workouts.length=${plan.workouts.length}; expected 7 covered days with a 1:1 workout/schedule mapping.`,
     });
     // Don't bail — still try to validate what we have.
   }
@@ -83,7 +83,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
       violations.push({
         rule: 'template_id_present',
         dayIndex,
-        details: `第 ${dayIndex} 天缺少 templateId。`,
+        details: `Day ${dayIndex} is missing a templateId.`,
       });
     }
 
@@ -92,55 +92,55 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
       violations.push({
         rule: 'sport_consistency',
         dayIndex,
-        details: `第 ${dayIndex} 天 schedule.sport=${s.sport} 与 workout.sport=${w.sport} 不一致。`,
+        details: `Day ${dayIndex}: schedule.sport=${s.sport} does not match workout.sport=${w.sport}.`,
       });
     }
 
     // Rest-tier templates use either 'rest' (full rest) or 'mobility' (active
     // recovery walk/stretch). Both are exempt from the metric-presence rule
-    // since 'targetHeartRate' may legitimately be '不适用' when the user has
+    // since 'targetHeartRate' may legitimately be 'N/A' when the user has
     // no HR data — these days exist precisely to NOT prescribe load.
     const isRest = s.sport === 'rest' || s.sport === 'mobility';
 
     if (!isRest) {
       // non_rest_must_have_metric
-      if (w.targetHeartRate === NA && w.targetPace === NA && w.targetPower === NA) {
+      if (isNotApplicableSentinel(w.targetHeartRate) && isNotApplicableSentinel(w.targetPace) && isNotApplicableSentinel(w.targetPower)) {
         violations.push({
           rule: 'non_rest_must_have_metric',
           dayIndex,
-          details: `第 ${dayIndex} 天为训练日但 targetHeartRate / targetPace / targetPower 均为 不适用。`,
+          details: `Day ${dayIndex} is a training day but targetHeartRate / targetPace / targetPower are all N/A.`,
         });
       }
 
       // pace_format
-      if (w.sport === 'running' && w.targetPace !== NA && !w.targetPace.includes('/km')) {
+      if (w.sport === 'running' && !isNotApplicableSentinel(w.targetPace) && !w.targetPace.includes('/km')) {
         violations.push({
           rule: 'pace_format',
           dayIndex,
-          details: `第 ${dayIndex} 天为跑步日，targetPace="${w.targetPace}" 缺少 /km。`,
+          details: `Day ${dayIndex} is a run but targetPace="${w.targetPace}" is missing /km.`,
         });
       }
-      if (w.sport === 'swimming' && w.targetPace !== NA && !w.targetPace.includes('/100m')) {
+      if (w.sport === 'swimming' && !isNotApplicableSentinel(w.targetPace) && !w.targetPace.includes('/100m')) {
         violations.push({
           rule: 'pace_format',
           dayIndex,
-          details: `第 ${dayIndex} 天为游泳日，targetPace="${w.targetPace}" 缺少 /100m。`,
+          details: `Day ${dayIndex} is a swim but targetPace="${w.targetPace}" is missing /100m.`,
         });
       }
-      if (w.sport === 'cycling' && w.targetPace !== NA) {
+      if (w.sport === 'cycling' && !isNotApplicableSentinel(w.targetPace)) {
         violations.push({
           rule: 'pace_format',
           dayIndex,
-          details: `第 ${dayIndex} 天为骑行日，targetPace 必须为 不适用，实际="${w.targetPace}"。`,
+          details: `Day ${dayIndex} is a ride, so targetPace must be N/A; got "${w.targetPace}".`,
         });
       }
 
       // hr_format
-      if (w.targetHeartRate !== NA && !w.targetHeartRate.includes('bpm')) {
+      if (!isNotApplicableSentinel(w.targetHeartRate) && !w.targetHeartRate.includes('bpm')) {
         violations.push({
           rule: 'hr_format',
           dayIndex,
-          details: `第 ${dayIndex} 天 targetHeartRate="${w.targetHeartRate}" 缺少 bpm 单位。`,
+          details: `Day ${dayIndex}: targetHeartRate="${w.targetHeartRate}" is missing the bpm unit.`,
         });
       }
 
@@ -149,17 +149,17 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
         violations.push({
           rule: 'workout_structure_has_numbers',
           dayIndex,
-          details: `第 ${dayIndex} 天 workoutStructure 缺少数字描述。`,
+          details: `Day ${dayIndex}: workoutStructure has no numeric detail.`,
         });
       }
 
       // targets_have_numbers
       for (const t of w.targets ?? []) {
-        if (!/\d/.test(t) && !t.includes(NA)) {
+        if (!/\d/.test(t) && !mentionsNotApplicable(t)) {
           violations.push({
             rule: 'targets_have_numbers',
             dayIndex,
-            details: `第 ${dayIndex} 天的 targets 中存在未量化项："${t}"。`,
+            details: `Day ${dayIndex}: target without a number: "${t}".`,
           });
           break;
         }
@@ -183,7 +183,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
         violations.push({
           rule: 'single_session_duration_within_capacity',
           dayIndex,
-          details: `第 ${dayIndex} 天时长 ${w.durationMinutes} 分钟 > 容量上限 ${s.durationCapMinutes} 分钟（${s.durationCapReason ?? '容量保护'}）。`,
+          details: `Day ${dayIndex}: duration ${w.durationMinutes} min > capacity cap ${s.durationCapMinutes} min (${s.durationCapReason ?? 'capacity protection'}).`,
         });
       }
 
@@ -197,7 +197,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
         violations.push({
           rule: 'anchor_confidence_allows_precision',
           dayIndex,
-          details: `第 ${dayIndex} 天是 ${w.workoutType} 高强度课，但 ${sportZh(w.sport)} 的近期可靠数据不足，不应安排精准阈值/VO2/间歇。`,
+          details: `Day ${dayIndex} is a high-intensity ${w.workoutType} session, but there is not enough reliable recent ${sportLabel(w.sport)} data to prescribe precise threshold/VO2/interval work.`,
         });
       }
     }
@@ -221,7 +221,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
         violations.push({
           rule: 'no_consecutive_hard_days',
           dayIndex: hardDays[i],
-          details: `第 ${hardDays[i - 1]} 天和第 ${hardDays[i]} 天连续为高强度课。`,
+          details: `Days ${hardDays[i - 1]} and ${hardDays[i]} are back-to-back high-intensity sessions.`,
         });
       }
     }
@@ -235,7 +235,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
   if (plan.context.forceRequestedSchedule !== true && hardCount > Math.max(0, hardBudget)) {
     violations.push({
       rule: 'hard_cap_per_week',
-      details: `本周高强度课 ${hardCount} > 剩余预算 ${Math.max(0, hardBudget)}（cap=${plan.context.maxHardSessionsPerWeek}, 已完成=${plan.context.hardSessionsAlreadyDoneThisWeek}）。`,
+      details: `High-intensity sessions this week ${hardCount} > remaining budget ${Math.max(0, hardBudget)} (cap=${plan.context.maxHardSessionsPerWeek}, done=${plan.context.hardSessionsAlreadyDoneThisWeek}).`,
     });
   }
 
@@ -247,7 +247,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
   ) {
     violations.push({
       rule: 'readiness_allows_intensity',
-      details: `训练容量/恢复评估为 ${plan.context.trainingCapacity.overall.readiness}，本周不允许高强度课，但计划包含 ${hardCount} 天高强度。`,
+      details: `Capacity/recovery readiness is ${plan.context.trainingCapacity.overall.readiness}, so no high-intensity sessions are allowed this week, but the plan has ${hardCount} hard days.`,
     });
   }
 
@@ -267,7 +267,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
     violations.push({
       rule: 'recent_high_stim_cooldown',
       dayIndex: 1,
-      details: `最近 24 小时内有 ${plan.context.latestStimulus} 刺激，但第 1 天仍为高强度。`,
+      details: `A ${plan.context.latestStimulus} stimulus occurred in the last 24 h, but day 1 is still high intensity.`,
     });
   }
 
@@ -278,7 +278,7 @@ export function validatePlan(plan: PlanForValidation): Violation[] {
     violations.push({
       rule: 'weekly_duration_within_user_limit',
       dayIndex: longest?.dayIndex,
-      details: `本周训练总时长 ${activeMinutes} 分钟 > 用户周上限 ${weeklyMaxMinutes} 分钟。`,
+      details: `Weekly training time ${activeMinutes} min > weekly limit ${weeklyMaxMinutes} min.`,
     });
   }
 
@@ -295,15 +295,15 @@ function validateSegmentedWorkout(w: ParameterizedWorkout): string | null {
     const hasDistances = /1200/.test(structure) && /800/.test(structure) && /400/.test(structure);
     const paces = uniqueMatches(`${targetPace}\n${structure}`, /\d+:\d{2}\s*\/km/g);
     if (!hasDistances || paces.length < 3) {
-      return `倒金字塔必须写清 1200/800/400 三段，并给出三个不同目标配速；当前 targetPace="${targetPace}"。`;
+      return `Reverse pyramid must spell out the 1200/800/400 reps with three distinct target paces; current targetPace="${targetPace}".`;
     }
   }
 
   if (type === 'progression') {
-    const hasSegments = /第一段/.test(structure) && /第二段/.test(structure) && /第三段/.test(structure);
+    const hasSegments = /第一段|Segment 1/i.test(structure) && /第二段|Segment 2/i.test(structure) && /第三段|Segment 3/i.test(structure);
     const paces = uniqueMatches(`${targetPace}\n${structure}`, /\d+:\d{2}\s*\/km/g);
     if (!hasSegments || paces.length < 2) {
-      return `递进跑必须写清至少三段，并体现逐步提速；当前 targetPace="${targetPace}"。`;
+      return `Progression run must spell out at least three segments with increasing pace; current targetPace="${targetPace}".`;
     }
   }
 
@@ -311,15 +311,15 @@ function validateSegmentedWorkout(w: ParameterizedWorkout): string | null {
     const powers = uniqueMatches(`${targetPower}\n${structure}`, /\d+\s*W/gi);
     const hasPctPattern = /95\s*%/.test(structure) && /105\s*%/.test(structure);
     if (powers.length < 2 && !hasPctPattern) {
-      return `Over-under 必须写清 under/over 两个功率目标；当前 targetPower="${targetPower}"。`;
+      return `Over-under must spell out both under and over power targets; current targetPower="${targetPower}".`;
     }
   }
 
   if (w.templateId === 'swim.sprint.v1') {
-    const hasMain = /x|×/.test(structure) && /米/.test(structure);
-    const hasAux = /辅助|技术游|轻松/.test(structure);
+    const hasMain = /x|×/.test(structure) && /米|\d\s*m\b/.test(structure);
+    const hasAux = /辅助|技术游|轻松|aux|technique|drill|easy/i.test(structure);
     if (!hasMain || !hasAux) {
-      return '短冲游必须写清短冲主组、组间休息和辅助轻松技术游。';
+      return 'Sprint swim must spell out the sprint main set, rest between reps, and the easy technique aux set.';
     }
   }
 
@@ -397,7 +397,7 @@ function validateIntensityDistribution(plan: PlanForValidation): Violation[] {
     violations.push({
       rule: 'intensity_distribution_within_week',
       dayIndex: longestHigh.dayIndex,
-      details: `本周高强度分钟占比 ${formatPct(highShare)} > 容量上限 ${formatPct(highLimit)}；应先降级最长高强度课。`,
+      details: `High-intensity share of weekly minutes ${formatPct(highShare)} > capacity limit ${formatPct(highLimit)}; downgrade the longest hard session first.`,
     });
   }
 
@@ -407,7 +407,7 @@ function validateIntensityDistribution(plan: PlanForValidation): Violation[] {
     violations.push({
       rule: 'low_intensity_floor_within_week',
       dayIndex: longestModerate.dayIndex,
-      details: `本周低强度分钟占比 ${formatPct(lowShare)}，明显低于目标 ${formatPct(lowFloor)}；应把一节中强度课改为有氧/技术课。`,
+      details: `Low-intensity share of weekly minutes ${formatPct(lowShare)} is well below the target ${formatPct(lowFloor)}; change one moderate session to an aerobic/technique session.`,
     });
   }
 
@@ -444,7 +444,7 @@ function validateLongSessionShare(plan: PlanForValidation): Violation[] {
       violations.push({
         rule: 'long_session_share_within_capacity',
         dayIndex: s.dayIndex,
-        details: `第 ${s.dayIndex} 天长课占 ${sportZh(w.sport)} 周训练分钟的 ${formatPct(share)}，超过 ${formatPct(shareCap)} 上限；应缩短长课或增加低强度基础课。`,
+        details: `Day ${s.dayIndex}: the long session is ${formatPct(share)} of weekly ${sportLabel(w.sport)} minutes, above the ${formatPct(shareCap)} cap; shorten it or add easy base sessions.`,
       });
     }
   }
@@ -486,10 +486,10 @@ function isCapacitySport(sport: string): sport is CapacitySport {
   return sport === 'running' || sport === 'cycling' || sport === 'swimming';
 }
 
-function sportZh(sport: CapacitySport): string {
-  if (sport === 'running') return '跑步';
-  if (sport === 'cycling') return '骑行';
-  return '游泳';
+function sportLabel(sport: CapacitySport): string {
+  if (sport === 'running') return 'running';
+  if (sport === 'cycling') return 'cycling';
+  return 'swimming';
 }
 
 function formatPct(value: number): string {
