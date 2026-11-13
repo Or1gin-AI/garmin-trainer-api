@@ -46,6 +46,20 @@ export function extractJsonObjectText(content: string | null | undefined): strin
   return '';
 }
 
+/**
+ * Provider-specific request tweaks. DeepSeek's current models think by
+ * default, and thinking mode rejects the forced `tool_choice` the scheduler,
+ * parameterizer and chat rely on, so thinking is switched off there.
+ */
+function applyProviderOptions(
+  body: ChatCompletionCreateParamsStreaming | ChatCompletionCreateParamsNonStreaming,
+  config: Pick<ActiveLlmConfig, 'baseUrl'>,
+): void {
+  if (/deepseek\.com/i.test(config.baseUrl)) {
+    (body as unknown as Record<string, unknown>).thinking = { type: 'disabled' };
+  }
+}
+
 const CACHE_TTL_MS = 60_000;
 const LLM_MAX_RETRIES = 0;
 
@@ -163,6 +177,7 @@ export async function streamChat(
   if (args.responseFormat) {
     body.response_format = args.responseFormat;
   }
+  applyProviderOptions(body, config);
 
   return client.chat.completions.create(body, {
     signal: args.signal,
@@ -198,6 +213,7 @@ export async function completeChat(
   if (args.responseFormat) {
     body.response_format = args.responseFormat;
   }
+  applyProviderOptions(body, config);
 
   return client.chat.completions.create(body, {
     signal: args.signal,
