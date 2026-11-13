@@ -10,9 +10,9 @@
 // activities between Garmin regions, not into our DB).
 
 import { authenticate } from './client.js';
-import { sql } from 'drizzle-orm';
+import { and, eq, gte, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { activityMetric } from '../db/schema.js';
+import { activityMetric, garminAccount, type ActivityMetricRow } from '../db/schema.js';
 import { normalizeActivity } from '../training/activity-normalizer.js';
 import { classifyActivityQuality } from '../training/activity-quality.js';
 import { toActivityMetricRow } from '../training/profile/persist-activity.js';
@@ -314,6 +314,17 @@ export async function fetchRecentRawActivities(
   };
 
   if (cnRes.error) {
+    // Accounts that never linked Garmin (e.g. demo accounts seeded with
+    // sample activities) plan from the activity metrics already stored.
+    const stored = await loadStoredActivities(userId, cutoffMs);
+    if (stored) {
+      return {
+        activities: stored,
+        physiology: null,
+        cn: { count: stored.length, error: null },
+        global: { count: 0, error: null },
+      };
+    }
     throw new GarminUnavailableError(
       `Unable to read Garmin China region data: ${cnRes.error}`,
     );
@@ -349,6 +360,102 @@ export async function fetchRecentRawActivities(
     physiology: cnRes.physiology,
     cn: { count: cnRes.list.length, error: cnRes.error },
     global: { count: globalRes.list.length, error: globalRes.error },
+  };
+}
+
+async function loadStoredActivities(
+  userId: string,
+  cutoffMs: number,
+): Promise<MappedActivity[] | null> {
+  const linked = await db
+    .select({ id: garminAccount.id })
+    .from(garminAccount)
+    .where(and(eq(garminAccount.userId, userId), eq(garminAccount.region, 'cn')))
+    .limit(1);
+  if (linked.length > 0) return null;
+
+  const rows = await db
+    .select()
+    .from(activityMetric)
+    .where(
+      and(
+        eq(activityMetric.userId, userId),
+        eq(activityMetric.region, 'cn'),
+        gte(activityMetric.startTime, new Date(cutoffMs)),
+      ),
+    );
+  if (rows.length === 0) return null;
+  return rows.map(metricRowToMapped);
+}
+
+const STORED_RUN_NAMES: Record<string, string> = {
+  recovery: 'Recovery Run',
+  aerobic: 'Easy Run',
+  long_endurance: 'Long Run',
+  tempo: 'Tempo Run',
+  threshold: 'Threshold Run',
+  vo2max: 'Interval Run',
+  anaerobic: 'Speed Session',
+};
+
+function storedActivityName(row: ActivityMetricRow): string {
+  if (row.sport === 'running') return STORED_RUN_NAMES[row.stimulus ?? ''] ?? 'Run';
+  if (row.sport === 'cycling') return 'Ride';
+  if (row.sport === 'swimming') return 'Swim';
+  return 'Activity';
+}
+
+function metricRowToMapped(row: ActivityMetricRow): MappedActivity {
+  const num = (v: unknown): number | undefined => {
+    if (v === null || v === undefined) return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const distanceKm = num(row.distanceKm) ?? 0;
+  const durationMin = num(row.durationMin) ?? 0;
+  const paceMinPerKm = row.avgPaceSecPerKm != null ? row.avgPaceSecPerKm / 60 : null;
+  const zones = (row.hrZoneSeconds ?? {}) as Record<string, unknown>;
+  const lthrPace = row.lactateThresholdPaceSecPerKm;
+  return {
+    id: `cn-${row.activityId}`,
+    region: 'cn',
+    activityId: row.activityId,
+    signature: `stored:${row.id}`,
+    name: storedActivityName(row),
+    type: row.subtype ?? row.sport,
+    startTimeLocal: row.startTime.toISOString(),
+    distanceKm,
+    durationMin,
+    averageHr: row.avgHr,
+    maxHr: row.maxHr,
+    averagePaceMinPerKm: paceMinPerKm,
+    averagePaceText: null,
+    trainingLoad: num(row.trainingLoad),
+    trainingEffectLabel: row.stimulus ?? undefined,
+    aerobicTrainingEffect: num(row.aerobicTrainingEffect),
+    anaerobicTrainingEffect: num(row.anaerobicTrainingEffect),
+    primaryBenefit: row.stimulus ?? undefined,
+    averageSpeed:
+      distanceKm > 0 && durationMin > 0 ? (distanceKm * 1000) / (durationMin * 60) : undefined,
+    elevationGain: num(row.elevationGainM),
+    averagePower: num(row.avgPower),
+    normalizedPower: num(row.normalizedPower),
+    maxPowerTwentyMinutes: num(row.maxPowerTwentyMinutes),
+    functionalThresholdPower: num(row.functionalThresholdPower),
+    averageCadence: num(row.cadenceAvg),
+    groundContactTime: num(row.groundContactTimeMs),
+    verticalOscillation: num(row.verticalOscillationCm),
+    verticalRatio: num(row.verticalRatio),
+    vo2Max: num(row.vo2Max),
+    lactateThresholdHr: num(row.lactateThresholdHr),
+    lactateThresholdPaceMinPerKm: lthrPace != null ? lthrPace / 60 : undefined,
+    recoveryTimeHours: num(row.recoveryTimeHours),
+    hrTimeInZone_1: num(zones.z1),
+    hrTimeInZone_2: num(zones.z2),
+    hrTimeInZone_3: num(zones.z3),
+    hrTimeInZone_4: num(zones.z4),
+    hrTimeInZone_5: num(zones.z5),
+    source: 'garmin',
   };
 }
 
@@ -427,6 +534,17 @@ export async function fetchCalendarActivities(
     physiology: null as GarminPhysiologyMetrics | null,
     error: null as string | null,
   };
+
+  if (cnRes.error) {
+    const stored = await loadStoredActivities(userId, cutoffMs);
+    if (stored) {
+      return {
+        activities: stored,
+        cn: { count: stored.length, error: null },
+        global: { count: 0, error: null },
+      };
+    }
+  }
 
   const seen = new Map<string, MappedActivity>();
   for (const a of cnRes.list) seen.set(activitySignature(a), mapActivity(a, 'cn'));
