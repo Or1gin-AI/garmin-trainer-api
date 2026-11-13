@@ -569,6 +569,7 @@ function buildSystemPrompt(input: ChatTurnInput): string {
   parts.push('');
   parts.push('Response style:');
   parts.push('- Always reply in English, even if the user writes in another language (e.g. Chinese); keep a friendly, professional and concise tone;');
+  parts.push('- Template ids such as run.tempo.v1 are internal: use them only in tool arguments and never show them in your reply; refer to sessions by their plain names (e.g. "tempo run", "long run");');
   parts.push('- Keep a single reply to roughly 200 words or fewer; lists or bold text are fine when useful;');
   parts.push('- When referring to a day, use "Day X / weekday" together with the specific templateId (e.g. run.tempo.v1) so the user can match it;');
   parts.push('- Never invent training load, pace, heart rate, power or other numbers; every judgement must be based on the athlete profile and recent state given below;');
